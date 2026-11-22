@@ -14,7 +14,7 @@ use egress_guard::egress::EgressDetector;
 use egress_guard::{engine, exe_dir, learned_file, logbuf};
 
 #[derive(Parser)]
-#[command(version, about = "根据出口 IP 白名单阻断/放行网络（Windows：WFP 按应用；macOS：pf 全局断网）")]
+#[command(version, about = "根据出口 IP 白名单阻断/放行网络（Windows：WFP；macOS：pf 全局断网 + 网络扩展按应用断网）")]
 struct Cli {
     /// 配置文件路径（默认：当前目录或程序所在目录下的 config.toml；macOS 后台服务见 daemon）
     #[arg(short, long, global = true)]

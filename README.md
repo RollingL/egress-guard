@@ -8,7 +8,7 @@
 
 Rust 编写，只用 WFP 用户态 API（`fwpuclnt.dll`），**不需要安装驱动**。
 
-另有 **macOS 版**（用系统自带的 pf 防火墙，目前只支持全局断网），见下文 [macOS 版](#macos-版)。
+另有 **macOS 版**（全局断网用系统自带的 pf 防火墙；按应用断网用网络扩展，需要 Developer ID 签名版本），见下文 [macOS 版](#macos-版)。
 
 Windows 版提供两个程序：
 
@@ -109,14 +109,14 @@ macOS 版与 Windows 版共用同一套检测、决策逻辑和界面（苹果�
 
 | | Windows | macOS |
 | --- | --- | --- |
-| 拦截机制 | WFP（按应用 ID） | pf 防火墙（系统自带，按地址/端口） |
-| 按应用断网 | ✅ | ❌（见下方说明） |
+| 拦截机制 | WFP（按应用 ID） | 全局断网：pf 防火墙；按应用断网：网络扩展（内容过滤） |
+| 按应用断网 | ✅ | ⚠️ 已实现，但需要 Developer ID 签名版本才能启用（见下方说明） |
 | 全局断网 | ✅ | ✅ 局域网、DNS、DHCP、IPv6 邻居发现、例外地址照常放行 |
 | 例外程序（如 VPN 客户端） | ✅ | ❌ 请把 VPN 服务器 IP 填到「例外地址」 |
 | 权限 | 界面以管理员身份运行 | 界面以普通用户运行；拦截由 root 后台服务（launchd）负责 |
 | 托盘 | 系统托盘 | 菜单栏图标（不占程序坞） |
 | 开机自启 | 任务计划程序 | 后台服务开机即保护 + 登录后在菜单栏显示 |
-| 需要签名吗 | 不需要 | 不需要（ad-hoc 签名即可运行） |
+| 需要签名吗 | 不需要 | 全局断网不需要（ad-hoc 签名即可运行）；按应用断网需要 |
 
 <p>
   <img src="docs/macos-blocked-light.png" width="49%" alt="macOS 概览：出口 IP 不在白名单，全部网络已阻断">
@@ -129,15 +129,18 @@ macOS 版与 Windows 版共用同一套检测、决策逻辑和界面（苹果�
 
 以上截图来自 GitHub Actions 的 macOS 虚拟机，CI 每次都会真实安装后台服务并验证断网与恢复。菜单栏图标：<img src="docs/macos-menubar.png" height="22" alt="菜单栏中的红色盾牌图标">
 
-### 为什么 macOS 版不能按应用断网
+### 按应用断网（网络扩展）
 
-macOS 上唯一能按应用拦截出站连接的官方机制是 **Network Extension 内容过滤（NEFilterDataProvider 系统扩展）**，Little Snitch、LuLu 都用它。它要求：
+pf 只认地址、端口和用户，分不清是哪个应用发出的连接。macOS 上能按应用拦截的官方机制是 **Network Extension 内容过滤（NEFilterDataProvider 系统扩展）**，Little Snitch、LuLu 都用它。0.7.0 起 .app 里带有这样一个网络扩展：后台服务把「是否阻断 + 受控应用列表（含自动识别的子进程）」推送给它，它对受控应用的连接逐个放行或丢弃。
 
-- 付费的 Apple Developer Program 账号（每年 99 美元）；
-- 申请 Network Extension 能力，用 Developer ID 签名并通过 Apple 公证；
-- 用户首次运行时在「系统设置 → 隐私与安全性」中手动允许系统扩展和内容过滤。
+**但 macOS 只加载用付费 Apple Developer ID 签名、带描述文件并经过公证的网络扩展。** 发布的 zip 没有签名，「受控应用」页会说明这一点，点「仍要尝试启用」会显示系统拒绝的原因；在那之前请用「全局断网」。拿到开发者账号后怎么签名、用户怎么启用、以及第一次在真机上需要验证什么，见 [docs/macos-network-extension.md](docs/macos-network-extension.md)。
 
-没有签名的扩展系统根本不会加载，所以免签名版本只能用 pf。pf 只认地址、端口和用户，分不清是哪个应用发出的连接。界面里「受控应用」「例外程序」的列表会保留在配置中，供以后的签名版本使用。
+<p>
+  <img src="docs/macos-apps-unsigned-light.png" width="49%" alt="macOS 受控应用页：未签名版本的说明">
+  <img src="docs/macos-apps-connected-light.png" width="49%" alt="macOS 受控应用页：网络扩展已连接（CI 中用测试客户端模拟）">
+</p>
+
+右图来自 CI：没有签名的扩展无法真正加载，图中「已连接」的是用扩展里同一份通信代码写的测试客户端，用来验证后台服务与扩展之间的协议。
 
 ### 安装与使用
 
@@ -154,7 +157,8 @@ macOS 上唯一能按应用拦截出站连接的官方机制是 **Network Extens
 | --- | --- |
 | 后台服务 | `/Library/LaunchDaemons/com.egressguard.daemon.plist`，以 root 运行 `/Library/Application Support/EgressGuard/bin/egress-guard daemon`（安装时从 .app 里复制，移动或删除 .app 不影响已安装的服务）。配置在同目录的 `config.toml`，日志在 `/Library/Logs/egress-guard.log`。 |
 | 界面通信 | launchd 创建的本地套接字 `/var/run/egress-guard.sock`，每行一个 JSON。界面连接时服务按需启动；只读请求所有用户可用，修改设置只接受 root 和管理员组。 |
-| 拦截 | 规则装入 `com.apple/egress-guard` 子锚点（系统默认的 `/etc/pf.conf` 已经引用 `com.apple/*`，不修改系统文件）。阻断时用 `pfctl -E` 取得启用令牌，放行时 `pfctl -X` 归还，不影响 pf 原本是否开启。 |
+| 按应用断网 | 网络扩展（`com.egressguard.app.filter`，root）连接上面的套接字接收规则，逐个连接放行或丢弃，详见 [docs/macos-network-extension.md](docs/macos-network-extension.md)。服务运行期间存在 `/var/run/egress-guard.running`，扩展只在它存在时连接，避免「退出」后被扩展重新拉起。 |
+| 全局断网 | 规则装入 `com.apple/egress-guard` 子锚点（系统默认的 `/etc/pf.conf` 已经引用 `com.apple/*`，不修改系统文件）。阻断时用 `pfctl -E` 取得启用令牌，放行时 `pfctl -X` 归还，不影响 pf 原本是否开启。 |
 | 断网期间检测出口 IP | 检测在以 `nobody` 身份运行的子进程里进行，pf 规则按套接字所属用户（`user nobody`）放行它，而不是放行全部 root 进程。 |
 | 已有连接 | 例外规则不建立状态，兜底规则直接丢弃，所以开始阻断前已经建立的连接在下一个数据包就会被拦截，同时局域网等例外连接不受影响。 |
 | 网络变化 | 监听路由套接字（地址增删、网卡状态、非主机路由变化），忽略 AirDrop 等频繁开关的 awdl/llw 接口；变化后与 Windows 一样先阻断、防抖后重新检测。 |
@@ -173,10 +177,6 @@ sudo egress-guard unblock        # 紧急恢复：清空 pf 规则
 ```
 
 卸载：设置页"后台服务 → 卸载…"，输入管理员密码。它会停止后台服务、移除全部 pf 规则、删除 `/Library/LaunchDaemons/com.egressguard.daemon.plist` 和服务程序，并关闭登录时自动打开，网络立即恢复原样；之后把 .app 拖进废纸篓即可。配置文件会保留在 `/Library/Application Support/EgressGuard`，重新安装后沿用；不需要的话可以手动删除这个文件夹和日志 `/Library/Logs/egress-guard*.log`。没有界面时也可以在终端执行 `sudo "/Applications/Egress Guard.app/Contents/MacOS/egress-guard" service uninstall`。
-
-### 以后要做按应用断网需要什么
-
-拿到 Apple Developer 账号后，可以在现有结构上增加一个 Network Extension 后端：Swift 写的内容过滤系统扩展负责逐个连接放行/丢弃，Rust 后台服务通过 XPC 把"是否阻断 + 受控应用列表"发给它，子进程识别（`src/mac/procs.rs` 已能枚举进程树）和界面可以直接复用。打包脚本已支持 `SIGN_IDENTITY` 环境变量，用 Developer ID 签名并开启 hardened runtime。
 
 ## 从源码构建
 
@@ -197,13 +197,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 macOS（需要 Xcode 命令行工具和 Rust）：
 
 ```bash
-scripts/macos/bundle.sh              # 本机架构，生成 target/macos/Egress Guard.app 和 zip
+scripts/macos/bundle.sh              # 本机架构，生成 target/macos/Egress Guard.app 和 zip（含网络扩展，ad-hoc 签名）
 scripts/macos/bundle.sh --universal  # Apple 芯片 + Intel 通用版本
 ```
 
 单元测试（白名单匹配、IP 解析、决策逻辑、pf 规则生成、本地通信协议）可在任意平台运行：`cargo test`。
 
-CI（`.github/workflows/ci.yml`）在 Linux、Windows、macOS 上测试和构建；macOS 任务还会在 GitHub 的 Mac 虚拟机上安装后台服务，实际验证全局断网、例外地址、白名单放行和退出恢复（`scripts/macos/ci-e2e.sh`）。
+CI（`.github/workflows/ci.yml`）在 Linux、Windows、macOS 上测试和构建；macOS 任务还会编译网络扩展、运行它的 Swift 单元测试，并在 GitHub 的 Mac 虚拟机上安装后台服务，实际验证全局断网、例外地址、白名单放行、退出恢复，以及后台服务向网络扩展推送规则的协议（`scripts/macos/ci-e2e.sh`）。
 
 ## 代码结构
 
@@ -213,7 +213,9 @@ src/
   bin/gui.rs        界面入口（单实例、--minimized）
   engine.rs         后台引擎线程：定时检测、网络变化、配置热更新、退出
   daemon.rs         后台服务：运行引擎 + 本地套接字（macOS）
-  ipc.rs            界面与后台服务的通信协议（JSON 行）
+  ipc.rs            界面、网络扩展与后台服务的通信协议（JSON 行）
+  filterfeed.rs     推送给 macOS 网络扩展的按应用阻断规则
+  netext.rs         界面调用的网络扩展安装/开关（macOS，Swift 桥接）
   pfrules.rs        pf 规则文本生成（与平台无关，可测试）
   config.rs         TOML 配置解析/保存、白名单（IP/CIDR）匹配
   egress.rs         公网出口 IP 查询（ureq + 系统 TLS）
@@ -232,10 +234,15 @@ src/
   win/tcpkill.rs    断开已有的 IPv4 TCP 连接
   win/procs.rs      进程枚举
   win/autostart.rs  任务计划程序开机自启
+  mac/firewall.rs   macOS 拦截后端：pf（全局断网）+ 网络扩展（按应用）
   mac/pf.rs         pf 锚点规则、启用令牌
   mac/service.rs    launchd 后台服务安装/卸载、登录项、管理员授权
   mac/netwatch.rs   路由套接字监听网络变化
   mac/procs.rs      进程枚举（libproc）
+macos/FilterExtension/  网络扩展（Swift，NEFilterDataProvider）、Info.plist、权限
+macos/Shared/       网络扩展与测试共用：规则匹配、连接后台服务
+macos/Bridge/       界面调用的网络扩展管理（Swift，编译为静态库）
+macos/Tests/        Swift 单元测试与协议测试客户端
 assets/             exe 图标、界面程序清单（requireAdministrator）
 scripts/macos/      .app 打包、Info.plist、CI 端到端测试
 ```

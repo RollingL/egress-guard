@@ -146,6 +146,12 @@ pub fn run(opts: Options) -> Result<()> {
         config_error: Mutex::new(load_error.map(|e| format!("{e:#}"))),
     });
     ipc::serve(listener, daemon, hub);
+    // 告诉网络扩展服务在运行。扩展只在这个文件存在时才连接套接字，
+    // 否则「退出」后扩展一重连，launchd 就会按需把服务重新拉起来
+    let marker = crate::filterfeed::run_marker(&opts.socket);
+    if let Err(e) = std::fs::write(&marker, format!("{}\n", std::process::id())) {
+        log::warn!("无法写入 {}: {e}", marker.display());
+    }
     {
         let tx = handle.sender();
         ctrlc::set_handler(move || {
@@ -155,6 +161,7 @@ pub fn run(opts: Options) -> Result<()> {
     }
     log::info!("后台服务 {} 已启动", env!("CARGO_PKG_VERSION"));
     let r = handle.join();
+    let _ = std::fs::remove_file(&marker);
     log::info!("后台服务退出");
     r
 }

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RawConfig;
 use crate::engine::Status;
+use crate::filterfeed::{self, FilterHello, FilterState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "arg", rename_all = "snake_case")]
@@ -34,11 +35,16 @@ pub enum Request {
     SetAutostart(bool),
     /// 移除全部阻断规则并退出服务。
     Stop,
+    /// macOS 网络扩展：持续接收按应用阻断的规则，直到连接断开。只接受 root。
+    FilterWatch(FilterHello),
 }
 
 impl Request {
     fn mutating(&self) -> bool {
-        !matches!(self, Request::Hello | Request::GetStatus | Request::Watch | Request::GetConfig | Request::Logs)
+        !matches!(
+            self,
+            Request::Hello | Request::GetStatus | Request::Watch | Request::GetConfig | Request::Logs | Request::FilterWatch(_)
+        )
     }
 }
 
@@ -61,6 +67,8 @@ pub enum Reply {
     Status(Box<Status>),
     Config(Box<RawConfig>),
     Logs(Vec<String>),
+    /// 推送给网络扩展的规则。
+    Filter(FilterState),
     Ok,
     Err(String),
 }
@@ -192,6 +200,11 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
             write_reply(&mut w, &Reply::Err("只有管理员账户可以修改设置".into()))?;
             continue;
         }
+        // 网络扩展以 root 运行；其他进程冒充扩展会让界面误以为按应用断网已生效
+        if matches!(req, Request::FilterWatch(_)) && uid != Some(0) && uid != Some(unsafe { libc::geteuid() }) {
+            write_reply(&mut w, &Reply::Err("只接受 root 进程（网络扩展）".into()))?;
+            return Ok(());
+        }
         let reply = match req {
             Request::Hello => Reply::Hello(handler.hello()),
             Request::GetStatus => Reply::Status(Box::new(hub.state.lock().unwrap().1.clone())),
@@ -222,6 +235,7 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
                 handler.stop();
                 return Ok(());
             }
+            Request::FilterWatch(hello) => return filter_watch(&mut w, hello),
             Request::Watch => {
                 let mut seen = 0;
                 loop {
@@ -241,6 +255,27 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
         };
         write_reply(&mut w, &reply)?;
     }
+}
+
+/// 网络扩展的连接：登记后持续推送规则，至少每 5 秒一次（心跳）。
+fn filter_watch(w: &mut impl Write, hello: FilterHello) -> std::io::Result<()> {
+    let hub = filterfeed::hub();
+    log::info!("网络扩展已连接（{}）", if hello.version.is_empty() { "版本未知" } else { &hello.version });
+    let _reg = hub.register(hello);
+    // 引擎还没写入过规则时先不发：扩展收到第一条规则前保持原来的状态
+    let mut seen = 0;
+    let r = loop {
+        let (v, s) = hub.wait_newer(seen, Duration::from_secs(5));
+        if v == 0 {
+            continue;
+        }
+        seen = v;
+        if let Err(e) = write_reply(w, &Reply::Filter(s)) {
+            break Err(e);
+        }
+    };
+    log::info!("网络扩展已断开");
+    r
 }
 
 /// 在后台线程中接受连接，每个连接一个线程。
@@ -343,6 +378,26 @@ impl Client {
             Reply::Logs(l) => Ok(l),
             other => bail!("意外的回复: {other:?}"),
         }
+    }
+
+    /// 以网络扩展的身份接收规则，直到连接断开（返回错误）。测试与 `filter-watch` 子命令使用。
+    pub fn filter_watch(&self, hello: FilterHello, mut on_state: impl FnMut(FilterState) -> bool) -> Result<()> {
+        let mut s = self.connect(Some(Duration::from_secs(15)))?;
+        let mut line = serde_json::to_string(&Request::FilterWatch(hello))?;
+        line.push('\n');
+        s.write_all(line.as_bytes())?;
+        for line in BufReader::new(s).lines() {
+            match serde_json::from_str::<Reply>(&line?)? {
+                Reply::Filter(st) => {
+                    if !on_state(st) {
+                        return Ok(());
+                    }
+                }
+                Reply::Err(e) => bail!(e),
+                _ => {}
+            }
+        }
+        bail!("后台服务关闭了连接")
     }
 
     /// 持续接收状态，直到连接断开（返回错误）。
@@ -449,9 +504,52 @@ mod tests {
     }
 
     #[test]
+    fn filter_watch_over_socket() {
+        let path = std::env::temp_dir().join(format!("eg-filter-{}.sock", std::process::id()));
+        let listener = bind(&path).unwrap();
+        let handler = Arc::new(TestHandler { cfg: Mutex::new(RawConfig::default()), stopped: AtomicBool::new(false) });
+        serve(listener, handler, Arc::new(StatusHub::default()));
+        let hub = filterfeed::hub();
+        hub.set(FilterState { blocked: true, inspect_existing: true, apps: vec!["/Applications/A.app".into()] });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = Client::new(&path);
+        let t = std::thread::spawn(move || {
+            c.filter_watch(FilterHello { version: "9.9.9".into() }, |s| {
+                let _ = tx.send(s.clone());
+                s.blocked // 收到放行后退出
+            })
+        });
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.blocked && first.apps == ["/Applications/A.app"]);
+        assert_eq!(hub.connected().as_deref(), Some("9.9.9"));
+        hub.set(FilterState::default());
+        assert!(!rx.recv_timeout(Duration::from_secs(5)).unwrap().blocked);
+        t.join().unwrap().unwrap();
+        // 服务端在下一次写入（心跳）失败时注销
+        for _ in 0..100 {
+            if hub.connected().is_none() {
+                break;
+            }
+            hub.set(FilterState { blocked: false, inspect_existing: false, apps: vec![format!("{:?}", std::time::Instant::now())] });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(hub.connected(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn request_json_shape() {
         assert_eq!(serde_json::to_string(&Request::Watch).unwrap(), "{\"cmd\":\"watch\"}");
         assert_eq!(serde_json::to_string(&Request::SetAutostart(true)).unwrap(), "{\"cmd\":\"set_autostart\",\"arg\":true}");
         assert!(Request::Stop.mutating() && !Request::Logs.mutating());
+        assert_eq!(
+            serde_json::to_string(&Request::FilterWatch(FilterHello { version: "0.7.0".into() })).unwrap(),
+            "{\"cmd\":\"filter_watch\",\"arg\":{\"version\":\"0.7.0\"}}"
+        );
+        assert_eq!(
+            serde_json::to_string(&Reply::Filter(FilterState::default())).unwrap(),
+            "{\"kind\":\"filter\",\"data\":{\"blocked\":false,\"inspect_existing\":false,\"apps\":[]}}"
+        );
     }
 }

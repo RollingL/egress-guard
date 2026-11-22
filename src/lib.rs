@@ -1,6 +1,6 @@
 //! egress-guard：根据本机公网出口 IP 判断是否阻断网络连接。
 //!
-//! 出口 IP 在白名单内 → 放行；否则 → 阻断配置中列出的应用（Windows：WFP），
+//! 出口 IP 在白名单内 → 放行；否则 → 阻断配置中列出的应用（Windows：WFP，macOS：网络扩展），
 //! 或者切断全部网络（全局断网；Windows：WFP，macOS：pf）。
 
 pub mod blockall;
@@ -11,12 +11,15 @@ pub mod daemon;
 pub mod discovery;
 pub mod egress;
 pub mod engine;
+#[cfg(unix)]
+pub mod filterfeed;
 pub mod gui;
 #[cfg(unix)]
 pub mod ipc;
 pub mod logbuf;
 #[cfg(target_os = "macos")]
 pub mod mac;
+pub mod netext;
 pub mod pfrules;
 #[cfg(windows)]
 pub mod win;

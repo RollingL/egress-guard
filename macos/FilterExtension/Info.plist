@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 网络扩展（系统扩展）的 Info.plist。@VERSION@、@TEAM_ID@ 由 scripts/macos/bundle.sh 替换。 -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>Egress Guard 网络扩展</string>
+	<key>CFBundleName</key>
+	<string>Egress Guard Filter</string>
+	<key>CFBundleExecutable</key>
+	<string>com.egressguard.app.filter</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.egressguard.app.filter</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>SYSX</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>egress-guard</string>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>出口 IP 不在白名单时，切断受控应用的网络连接。</string>
+	<key>NetworkExtension</key>
+	<dict>
+		<!-- 系统通过这个 Mach 服务与扩展通信；必须以 App Group（团队 ID 开头）为前缀 -->
+		<key>NEMachServiceName</key>
+		<string>@TEAM_ID@.com.egressguard.filter</string>
+		<key>NEProviderClasses</key>
+		<dict>
+			<key>com.apple.networkextension.filter-data</key>
+			<string>EgressFilter.FilterDataProvider</string>
+		</dict>
+	</dict>
+</dict>
+</plist>

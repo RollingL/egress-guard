@@ -4,7 +4,8 @@
 //! - 阻断时用 `pfctl -E` 取得启用令牌，放行时用 `pfctl -X` 归还；pf 原本是否开启都不受影响。
 //! - pf 规则不随进程退出自动消失：正常退出、收到 SIGTERM 时会清空；异常退出后由 launchd 重启服务，
 //!   启动时先清空残留规则。也可以手动执行 `sudo egress-guard unblock`。
-//! - pf 只能按地址/端口/用户过滤，**不能按应用**区分，所以受控应用列表和例外程序在这里不生效。
+//! - pf 只能按地址/端口/用户过滤，**不能按应用**区分：受控应用由网络扩展负责（见 `mac::firewall`），
+//!   例外程序在这里不生效。
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -22,7 +23,6 @@ pub struct PfFirewall {
     /// `pfctl -E` 返回的启用令牌。
     token: Option<String>,
     /// 已经提示过的限制，避免日志刷屏。
-    warned_apps: bool,
     warned_allow_apps: bool,
 }
 
@@ -75,16 +75,11 @@ impl PfFirewall {
             blocked: false,
             rules: Rules::default(),
             token: None,
-            warned_apps: false,
             warned_allow_apps: false,
         })
     }
 
     fn warn_limits(&mut self) {
-        if self.rules.block_all.is_none() && !self.rules.apps.is_empty() && !self.warned_apps {
-            self.warned_apps = true;
-            log::warn!("macOS pf 不能按应用阻断：受控应用不会被断网。请开启「全局断网」");
-        }
         if let Some(p) = &self.rules.block_all {
             if !p.allow_apps.is_empty() && !self.warned_allow_apps {
                 self.warned_allow_apps = true;

@@ -296,6 +296,12 @@ mod remote {
             if let Err(e) = service::set_login_item(false, Path::new("")) {
                 log::warn!("无法移除登录项: {e:#}");
             }
+            // 网络扩展也一并停用（系统可能再要求输入一次密码）；没有服务时它本来就放行全部连接
+            let ext = crate::netext::state();
+            if ext.signed() && (ext.ext_enabled == Some(true) || ext.filter_configured) {
+                log::info!("停用网络扩展");
+                crate::netext::deactivate();
+            }
             Ok(())
         }
 

@@ -34,6 +34,10 @@ pub trait Firewall {
     fn per_app(&self) -> bool {
         true
     }
+    /// 负责按应用阻断的 macOS 网络扩展的版本（已连接时）。
+    fn extension(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 根据检测结果计算目标状态：Some(true)=阻断，Some(false)=放行，None=保持不变。
@@ -92,6 +96,10 @@ impl Controller {
 
     pub fn per_app(&self) -> bool {
         self.fw.per_app()
+    }
+
+    pub fn extension(&self) -> Option<String> {
+        self.fw.extension()
     }
 
     pub fn last_ip(&self) -> Option<IpAddr> {
