@@ -5,6 +5,7 @@
 //!   --minimized        启动后直接隐藏到托盘 / 菜单栏（开机自启时使用）
 //!   -c, --config PATH  配置文件路径（Windows，默认：exe 所在目录下的 config.toml）
 //!   --page NAME        打开时显示的页面（截图用）
+//!   --netext-selftest [秒]  macOS：查询网络扩展状态并尝试安装，打印结果后退出（CI 用）
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
@@ -76,6 +77,11 @@ fn main() {
         match a.as_str() {
             "--minimized" => start_minimized = true,
             "--page" => start_page = args.next(),
+            // CI 自检：查询网络扩展状态并尝试安装，打印结果（JSON）后退出
+            "--netext-selftest" => {
+                egress_guard::netext::selftest(args.next().and_then(|s| s.parse().ok()).unwrap_or(10.0));
+                return;
+            }
             _ => {}
         }
     }

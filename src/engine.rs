@@ -35,6 +35,8 @@ pub enum Event {
     ExtraApps(Vec<ExtraApp>),
     /// 清空子进程识别记录。
     ClearLearned,
+    /// 只刷新状态（例如 macOS 网络扩展连上或断开）。
+    Refresh,
 }
 
 /// 引擎对外报告的状态快照。macOS 上由后台服务通过本地套接字发给界面。
@@ -61,8 +63,10 @@ pub struct Status {
     pub backend_error: Option<String>,
     /// 模拟模式（--dry-run 或拦截后端打开失败）。
     pub simulated: bool,
-    /// 拦截后端能否按应用阻断（macOS 的 pf 后端不能，只能全局断网）。
+    /// 拦截后端现在能否按应用阻断（macOS 需要网络扩展已连接；否则只有 pf 全局断网）。
     pub per_app: bool,
+    /// 已连接的 macOS 网络扩展的版本。
+    pub filter_ext: Option<String>,
     /// 引擎是否在运行。
     pub running: bool,
     /// 自动识别到、一并阻断的关联程序。
@@ -139,7 +143,7 @@ fn run(
         status.simulated = true;
         Box::new(DryRunFirewall::default())
     } else {
-        match open_backend(&cfg) {
+        match open_backend(&cfg, tx.clone()) {
             Ok(fw) => fw,
             Err(e) if strict => {
                 status.running = false;
@@ -278,6 +282,7 @@ fn run(
             Ok(Event::ClearLearned) => {
                 watch.lock().unwrap().clear_learned = true;
             }
+            Ok(Event::Refresh) => {}
             Ok(Event::Detected { generation: g, result }) => {
                 checking = false;
                 if g == generation {
@@ -337,6 +342,7 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.whitelisted = ctrl.last_ip().map(|ip| ctrl.config().is_whitelisted(ip));
     s.blocked = ctrl.is_blocked();
     s.per_app = ctrl.per_app();
+    s.filter_ext = ctrl.extension();
     s.block_all = ctrl.config().block_all.enabled;
     s.checking = checking;
     s.detect_error = ctrl.last_error().map(str::to_owned);
@@ -383,18 +389,19 @@ fn snapshot_fn() -> discovery::SnapshotFn {
 }
 
 #[cfg(windows)]
-fn open_backend(cfg: &Config) -> Result<Box<dyn Firewall>> {
-    let _ = cfg;
+fn open_backend(cfg: &Config, tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
+    let _ = (cfg, tx);
     Ok(Box::new(crate::win::wfp::WfpFirewall::open()?))
 }
 
+/// macOS：pf 负责全局断网，网络扩展（连上后）负责按应用阻断。
 #[cfg(target_os = "macos")]
-fn open_backend(cfg: &Config) -> Result<Box<dyn Firewall>> {
+fn open_backend(cfg: &Config, tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
     let _ = cfg;
-    Ok(Box::new(crate::mac::pf::PfFirewall::open()?))
+    Ok(Box::new(crate::mac::firewall::MacFirewall::open(tx)?))
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn open_backend(_cfg: &Config) -> Result<Box<dyn Firewall>> {
+fn open_backend(_cfg: &Config, _tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
     anyhow::bail!("只支持 Windows（WFP）和 macOS（pf）；在其他平台请使用 --dry-run")
 }

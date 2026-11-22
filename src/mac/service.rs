@@ -192,6 +192,7 @@ pub fn uninstall() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(paths::daemon_bin().parent().unwrap_or(Path::new("/nonexistent")));
     let _ = std::fs::remove_file(SOCKET);
+    let _ = std::fs::remove_file(crate::filterfeed::run_marker(Path::new(SOCKET)));
     println!("后台服务已卸载；配置保留在 {SUPPORT_DIR}，日志在 {LOG_FILE}");
     Ok(())
 }

@@ -107,6 +107,15 @@ pub struct ProcEntry {
     pub path: String,
 }
 
+/// 程序（规范路径）属于哪个目标：完全相同，或者位于作为目标的 `.app` 应用包里
+/// （macOS 上受控应用通常是应用包本身，例如 `/Applications/Foo.app`，进程路径是包内的可执行文件）。
+pub fn lookup_target<'a>(norm: &str, targets: &'a HashMap<String, String>) -> Option<&'a String> {
+    if let Some(t) = targets.get(norm) {
+        return Some(t);
+    }
+    norm.match_indices(".app\\").find_map(|(i, _)| targets.get(&norm[..i + 4]))
+}
+
 /// 找出所有“祖先链上有目标进程”且自身不是目标的进程。
 /// `targets`：目标程序的规范路径 → 它所属的受控应用（规范路径）。
 /// 返回 (进程下标, 所属受控应用)。
@@ -116,7 +125,7 @@ pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Str
         if p.path.is_empty() {
             None
         } else {
-            targets.get(&normalize(&p.path))
+            lookup_target(&normalize(&p.path), targets)
         }
     };
     let mut out = Vec::new();
@@ -444,7 +453,7 @@ fn run(
                     continue;
                 }
                 let norm = normalize(&p.path);
-                if is_system_path(&norm, &system_dirs) || excluded.contains(&norm) || t.contains_key(&norm) {
+                if is_system_path(&norm, &system_dirs) || excluded.contains(&norm) || lookup_target(&norm, &t).is_some() {
                     continue;
                 }
                 if learned.add(Path::new(&p.path), &root) {
@@ -491,6 +500,24 @@ mod tests {
         // 500 路径未知，但创建时间已知，可作为中间节点
         assert_eq!(pids, vec![200, 300, 500, 600]);
         assert!(found.iter().all(|(_, r)| r == &root));
+    }
+
+    #[test]
+    fn mac_bundle_processes_are_targets() {
+        // 受控应用是 .app 包：包里的主程序、辅助程序都算目标本身，包外的子进程才需要识别
+        let procs = vec![
+            p(100, 1, 10, "/Applications/Foo.app/Contents/MacOS/Foo"),
+            p(200, 100, 20, "/Applications/Foo.app/Contents/Frameworks/Foo Helper.app/Contents/MacOS/Foo Helper"),
+            p(300, 200, 30, "/usr/local/bin/worker"),
+            p(400, 1, 40, "/Applications/Foo.appx/Contents/MacOS/x"),
+        ];
+        let root = normalize("/Applications/Foo.app");
+        let targets: HashMap<String, String> = [(root.clone(), root.clone())].into();
+        assert_eq!(lookup_target(&normalize(&procs[1].path), &targets), Some(&root));
+        assert_eq!(lookup_target(&normalize(&procs[3].path), &targets), None);
+        let found = descendants_of_targets(&procs, &targets);
+        let pids: Vec<u32> = found.iter().map(|(i, _)| procs[*i].pid).collect();
+        assert_eq!(pids, vec![300]);
     }
 
     #[test]

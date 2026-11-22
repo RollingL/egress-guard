@@ -58,9 +58,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - name: 打包 .app（通用二进制）
-        run: scripts/macos/bundle.sh --universal
-      - name: 端到端测试（pf 全局断网）
+      - name: 网络扩展共用代码的单元测试（Swift）
+        run: |
+          mkdir -p target/macos
+          xcrun swiftc -O -o target/macos/feedtest macos/Shared/*.swift macos/Tests/main.swift
+          target/macos/feedtest
+      - name: 打包 .app（通用二进制，含网络扩展）
+        run: |
+          scripts/macos/bundle.sh --universal
+          EXT="target/macos/Egress Guard.app/Contents/Library/SystemExtensions/com.egressguard.app.filter.systemextension"
+          lipo -info "$EXT/Contents/MacOS/com.egressguard.app.filter"
+          plutil -p "$EXT/Contents/Info.plist"
+          codesign -dvv "$EXT" 2>&1 | head -20
+      - name: 端到端测试（pf 全局断网、按应用断网的规则推送）
         run: scripts/macos/ci-e2e.sh
       - uses: actions/upload-artifact@v4
         if: always()

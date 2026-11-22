@@ -33,8 +33,11 @@ use theme::{Glyph, Palette};
 
 pub const WINDOW_TITLE: &str = "出口 IP 网络控制 - egress-guard";
 
-/// 拦截后端能否按应用阻断（macOS 免签名版本用 pf，只能全局断网）。
-const PER_APP: bool = !cfg!(target_os = "macos");
+/// 全局断网能否按程序放行例外（macOS 的全局断网用 pf，分不清程序）。
+const ALLOW_APPS: bool = !cfg!(target_os = "macos");
+
+/// 网络扩展的说明文档。
+const NETEXT_DOC: &str = "https://github.com/RollingL/egress-guard/blob/main/docs/macos-network-extension.md";
 
 /// macOS 窗口不显示标题栏：侧边栏一直延伸到顶部，红绿灯按钮浮在侧边栏上（与「系统设置」一致）。
 /// 内容需要给标题栏区域（约 28pt）留出空间。
@@ -54,6 +57,8 @@ mod text {
     pub const BACKEND_UNAVAILABLE: &str = "WFP 不可用，当前为模拟模式。请以管理员身份运行。";
     pub const CLOSE_HINT: &str = "点窗口右上角的 × 会隐藏到托盘，程序继续运行。要退出，请右键托盘图标选择「退出程序」，退出后所有阻断随之解除。";
     pub const PROGRAM: &str = "exe";
+    pub const APPS_SUB: &str = "出口 IP 不在白名单内时，以下程序的全部网络连接会被阻断。";
+    pub const KILL_EXISTING_SUB: &str = "切换为阻断时，主动断开受控应用的 TCP 连接";
     pub const SYSTEM_DIRS_HINT: &str = "Windows 系统目录下的程序（cmd、PowerShell、conhost 等）不会被自动加入。识别到的子进程会被记住，下次启动立即生效。";
     pub const AUTOSTART_TITLE: &str = "登录时自动启动";
     pub const AUTOSTART_SUB: &str = "以管理员权限在托盘中运行，不弹出 UAC";
@@ -64,16 +69,18 @@ mod text {
 #[cfg(target_os = "macos")]
 mod text {
     pub const ENGINE_RUNNING: &str = "pf 运行中";
-    pub const OVERVIEW_SUB: &str = "根据本机公网出口 IP，自动放行或切断本机的网络连接。";
+    pub const OVERVIEW_SUB: &str = "根据本机公网出口 IP，自动放行或阻断受控应用、或者整台 Mac 的网络连接。";
     // macOS 的域名解析由系统服务 mDNSResponder 代为发出，无法只放行本工具的 DNS 查询
     pub const DNS_SUB: &str = "域名解析（端口 53）。关闭后断网期间无法解析检测服务的域名，出口回到白名单也不会自动恢复";
-    pub const NETWORK_SUB: &str = "出口 IP 不在白名单内时，切断本机的全部网络连接。macOS 版只能用这种方式拦截。";
-    pub const BLOCK_ALL_OFF: &str = "关闭时不拦截任何连接（macOS 版不能按应用断网）";
-    pub const NETWORK_FOOTNOTE: &str = "断网时只放行下面列出的连接。退出程序会立即恢复全部网络。";
+    pub const NETWORK_SUB: &str = "出口 IP 不在白名单内时，用 pf 防火墙切断本机的全部网络连接，而不只是受控应用。";
+    pub const BLOCK_ALL_OFF: &str = "关闭时只阻断「受控应用」中的应用（需要启用网络扩展）";
+    pub const NETWORK_FOOTNOTE: &str = "断网时只放行下面列出的连接；启用了网络扩展时，受控应用连这些例外也不能访问。退出程序会立即恢复全部网络。";
     pub const CHILDREN_SUB: &str = "受控应用启动的其他程序自动加入阻断";
     pub const BACKEND_UNAVAILABLE: &str = "pf 不可用，当前为模拟模式。";
     pub const CLOSE_HINT: &str = "关闭窗口后程序在菜单栏继续运行。要退出，请点菜单栏图标选择「退出并解除阻断」。";
     pub const PROGRAM: &str = "应用";
+    pub const APPS_SUB: &str = "出口 IP 不在白名单内时，以下应用的全部网络连接会被阻断（由网络扩展执行）。";
+    pub const KILL_EXISTING_SUB: &str = "切换为阻断时，立即切断受控应用正在进行的连接（网络扩展会持续检查这些连接）";
     pub const SYSTEM_DIRS_HINT: &str = "系统目录（/System、/usr、/bin 等）下的程序不会被自动加入。识别到的子进程会被记住。";
     pub const AUTOSTART_TITLE: &str = "开机自动启动";
     pub const AUTOSTART_SUB: &str = "开机即由后台服务保护，登录后在菜单栏显示图标";
@@ -165,6 +172,9 @@ struct App {
     /// 正在进行的后台服务安装/卸载及其说明。
     service_job: Option<(Job, &'static str)>,
     service_error: Option<String>,
+    /// macOS 网络扩展的安装状态（系统一侧），以及上次请求刷新的时间。
+    netext: crate::netext::State,
+    netext_refreshed: Option<Instant>,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -256,6 +266,8 @@ pub fn run(opts: Options) -> Result<()> {
                 page_since: f64::NEG_INFINITY,
                 service_job: None,
                 service_error: None,
+                netext: Default::default(),
+                netext_refreshed: None,
             }))
         }),
     )
@@ -281,7 +293,7 @@ fn tray_state(s: &Status) -> tray::TrayState {
     let (shade, what) = if !s.running {
         (Shade::Gray, if s.backend_error.is_some() { "未连接后台服务" } else { "已停止" }.to_string())
     } else if inert(s) {
-        (Shade::Amber, "未拦截（全局断网未开启）".to_string())
+        (Shade::Amber, "未拦截（网络扩展、全局断网都未启用）".to_string())
     } else if s.blocked {
         (Shade::Red, "已阻断".to_string())
     } else if s.egress_ip.is_some() {
@@ -311,7 +323,7 @@ fn status_line(s: &Status) -> String {
     let line = if !s.running {
         if s.backend_error.is_some() { "未连接后台服务".to_owned() } else { "已停止".to_owned() }
     } else if inert(s) {
-        "未拦截：全局断网没有开启".to_owned()
+        "未拦截：网络扩展、全局断网都没有启用".to_owned()
     } else if s.blocked {
         match s.egress_ip {
             Some(ip) => format!("已切断网络：出口 IP {ip} 不在白名单"),
@@ -325,7 +337,7 @@ fn status_line(s: &Status) -> String {
     if s.simulated { format!("{line}（模拟模式）") } else { line }
 }
 
-/// 阻断范围的名称。只能整机断网的平台（macOS）直接说「网络」。
+/// 阻断范围的名称。只能整机断网时（macOS 网络扩展未连接）直接说「网络」。
 fn scope_name(s: &Status) -> &'static str {
     if !s.per_app {
         "网络"
@@ -336,7 +348,7 @@ fn scope_name(s: &Status) -> &'static str {
     }
 }
 
-/// 引擎判定要阻断，但后端只能全局断网而全局断网没开（macOS 未开启全局断网时），实际什么也不拦截。
+/// 引擎判定要阻断，但按应用断网不可用（macOS 网络扩展未连接）而全局断网又没开，实际什么也不拦截。
 fn inert(s: &Status) -> bool {
     s.running && s.blocked && !s.per_app && !s.block_all && !s.simulated
 }
@@ -354,7 +366,7 @@ fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
             None => ("已停止", "后台引擎没有运行。".into(), p.gray),
         }
     } else if inert(s) {
-        ("未拦截", "出口 IP 没有通过白名单，但全局断网未开启，网络没有被切断。".into(), p.orange)
+        ("未拦截", "出口 IP 没有通过白名单，但网络扩展没有启用、全局断网也没有开启，什么也没有切断。".into(), p.orange)
     } else if s.blocked {
         let why = match (s.egress_ip, &s.detect_error) {
             (Some(_), _) => "出口 IP 不在白名单内。出口回到白名单后会自动恢复。",
@@ -563,6 +575,133 @@ impl App {
         }
     }
 
+    // ---------------- 网络扩展（macOS） ----------------
+
+    /// 定时读取网络扩展的安装状态；在「受控应用」页时每 10 秒向系统查询一次。
+    fn poll_netext(&mut self, ctx: &egui::Context) {
+        if !crate::netext::supported() {
+            return;
+        }
+        if self.page == Page::Apps && self.netext_refreshed.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            self.netext_refreshed = Some(Instant::now());
+            crate::netext::refresh();
+        }
+        self.netext = crate::netext::state();
+        if self.page == Page::Apps {
+            ctx.request_repaint_after(Duration::from_millis(if self.netext.busy() { 300 } else { 1000 }));
+        }
+    }
+
+    /// 「受控应用」页顶部：网络扩展的状态与操作。
+    fn netext_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        enum Act {
+            Activate,
+            EnableFilter,
+            OpenSettings,
+        }
+        let s = self.status.lock().unwrap().clone();
+        let st = self.netext.clone();
+
+        if let Some(v) = &s.filter_ext {
+            let mut deactivate = false;
+            theme::card(ui, p, |ui| {
+                theme::row(ui, p, "按应用断网", Some(&format!("网络扩展 {v} 已连接后台服务，逐个放行或切断受控应用的连接")), |ui| {
+                    theme::chip(ui, p.green, "已启用");
+                });
+                theme::hairline(ui, p);
+                theme::row(ui, p, "网络扩展", Some("也可以在「系统设置 → 通用 → 登录项与扩展」中查看"), |ui| {
+                    if st.busy() {
+                        ui.add(egui::Spinner::new().size(14.0));
+                    } else if theme::text_button(ui, p.red, "停用…").on_hover_text("关闭内容过滤并卸载网络扩展").clicked() {
+                        deactivate = true;
+                    }
+                });
+            });
+            if deactivate {
+                crate::netext::deactivate();
+                self.netext_refreshed = None;
+            }
+            ui.add_space(4.0);
+            return;
+        }
+
+        let ext_on = st.ext_enabled == Some(true);
+        let (title, mut body, action): (&str, String, Option<(&str, Act)>) = if !st.loaded {
+            ("正在检查网络扩展", "正在向系统查询网络扩展的安装状态…".into(), None)
+        } else if !st.bundled {
+            ("这个版本没有附带网络扩展", "应用包里找不到 Egress Guard 网络扩展，无法按应用断网。请使用完整的发布版本，或者使用「全局断网」。".into(), None)
+        } else if !st.signed() {
+            (
+                "需要签名版本才能按应用断网",
+                "按应用断网依赖 Apple 的网络扩展（内容过滤）。macOS 只加载用 Developer ID 签名、并经过 Apple 公证的网络扩展，\
+                 当前这个版本没有签名，系统会拒绝启用。受控应用可以照常添加、保存，换成签名版本并启用扩展后立即生效；在那之前请使用「全局断网」。"
+                    .into(),
+                Some(("仍要尝试启用…", Act::Activate)),
+            )
+        } else if st.awaiting_approval() {
+            (
+                "等待你在系统设置中允许",
+                "打开「系统设置 → 隐私与安全性」，在页面下方找到 Egress Guard 被阻止的系统扩展，点「允许」并输入密码。\
+                 之后系统会询问是否允许过滤网络内容，请选择「允许」。"
+                    .into(),
+                Some(("打开系统设置", Act::OpenSettings)),
+            )
+        } else if st.phase == "reboot_required" {
+            ("需要重新启动", "网络扩展将在重新启动 Mac 后生效。".into(), None)
+        } else if ext_on && !st.filter_enabled {
+            (
+                "内容过滤未开启",
+                "网络扩展已安装，但内容过滤没有开启（可能在系统设置里被关闭了）。开启时系统会询问是否允许过滤网络内容。".into(),
+                Some(("开启内容过滤", Act::EnableFilter)),
+            )
+        } else if ext_on && self.backend.service() != ServiceState::NotApplicable && !s.running {
+            ("等待后台服务", "网络扩展已启用。后台服务运行后，它会自动连接并开始按应用断网。".into(), None)
+        } else if ext_on {
+            ("正在连接后台服务", "网络扩展已启用，正在等待它连接后台服务…如果一直连不上，可以重新启用。".into(), Some(("重新启用", Act::Activate)))
+        } else {
+            (
+                "启用按应用断网",
+                "受控应用的连接由 Egress Guard 网络扩展逐个放行或切断。启用时系统会先要求你在「系统设置 → 隐私与安全性」中允许这个系统扩展，\
+                 然后询问是否允许过滤网络内容。"
+                    .into(),
+                Some(("启用网络扩展…", Act::Activate)),
+            )
+        };
+        if let Some(e) = st.last_error() {
+            body.push_str(&format!("\n上次操作失败：{e}"));
+        }
+        let mut clicked = None;
+        let mut doc = false;
+        warning_card_with(ui, p, title, &body, |ui| {
+            if st.busy() {
+                ui.label(RichText::new("等待系统…").size(12.5).color(p.secondary));
+                ui.add(egui::Spinner::new().size(14.0));
+            } else if let Some((label, act)) = action {
+                let primary = !matches!(act, Act::Activate) || st.signed();
+                let r = if primary { theme::accent_button(ui, p, label, true) } else { theme::gray_button(ui, p, label) };
+                if r.clicked() {
+                    clicked = Some(act);
+                }
+            }
+            if !st.signed() || st.last_error().is_some() {
+                doc = theme::text_button(ui, p.accent, "说明  ›").on_hover_text(NETEXT_DOC).clicked();
+            }
+        });
+        match clicked {
+            Some(Act::Activate) => crate::netext::activate(),
+            Some(Act::EnableFilter) => crate::netext::set_filter(true),
+            Some(Act::OpenSettings) => open_url("x-apple.systempreferences:com.apple.preference.security"),
+            None => {}
+        }
+        if clicked.is_some() {
+            self.netext_refreshed = None;
+        }
+        if doc {
+            open_url(NETEXT_DOC);
+        }
+        ui.add_space(4.0);
+    }
+
     // ---------------- 侧边栏 ----------------
 
     fn sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -590,9 +729,7 @@ impl App {
             (Page::Settings, theme::NavItem { glyph: Glyph::Gear, icon_bg: p.gray, text: "设置", badge: None }),
             (Page::Log, theme::NavItem { glyph: Glyph::Lines, icon_bg: p.indigo, text: "日志", badge: None }),
         ];
-        // 不能按应用断网的平台不显示「受控应用」（列表仍保留在配置里）
-        let (pages, items): (Vec<Page>, Vec<theme::NavItem>) =
-            all.into_iter().filter(|(page, _)| PER_APP || *page != Page::Apps).unzip();
+        let (pages, items): (Vec<Page>, Vec<theme::NavItem>) = all.into_iter().unzip();
         let selected = pages.iter().position(|x| *x == self.page).unwrap_or(0);
         if let Some(i) = theme::nav_list(ui, p, &items, selected) {
             self.page = pages[i];
@@ -648,13 +785,24 @@ impl App {
             warning_card(ui, p, "拦截规则未生效", &format!("{}{e}", text::BACKEND_UNAVAILABLE));
             ui.add_space(4.0);
         }
-        if !PER_APP && s.running && !self.applied.block_all.enabled {
-            let mut go = false;
-            warning_card_with(ui, p, "全局断网未开启", "macOS 版只能切断全部网络，不能按应用断网。现在出口 IP 不在白名单时不会拦截任何连接。", |ui| {
-                go = theme::text_button(ui, p.accent, "去开启  ›").clicked();
+        // macOS：网络扩展没连上时只有 pf 全局断网有效
+        if !s.per_app && s.running && !s.simulated && !self.applied.block_all.enabled {
+            let mut go = None;
+            let body = if self.applied.apps.is_empty() {
+                "还没有添加受控应用，全局断网也没有开启：出口 IP 不在白名单时不会拦截任何连接。"
+            } else {
+                "网络扩展没有启用，出口 IP 不在白名单时受控应用不会被断网。可以启用网络扩展，或者开启全局断网。"
+            };
+            warning_card_with(ui, p, "按应用断网未生效", body, |ui| {
+                if theme::text_button(ui, p.accent, "全局断网  ›").clicked() {
+                    go = Some(Page::Network);
+                }
+                if theme::text_button(ui, p.accent, "网络扩展  ›").clicked() {
+                    go = Some(Page::Apps);
+                }
             });
-            if go {
-                self.page = Page::Network;
+            if let Some(pg) = go {
+                self.page = pg;
             }
             ui.add_space(4.0);
         }
@@ -670,7 +818,7 @@ impl App {
         } else {
             theme::Route::Checking
         };
-        let scope = if s.block_all || !PER_APP { "全部网络".to_owned() } else { format!("{} 个受控应用", self.applied.apps.len()) };
+        let scope = if s.block_all || !s.per_app { "全部网络".to_owned() } else { format!("{} 个受控应用", self.applied.apps.len()) };
         let gate = match (s.whitelisted, s.blocked) {
             _ if !s.running => if s.backend_error.is_some() { "未连接" } else { "已停止" },
             _ if inert(&s) => "未通过，未拦截",
@@ -727,13 +875,16 @@ impl App {
                 if s.backend_error.is_some() {
                     theme::chip(ui, p.orange, "模拟模式");
                 } else if s.running {
+                    if let Some(v) = &s.filter_ext {
+                        theme::chip(ui, p.green, &format!("网络扩展 {v}"));
+                    }
                     theme::chip(ui, p.green, text::ENGINE_RUNNING);
                 } else {
                     theme::chip(ui, p.gray, "未运行");
                 }
             });
             theme::hairline(ui, p);
-            let scope = match (self.applied.block_all.enabled, PER_APP) {
+            let scope = match (self.applied.block_all.enabled, s.per_app || !s.running) {
                 (true, _) => "全部网络",
                 (false, true) => "仅受控应用",
                 (false, false) => "未开启",
@@ -743,16 +894,14 @@ impl App {
                     goto = Some(Page::Network);
                 }
             });
-            if PER_APP {
-                theme::hairline(ui, p);
-                let extra_n = s.extra_apps.len();
-                let sub = (extra_n > 0).then(|| format!("另有 {extra_n} 个自动识别的关联程序"));
-                theme::row(ui, p, "受控应用", sub.as_deref(), |ui| {
-                    if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
-                        goto = Some(Page::Apps);
-                    }
-                });
-            }
+            theme::hairline(ui, p);
+            let extra_n = s.extra_apps.len();
+            let sub = (extra_n > 0).then(|| format!("另有 {extra_n} 个自动识别的关联程序"));
+            theme::row(ui, p, "受控应用", sub.as_deref(), |ui| {
+                if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
+                    goto = Some(Page::Apps);
+                }
+            });
             theme::hairline(ui, p);
             theme::row(ui, p, "白名单条目", None, |ui| {
                 if theme::text_button(ui, p.accent, &format!("{} 条  ›", self.applied.whitelist.len())).clicked() {
@@ -847,15 +996,9 @@ impl App {
     }
 
     fn apps(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        theme::page_title(ui, p, "受控应用", "出口 IP 不在白名单内时，以下程序的全部网络连接会被阻断。");
-        if !PER_APP {
-            info_card(
-                ui,
-                p,
-                "macOS 版暂不支持按应用断网",
-                "按应用拦截需要 Apple 的网络扩展（Network Extension），必须用付费开发者账号签名、公证后才能启用。当前版本请使用「全局断网」；这里的列表会保留，供以后的签名版本使用。",
-            );
-            ui.add_space(4.0);
+        theme::page_title(ui, p, "受控应用", text::APPS_SUB);
+        if crate::netext::supported() {
+            self.netext_card(ui, p);
         }
 
         ui.horizontal(|ui| {
@@ -1158,11 +1301,11 @@ impl App {
         });
 
         theme::section(ui, p, &format!("例外程序 {} 个", self.draft.block_all.allow_apps.len()));
-        if !PER_APP {
+        if !ALLOW_APPS {
             info_card(ui, p, "macOS 版不支持按程序放行", "pf 防火墙不能区分程序。VPN 客户端请改为把 VPN 服务器地址填到下面的「例外地址」。");
             ui.add_space(4.0);
         }
-        if PER_APP {
+        if ALLOW_APPS {
         ui.horizontal(|ui| {
             if theme::gray_button(ui, p, "浏览选择程序…").clicked() {
                 for f in platform::pick_exe_files() {
@@ -1180,7 +1323,7 @@ impl App {
         ui.add_space(4.0);
         }
         let mut remove = None;
-        if PER_APP || !self.draft.block_all.allow_apps.is_empty() {
+        if ALLOW_APPS || !self.draft.block_all.allow_apps.is_empty() {
         theme::card(ui, p, |ui| {
             let list = &self.draft.block_all.allow_apps;
             if list.is_empty() {
@@ -1326,13 +1469,11 @@ impl App {
             theme::row(ui, p, "网络变化时先阻断", Some("防止切换网络的瞬间泄漏"), |ui| {
                 theme::toggle(ui, p, &mut b.block_on_network_change);
             });
-            // pf 规则不建立状态，已有连接在下一个数据包就会被拦截，不需要这个选项
-            if PER_APP {
-                theme::hairline(ui, p);
-                theme::row(ui, p, "断开已有连接", Some("切换为阻断时，主动断开受控应用的 TCP 连接"), |ui| {
-                    theme::toggle(ui, p, &mut b.kill_existing_tcp);
-                });
-            }
+            // macOS 的全局断网（pf 不建立状态）总会切断已有连接；这个选项只影响受控应用
+            theme::hairline(ui, p);
+            theme::row(ui, p, "断开已有连接", Some(text::KILL_EXISTING_SUB), |ui| {
+                theme::toggle(ui, p, &mut b.kill_existing_tcp);
+            });
             theme::hairline(ui, p);
             theme::row(ui, p, "网络变化防抖", None, |ui| {
                 ui.add(egui::DragValue::new(&mut b.debounce_ms).range(0..=30000).suffix(" 毫秒"));
@@ -1521,6 +1662,7 @@ fn letter_icon(ui: &mut egui::Ui, p: &Palette, name: &str) {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_service_job();
+        self.poll_netext(ctx);
         // macOS：连上后台服务后以服务里的配置为准（没有未保存的修改时）
         if let Some(raw) = self.backend.take_new_config() {
             if !self.dirty() && raw != self.applied {
@@ -1640,6 +1782,16 @@ fn titlebar_drag_area(ui: &mut egui::Ui) {
 }
 
 /// 从路径中取出不带扩展名（.exe / .app）的程序名（与运行平台无关）。
+/// 用系统默认方式打开链接（macOS 的 open；其他平台不需要）。
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    if let Err(e) = std::process::Command::new("/usr/bin/open").arg(url).spawn() {
+        log::warn!("无法打开 {url}: {e}");
+    }
+    #[cfg(not(target_os = "macos"))]
+    log::info!("打开 {url}");
+}
+
 fn exe_name(path: &str) -> String {
     let file = path.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().unwrap_or(path);
     match file.rsplit_once('.') {

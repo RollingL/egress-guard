@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 主程序（界面）的权限（只在用 Developer ID 签名时使用；@TEAM_ID@ 由打包脚本替换）。
+     安装系统扩展、配置内容过滤都是受限权限，必须与描述文件（provisioning profile）里的一致。
+     未签名（ad-hoc）版本不能带这些权限，否则系统会直接拒绝启动程序。 -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.application-identifier</key>
+	<string>@TEAM_ID@.com.egressguard.app</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>@TEAM_ID@</string>
+	<key>com.apple.developer.system-extension.install</key>
+	<true/>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>content-filter-provider-systemextension</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>@TEAM_ID@.com.egressguard</string>
+	</array>
+</dict>
+</plist>

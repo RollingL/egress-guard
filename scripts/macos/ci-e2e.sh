@@ -1,7 +1,10 @@
 #!/bin/bash
 # 在 GitHub 的 macOS 虚拟机上做端到端测试（需要免密 sudo）：
-# 安装后台服务 → 全局断网生效（检测仍可用、例外地址可达）→ 出口进入白名单后放行 → 退出 → 卸载。
-# 中间启动界面截图，保存到 target/macos/shots/。
+# 安装后台服务 → 按应用断网的规则推送（用测试客户端代替网络扩展）→ 全局断网生效（检测仍可用、例外地址可达）
+# → 出口进入白名单后放行 → 退出 → 卸载。中间启动界面截图，保存到 target/macos/shots/。
+#
+# 网络扩展本身（NEFilterDataProvider）需要 Developer ID 签名才能被系统加载，CI 里测不到；
+# 这里测的是它与后台服务之间的协议，用的是扩展里同一份 Swift 代码（macos/Shared）。
 #
 # 注意：断网期间 Actions runner 自己也连不上 GitHub，所以断网阶段尽量短。
 set -uo pipefail
@@ -11,6 +14,9 @@ APP="$PWD/target/macos/Egress Guard.app"
 CLI="$APP/Contents/MacOS/egress-guard"
 GUI="$APP/Contents/MacOS/egress-guard-gui"
 SHOTS="$PWD/target/macos/shots"
+FEEDTEST="$PWD/target/macos/feedtest"
+SOCK=/var/run/egress-guard.sock
+MARKER=/var/run/egress-guard.running
 mkdir -p "$SHOTS"
 FAILED=0
 
@@ -69,6 +75,15 @@ sudo pfctl -s rules 2>/dev/null | head -20
 step "未安装服务时的界面"
 shot 0-not-installed overview 5
 
+step "网络扩展自检（未签名：预期系统拒绝安装，这里只确认桥接代码能运行并给出原因）"
+sudo rm -rf "/Applications/Egress Guard.app"
+sudo ditto "$APP" "/Applications/Egress Guard.app"
+SELF=$("/Applications/Egress Guard.app/Contents/MacOS/egress-guard-gui" --netext-selftest 8 | tail -1)
+echo "$SELF"
+echo "$SELF" | python3 -c "import json,sys; s=json.load(sys.stdin); print('bundled', s['bundled'], 'team', s.get('team_id'), 'phase', s['phase']); sys.exit(0 if s['bundled'] and s['loaded'] else 1)" \
+  || fail "网络扩展自检失败：$SELF"
+sudo rm -rf "/Applications/Egress Guard.app"
+
 step "安装后台服务"
 sudo "$CLI" service install || fail "安装失败"
 ls -l /Library/LaunchDaemons/com.egressguard.daemon.plist /var/run/egress-guard.sock
@@ -77,6 +92,47 @@ IP=$(field egress_ip)
 echo "出口 IP：$IP"
 "$CLI" status
 can_reach https://example.com || fail "默认配置（未开启全局断网）不应断网"
+[[ -e "$MARKER" ]] && echo "OK：运行标记 $MARKER 存在" || fail "服务运行时没有 $MARKER"
+
+step "按应用断网：没有网络扩展时规则不生效、不影响其他程序"
+cat > /tmp/eg.toml <<TOML
+whitelist = []
+apps = ["/Applications/Safari.app", "/System/Applications/Calculator.app"]
+[detect]
+interval_secs = 10
+[ui]
+appearance = "light"
+TOML
+"$CLI" apply /tmp/eg.toml || fail "apply 失败"
+wait_for "s.get('blocked') and not s.get('block_all')" 30 || fail "没有进入阻断"
+[[ "$(field per_app)" == "" ]] && echo "OK：没有网络扩展时 per_app = false" || fail "没有网络扩展却报告 per_app"
+can_reach https://example.com && echo "OK：其他程序不受影响" || fail "按应用阻断不应影响其他程序"
+shot 7-apps-unsigned-light apps 5
+
+step "按应用断网：测试客户端以网络扩展的身份接收规则"
+sudo "$FEEDTEST" --feed "$SOCK" "$MARKER" --expect-app /Applications/Safari.app --expect blocked,allowed --timeout 120 \
+  > /tmp/feedtest.log 2>&1 &
+FEED_PID=$!
+wait_for "s.get('filter_ext') and s.get('per_app')" 30 || fail "后台服务没有看到网络扩展连接"
+"$CLI" status
+shot 8-perapp-blocked-light overview 6
+shot 9-apps-connected-light apps 5
+write_cfg_apps_ok() {
+  cat > /tmp/eg.toml <<TOML
+whitelist = ["$IP"]
+apps = ["/Applications/Safari.app", "/System/Applications/Calculator.app"]
+[detect]
+interval_secs = 10
+[ui]
+appearance = "dark"
+TOML
+}
+write_cfg_apps_ok
+"$CLI" apply /tmp/eg.toml || fail "apply 失败"
+wait_for "not s.get('blocked')" 30 || fail "出口进入白名单后没有放行"
+if wait "$FEED_PID"; then echo "OK：网络扩展依次收到 阻断 → 放行"; else fail "网络扩展测试客户端失败"; fi
+cat /tmp/feedtest.log
+wait_for "not s.get('filter_ext')" 30 || fail "网络扩展断开后后台服务仍报告已连接"
 
 step "全局断网：白名单为空"
 write_cfg "" light
@@ -132,6 +188,7 @@ wait_for "s.get('blocked')" 30 || fail "没有再次阻断"
 "$CLI" stop || fail "stop 失败"
 sleep 2
 can_reach https://example.com && echo "OK：退出后网络恢复" || fail "退出后仍然断网"
+[[ ! -e "$MARKER" ]] && echo "OK：退出后运行标记已删除（网络扩展不会再把服务拉起来）" || fail "退出后 $MARKER 仍存在"
 [[ -z "$(sudo pfctl -a com.apple/egress-guard -s rules 2>/dev/null)" ]] || fail "退出后锚点里仍有规则"
 
 step "卸载"
