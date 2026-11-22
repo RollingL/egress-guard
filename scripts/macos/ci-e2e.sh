@@ -115,7 +115,7 @@ windows() {
     const l = ObjC.deepUnwrap(ObjC.castRefToObject(\$.CGWindowListCopyWindowInfo(\$.kCGWindowListOptionOnScreenOnly, 0)));
     l.filter(w => w.kCGWindowOwnerPID == $GPID && w.kCGWindowLayer == 0).length" 2>/dev/null
 }
-echo "界面进程 $GPID，隐藏时窗口数：$(windows)"
+echo "界面进程 ${GPID}，隐藏时窗口数：$(windows)"
 open "$APP"
 sleep 3
 N=$(windows)
