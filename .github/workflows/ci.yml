@@ -38,6 +38,47 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      # GitHub 的 Windows 虚拟机没有显卡驱动，只有 OpenGL 1.1，界面（OpenGL 2.0+）打不开。
+      # 自检时把 Mesa 的软件渲染 opengl32.dll 放在程序旁边（只在 CI 的临时目录里，发布的程序不带）。
+      - name: 准备软件渲染的 OpenGL（Mesa llvmpipe）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+          if (-not $asset) { $rel.assets.name; Write-Error '找不到 Mesa 发布包' }
+          "Mesa $($rel.tag_name)：$($asset.name)"
+          $dir = Join-Path $env:RUNNER_TEMP 'mesa'
+          Invoke-WebRequest $asset.browser_download_url -OutFile "$dir.7z"
+          7z x "$dir.7z" "-o$dir" -y | Out-Null
+          $gui = Join-Path $env:RUNNER_TEMP 'gui'
+          New-Item -ItemType Directory -Force $gui | Out-Null
+          Copy-Item target\release\egress-guard-gui.exe $gui
+          Copy-Item (Join-Path $dir 'x64\*.dll') $gui
+          Get-ChildItem $gui | Select-Object Name, Length
+      - name: 复制粘贴：界面与系统剪贴板互通（Ctrl+C / Ctrl+V）
+        shell: pwsh
+        env:
+          GALLIUM_DRIVER: llvmpipe
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'clipboard.json'
+          Set-Clipboard -Value 'before'
+          $err = Join-Path $env:RUNNER_TEMP 'clipboard.err'
+          $p = Start-Process (Join-Path $env:RUNNER_TEMP 'gui\egress-guard-gui.exe') -ArgumentList '--clipboard-selftest', $out, '16' -PassThru -RedirectStandardError $err
+          Start-Sleep 8
+          if ($p.HasExited) { Get-Content $err -ErrorAction SilentlyContinue; Write-Error "自检窗口启动失败（退出码 $($p.ExitCode)）" }
+          $copied = Get-Clipboard -Raw
+          if ($copied -ne 'egress-guard-copy-ok') { Write-Error "界面里复制的文字没有到系统剪贴板：$copied" }
+          else { 'OK：界面里复制的文字到了系统剪贴板' }
+          Set-Clipboard -Value '203.0.113.7'
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.SendKeys]::SendWait('^v')
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); Write-Error '自检窗口没有按时退出' }
+          $pasted = (Get-Content $out -Raw | ConvertFrom-Json).pasted
+          "输入框内容：$pasted"
+          if ($pasted -ne '203.0.113.7') { Write-Error 'Ctrl+V 没有把系统剪贴板的内容粘贴进输入框' }
+          else { 'OK：Ctrl+V 把系统剪贴板的内容粘贴进了输入框' }
       - uses: actions/upload-artifact@v4
         with:
           name: egress-guard-windows

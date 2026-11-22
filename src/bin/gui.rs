@@ -6,7 +6,19 @@
 //!   -c, --config PATH  配置文件路径（Windows，默认：exe 所在目录下的 config.toml）
 //!   --page NAME        打开时显示的页面（截图用）
 //!   --netext-selftest [秒]  macOS：查询网络扩展状态并尝试安装，打印结果后退出（CI 用）
+//!   --clipboard-selftest 输出文件 [秒]  打开一个输入框窗口检查系统剪贴板的复制、粘贴（CI 用）
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
+/// `--clipboard-selftest 输出文件 [秒]`：见 [`egress_guard::gui::clipboard_selftest`]。
+fn clipboard_selftest(mut args: impl Iterator<Item = String>) -> ! {
+    let out = args.next().map(std::path::PathBuf::from).unwrap_or_else(|| "clipboard-selftest.json".into());
+    let secs = args.next().and_then(|s| s.parse().ok()).unwrap_or(10.0);
+    if let Err(e) = egress_guard::gui::clipboard_selftest(out, secs) {
+        eprintln!("{e:#}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
 
 #[cfg(windows)]
 fn main() {
@@ -29,6 +41,7 @@ fn main() {
             "--minimized" => start_minimized = true,
             "-c" | "--config" => config = args.next().map(PathBuf::from),
             "--page" => start_page = args.next(),
+            "--clipboard-selftest" => clipboard_selftest(args),
             _ => {}
         }
     }
@@ -82,6 +95,7 @@ fn main() {
                 egress_guard::netext::selftest(args.next().and_then(|s| s.parse().ok()).unwrap_or(10.0));
                 return;
             }
+            "--clipboard-selftest" => clipboard_selftest(args),
             _ => {}
         }
     }
@@ -126,6 +140,7 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--page" => start_page = args.next(),
+            "--clipboard-selftest" => clipboard_selftest(args),
             other => config_path = other.into(),
         }
     }
