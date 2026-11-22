@@ -58,6 +58,24 @@ exclude = [
     # 'C:\Program Files\Mozilla Firefox\firefox.exe',
 ]
 
+[block_all]
+# 全局断网：出口 IP 不在白名单时切断本机全部网络（而不只是 apps 中的程序）。
+# 始终放行：本工具自身（用于继续检测出口 IP）、回环地址、DHCP。
+# apps 中的受控应用不受下面的例外影响，阻断时仍完全断网。退出程序即恢复全部网络。
+enabled = false
+# 放行局域网（10/8、172.16/12、192.168/16、169.254/16、组播、fe80::/10、fc00::/7）
+allow_lan = true
+# 放行 DNS 查询（远端端口 53）。关闭后本工具也可能无法检测出口 IP
+allow_dns = true
+# 例外程序（完整路径），如 VPN 客户端：断网时仍需要它连上 VPN
+allow_apps = [
+    # 'C:\Program Files\OpenVPN\bin\openvpn.exe',
+]
+# 例外远端地址/网段，如 VPN 服务器。WireGuard 等由内核发包的 VPN 只能用这种方式放行
+allow_remote = [
+    # "198.51.100.7",
+]
+
 [ui]
 # 界面外观：system（跟随系统）/ light（浅色）/ dark（深色）。命令行版本忽略此项
 appearance = "system"

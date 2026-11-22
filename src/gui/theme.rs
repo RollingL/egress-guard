@@ -341,6 +341,7 @@ pub enum Glyph {
     Grid,
     Gear,
     Lines,
+    Globe,
 }
 
 /// 盾牌轮廓的多边形（凸多边形，坐标归一化到 0..1）。
@@ -388,6 +389,13 @@ pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Col
                 painter.line_segment([c + d * s * 0.22, c + d * s * 0.36], Stroke::new(s * 0.13, color));
             }
             painter.circle_stroke(c, s * 0.20, Stroke::new(s * 0.11, color));
+        }
+        Glyph::Globe => {
+            let c = rect.center();
+            let st = Stroke::new(s * 0.08, color);
+            painter.circle_stroke(c, s * 0.32, st);
+            painter.add(Shape::ellipse_stroke(c, Vec2::new(s * 0.13, s * 0.32), st));
+            painter.line_segment([at(0.18, 0.5), at(0.82, 0.5)], st);
         }
         Glyph::Lines => {
             for (i, w) in [0.56, 0.44, 0.56].iter().enumerate() {

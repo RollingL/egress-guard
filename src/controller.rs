@@ -5,15 +5,27 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::blockall::BlockAllPolicy;
 use crate::config::{Config, FailMode};
+
+/// 阻断时要生效的规则。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Rules {
+    /// 受控应用（含自动识别的关联程序）：阻断时完全断网，不受全局断网例外影响。
+    pub apps: Vec<PathBuf>,
+    /// 全局断网的例外规则；None 表示只阻断受控应用。
+    pub block_all: Option<BlockAllPolicy>,
+    /// 切换为阻断时主动断开现有 IPv4 TCP 连接。
+    pub kill_existing_tcp: bool,
+}
 
 /// 防火墙后端抽象。Windows 上由 WFP 实现，--dry-run 时只打日志。
 pub trait Firewall {
     fn block(&mut self) -> Result<()>;
     fn unblock(&mut self) -> Result<()>;
     fn is_blocked(&self) -> bool;
-    /// 更换受控应用列表；若当前处于阻断状态，新列表立即生效。
-    fn set_apps(&mut self, apps: Vec<PathBuf>, kill_existing_tcp: bool) -> Result<()>;
+    /// 更换规则；若当前处于阻断状态，新规则立即生效。
+    fn set_rules(&mut self, rules: Rules) -> Result<()>;
     /// 是否有程序暂未能加上规则（文件暂不存在或单个程序添加失败），需要稍后重试。
     fn has_pending(&self) -> bool {
         false
@@ -86,6 +98,20 @@ impl Controller {
         self.failures
     }
 
+    /// 阻断范围的描述，用于日志。
+    fn scope(&self) -> &'static str {
+        if self.cfg.block_all.enabled { "全部网络" } else { "受控应用" }
+    }
+
+    /// 当前应生效的规则。
+    pub fn rules(&self) -> Rules {
+        Rules {
+            apps: self.effective_apps(),
+            block_all: self.cfg.block_all_policy(),
+            kill_existing_tcp: self.cfg.behavior.kill_existing_tcp,
+        }
+    }
+
     /// 实际需要阻断的程序：配置的受控应用 + 自动识别的关联程序（去重）。
     pub fn effective_apps(&self) -> Vec<PathBuf> {
         let mut seen = std::collections::HashSet::new();
@@ -109,9 +135,14 @@ impl Controller {
 
     /// 把当前程序列表推送到防火墙；失败时记下，等 `retry_pending` 重试。
     fn push_apps(&mut self) -> Result<()> {
-        let r = self.fw.set_apps(self.effective_apps(), self.cfg.behavior.kill_existing_tcp);
+        let r = self.fw.set_rules(self.rules());
         self.apps_dirty = r.is_err();
         r
+    }
+
+    /// 按当前配置把规则推送到防火墙（启动时调用一次）。
+    pub fn apply_rules(&mut self) -> Result<()> {
+        self.push_apps()
     }
 
     /// 是否有未完成的规则同步需要重试。
@@ -129,9 +160,9 @@ impl Controller {
 
     /// 应用新配置。受控应用变化会立即反映到防火墙规则上。
     pub fn reconfigure(&mut self, cfg: Config) -> Result<()> {
-        let changed = cfg.apps != self.cfg.apps
-            || cfg.behavior.kill_existing_tcp != self.cfg.behavior.kill_existing_tcp;
+        let before = self.rules();
         self.cfg = cfg;
+        let changed = self.rules() != before;
         // 规则同步失败也继续按新白名单决策，错误最后再返回
         let sync = if changed || self.apps_dirty { self.push_apps() } else { Ok(()) };
         // 白名单可能已变化：用最近一次的出口 IP 立即重新决策
@@ -151,7 +182,7 @@ impl Controller {
     /// 网络变化时调用：按配置先行阻断。
     pub fn on_network_change(&mut self) -> Result<()> {
         if self.cfg.behavior.block_on_network_change && !self.fw.is_blocked() {
-            log::info!("网络发生变化，先阻断受控应用，等待重新检测出口 IP");
+            log::info!("网络发生变化，先阻断{}，等待重新检测出口 IP", self.scope());
             self.fw.block()?;
         }
         Ok(())
@@ -181,11 +212,11 @@ impl Controller {
 
         match decide(&self.cfg, &detection, self.failures) {
             Some(true) if !self.fw.is_blocked() => {
-                log::warn!("切换为【阻断】受控应用");
+                log::warn!("切换为【阻断】{}", self.scope());
                 self.fw.block()
             }
             Some(false) if self.fw.is_blocked() => {
-                log::info!("切换为【放行】受控应用");
+                log::info!("切换为【放行】{}", self.scope());
                 self.fw.unblock()
             }
             _ => Ok(()),
@@ -201,20 +232,24 @@ pub struct DryRunFirewall {
 
 impl Firewall for DryRunFirewall {
     fn block(&mut self) -> Result<()> {
-        log::info!("[dry-run] 将阻断受控应用");
+        log::info!("[dry-run] 将阻断");
         self.blocked = true;
         Ok(())
     }
     fn unblock(&mut self) -> Result<()> {
-        log::info!("[dry-run] 将放行受控应用");
+        log::info!("[dry-run] 将放行");
         self.blocked = false;
         Ok(())
     }
     fn is_blocked(&self) -> bool {
         self.blocked
     }
-    fn set_apps(&mut self, apps: Vec<PathBuf>, _kill: bool) -> Result<()> {
-        log::info!("[dry-run] 受控应用更新为 {} 个", apps.len());
+    fn set_rules(&mut self, rules: Rules) -> Result<()> {
+        log::info!(
+            "[dry-run] 规则更新：受控应用 {} 个{}",
+            rules.apps.len(),
+            if rules.block_all.is_some() { "，全局断网" } else { "" }
+        );
         Ok(())
     }
 }
@@ -276,10 +311,10 @@ mod tests {
         assert!(!c.is_blocked());
     }
 
-    /// set_apps 前 N 次失败的测试后端。
+    /// set_rules 前 N 次失败的测试后端。
     struct FlakyFirewall {
         fail_left: std::rc::Rc<std::cell::Cell<u32>>,
-        applied: std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>,
+        applied: std::rc::Rc<std::cell::RefCell<Rules>>,
     }
 
     impl Firewall for FlakyFirewall {
@@ -292,12 +327,12 @@ mod tests {
         fn is_blocked(&self) -> bool {
             true
         }
-        fn set_apps(&mut self, apps: Vec<PathBuf>, _kill: bool) -> Result<()> {
+        fn set_rules(&mut self, rules: Rules) -> Result<()> {
             if self.fail_left.get() > 0 {
                 self.fail_left.set(self.fail_left.get() - 1);
                 return Err(anyhow!("WFP 暂时不可用"));
             }
-            *self.applied.borrow_mut() = apps;
+            *self.applied.borrow_mut() = rules;
             Ok(())
         }
     }
@@ -305,7 +340,7 @@ mod tests {
     #[test]
     fn failed_sync_is_retried() {
         let fail_left = std::rc::Rc::new(std::cell::Cell::new(1));
-        let applied = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let applied = std::rc::Rc::new(std::cell::RefCell::new(Rules::default()));
         let fw = FlakyFirewall { fail_left: fail_left.clone(), applied: applied.clone() };
         let mut c = Controller::new(cfg(""), Box::new(fw));
         let extra = vec![PathBuf::from("C:\\b.exe")];
@@ -315,14 +350,33 @@ mod tests {
         // 同样的列表再次到达时不能因"没变化"而跳过
         c.set_extra(extra.clone()).unwrap();
         assert!(!c.needs_retry());
-        assert_eq!(applied.borrow().len(), 2);
+        assert_eq!(applied.borrow().apps.len(), 2);
 
         // 定时重试路径
         fail_left.set(1);
         assert!(c.set_extra(vec![]).is_err());
         c.retry_pending().unwrap();
         assert!(!c.needs_retry());
-        assert_eq!(applied.borrow().len(), 1);
+        assert_eq!(applied.borrow().apps.len(), 1);
+    }
+
+    #[test]
+    fn block_all_follows_config() {
+        let applied = std::rc::Rc::new(std::cell::RefCell::new(Rules::default()));
+        let fw = FlakyFirewall { fail_left: Default::default(), applied: applied.clone() };
+        let mut c = Controller::new(cfg(""), Box::new(fw));
+        c.apply_rules().unwrap();
+        assert!(applied.borrow().block_all.is_none());
+
+        c.reconfigure(cfg("[block_all]\nenabled=true\nallow_lan=false\nallow_remote=['198.51.100.7']")).unwrap();
+        let p = applied.borrow().block_all.clone().unwrap();
+        assert!(!p.allow_lan && p.allow_dns);
+        assert_eq!(p.allow_remote.len(), 1);
+        // 受控应用不受全局断网影响，仍在阻断列表里
+        assert_eq!(applied.borrow().apps.len(), 1);
+
+        c.reconfigure(cfg("")).unwrap();
+        assert!(applied.borrow().block_all.is_none());
     }
 
     #[test]

@@ -46,19 +46,30 @@ enum Page {
     Overview,
     Whitelist,
     Apps,
+    Network,
     Settings,
     Log,
 }
 
 impl Page {
     fn editable(self) -> bool {
-        matches!(self, Page::Whitelist | Page::Apps | Page::Settings)
+        matches!(self, Page::Whitelist | Page::Apps | Page::Network | Page::Settings)
     }
+}
+
+/// 程序选择器选中的程序加到哪个列表。
+#[derive(PartialEq, Clone, Copy)]
+enum PickFor {
+    /// 受控应用。
+    Apps,
+    /// 全局断网的例外程序。
+    AllowApps,
 }
 
 struct ProcPicker {
     filter: String,
     list: Vec<procs::ProcInfo>,
+    target: PickFor,
 }
 
 struct App {
@@ -74,6 +85,9 @@ struct App {
     page: Page,
     new_entry: String,
     entry_error: Option<String>,
+    /// 全局断网例外地址的输入框。
+    new_remote: String,
+    remote_error: Option<String>,
     /// (是否成功, 文本, 时间)
     message: Option<(bool, String, Instant)>,
     load_error: Option<String>,
@@ -148,6 +162,8 @@ pub fn run(opts: Options) -> Result<()> {
                 page: Page::Overview,
                 new_entry: String::new(),
                 entry_error: None,
+                new_remote: String::new(),
+                remote_error: None,
                 message: None,
                 load_error,
                 picker: None,
@@ -181,19 +197,24 @@ fn tray_state(s: &Status) -> tray::TrayState {
     tray::TrayState { shade, tooltip }
 }
 
+/// 阻断范围的名称。
+fn scope_name(s: &Status) -> &'static str {
+    if s.block_all { "全部网络" } else { "受控应用" }
+}
+
 /// 状态的展示信息：标题、说明、颜色。
 fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
     if !s.running {
         ("已停止", "后台引擎没有运行。".into(), p.gray)
     } else if s.blocked {
         let why = match (s.egress_ip, &s.detect_error) {
-            (Some(ip), _) => format!("出口 IP {ip} 不在白名单内，受控应用已断网。"),
+            (Some(ip), _) => format!("出口 IP {ip} 不在白名单内，{}已断网。", scope_name(s)),
             (None, Some(_)) => "无法确定出口 IP，为安全起见已断网。".into(),
-            (None, None) => "正在确认出口 IP，确认前受控应用保持断网。".into(),
+            (None, None) => format!("正在确认出口 IP，确认前{}保持断网。", scope_name(s)),
         };
         ("已阻断", why, p.red)
     } else if let Some(ip) = s.egress_ip {
-        ("已放行", format!("出口 IP {ip} 在白名单内，受控应用可以正常联网。"), p.green)
+        ("已放行", format!("出口 IP {ip} 在白名单内，{}可以正常联网。", scope_name(s)), p.green)
     } else {
         ("检测中", "正在确认出口 IP…".into(), p.gray)
     }
@@ -230,6 +251,7 @@ impl App {
         self.services_text = self.draft.detect.services.join("\n");
         self.message = None;
         self.entry_error = None;
+        self.remote_error = None;
     }
 
     fn sync_services(&mut self) {
@@ -262,6 +284,34 @@ impl App {
         }
     }
 
+    fn add_allow_app(&mut self, path: PathBuf) {
+        let key = procs::normalize_path(&path.to_string_lossy());
+        let list = &mut self.draft.block_all.allow_apps;
+        if !list.iter().any(|a| procs::normalize_path(&a.to_string_lossy()) == key) {
+            list.push(path);
+        }
+    }
+
+    fn add_remote_entry(&mut self) {
+        let entry = self.new_remote.trim().to_owned();
+        if entry.is_empty() {
+            return;
+        }
+        match parse_net(&entry) {
+            Ok(net) => {
+                let text = crate::config::format_net(&net);
+                if self.draft.block_all.allow_remote.contains(&text) {
+                    self.remote_error = Some("该地址已存在".into());
+                } else {
+                    self.draft.block_all.allow_remote.push(text);
+                    self.new_remote.clear();
+                    self.remote_error = None;
+                }
+            }
+            Err(_) => self.remote_error = Some(format!("无法解析为 IP 或 CIDR：{entry}")),
+        }
+    }
+
     // ---------------- 侧边栏 ----------------
 
     fn sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -280,10 +330,12 @@ impl App {
 
         let wl = self.draft.whitelist.len().to_string();
         let apps = self.draft.apps.len().to_string();
-        let items: [(Page, Glyph, Color32, &str, Option<&str>); 5] = [
+        let scope = if self.draft.block_all.enabled { "开" } else { "关" };
+        let items: [(Page, Glyph, Color32, &str, Option<&str>); 6] = [
             (Page::Overview, Glyph::Shield, p.green, "概览", None),
             (Page::Whitelist, Glyph::Check, p.accent, "出口 IP 白名单", Some(&wl)),
             (Page::Apps, Glyph::Grid, p.orange, "受控应用", Some(&apps)),
+            (Page::Network, Glyph::Globe, p.red, "全局断网", Some(scope)),
             (Page::Settings, Glyph::Gear, p.gray, "设置", None),
             (Page::Log, Glyph::Lines, p.indigo, "日志", None),
         ];
@@ -353,7 +405,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(format!("受控应用{title}")).font(theme::bold(22.0)).color(p.label));
+                    ui.label(RichText::new(format!("{}{title}", scope_name(&s))).font(theme::bold(22.0)).color(p.label));
                     ui.label(RichText::new(desc).color(p.secondary));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -407,6 +459,13 @@ impl App {
                     theme::chip(ui, p.green, "WFP 运行中");
                 } else {
                     theme::chip(ui, p.gray, "未运行");
+                }
+            });
+            theme::hairline(ui, p);
+            let scope = if self.applied.block_all.enabled { "全部网络" } else { "仅受控应用" };
+            theme::row(ui, p, "断网范围", None, |ui| {
+                if theme::text_button(ui, p.accent, &format!("{scope}  ›")).clicked() {
+                    goto = Some(Page::Network);
                 }
             });
             theme::hairline(ui, p);
@@ -512,7 +571,8 @@ impl App {
                 }
             }
             if theme::gray_button(ui, p, "从正在运行的程序中选择…").clicked() {
-                self.picker = Some(ProcPicker { filter: String::new(), list: procs::list_processes() });
+                self.picker =
+                    Some(ProcPicker { filter: String::new(), list: procs::list_processes(), target: PickFor::Apps });
             }
         });
         ui.add_space(4.0);
@@ -677,6 +737,7 @@ impl App {
 
     fn picker_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(picker) = &mut self.picker else { return };
+        let target = picker.target;
         let mut open = true;
         let mut chosen = None;
         egui::Window::new("从正在运行的程序中选择")
@@ -723,12 +784,177 @@ impl App {
                 });
             });
         if let Some(path) = chosen {
-            self.add_app(path);
+            match target {
+                PickFor::Apps => self.add_app(path),
+                PickFor::AllowApps => self.add_allow_app(path),
+            }
             self.notify(true, "已添加，记得保存");
         }
         if !open {
             self.picker = None;
         }
+    }
+
+    fn network(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::page_title(
+            ui,
+            p,
+            "全局断网",
+            "出口 IP 不在白名单内时，切断本机的全部网络连接，而不只是受控应用。",
+        );
+
+        theme::card(ui, p, |ui| {
+            theme::row(
+                ui,
+                p,
+                "不在白名单时切断全部网络",
+                Some("关闭时只阻断「受控应用」中的程序"),
+                |ui| {
+                    theme::toggle(ui, p, &mut self.draft.block_all.enabled);
+                },
+            );
+        });
+        let enabled = self.draft.block_all.enabled;
+        if enabled && self.draft.whitelist.is_empty() {
+            ui.add_space(4.0);
+            warning_card(ui, p, "白名单为空", "开启后本机会一直断网，直到添加白名单条目或退出程序。");
+        }
+        theme::footnote(
+            ui,
+            p,
+            "受控应用不受下面的例外影响，阻断时仍然完全断网。退出程序会立即恢复全部网络。",
+        );
+
+        let b = &mut self.draft.block_all;
+        theme::section(ui, p, "始终放行");
+        theme::card(ui, p, |ui| {
+            let fixed = [
+                ("Egress Guard 本身", "用于在断网期间继续检测出口 IP，以便自动恢复"),
+                ("本机回环", "127.0.0.1、::1 等本机内部通信"),
+                ("DHCP", "自动获取 IP 地址，否则网卡可能拿不到地址"),
+            ];
+            for (i, (title, sub)) in fixed.iter().enumerate() {
+                if i > 0 {
+                    theme::hairline(ui, p);
+                }
+                theme::row(ui, p, title, Some(sub), |ui| {
+                    theme::chip(ui, p.green, "放行");
+                });
+            }
+        });
+
+        theme::section(ui, p, "可选放行");
+        theme::card(ui, p, |ui| {
+            theme::row(
+                ui,
+                p,
+                "局域网",
+                Some("10.x、172.16–31.x、192.168.x、链路本地与组播地址，例如路由器、打印机、共享文件夹"),
+                |ui| {
+                    theme::toggle(ui, p, &mut b.allow_lan);
+                },
+            );
+            theme::hairline(ui, p);
+            theme::row(ui, p, "DNS 查询", Some("域名解析（端口 53）。关闭后本工具也可能无法检测出口 IP"), |ui| {
+                theme::toggle(ui, p, &mut b.allow_dns);
+            });
+        });
+
+        theme::section(ui, p, &format!("例外程序 {} 个", self.draft.block_all.allow_apps.len()));
+        ui.horizontal(|ui| {
+            if theme::gray_button(ui, p, "浏览选择程序…").clicked() {
+                for f in platform::pick_exe_files() {
+                    self.add_allow_app(f);
+                }
+            }
+            if theme::gray_button(ui, p, "从正在运行的程序中选择…").clicked() {
+                self.picker = Some(ProcPicker {
+                    filter: String::new(),
+                    list: procs::list_processes(),
+                    target: PickFor::AllowApps,
+                });
+            }
+        });
+        ui.add_space(4.0);
+        let mut remove = None;
+        theme::card(ui, p, |ui| {
+            let list = &self.draft.block_all.allow_apps;
+            if list.is_empty() {
+                empty_state(ui, p, "暂无例外程序", "例如 VPN 客户端：断网期间仍需要它连上 VPN，出口才能回到白名单。");
+                return;
+            }
+            let n = list.len();
+            for (i, app) in list.iter().enumerate() {
+                let name = exe_name(&app.to_string_lossy());
+                ui.horizontal(|ui| {
+                    ui.set_min_height(40.0);
+                    letter_icon(ui, p, &name);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(&name).color(p.label));
+                        ui.add_space(-6.0);
+                        ui.label(RichText::new(shorten(&app.display().to_string(), 70)).size(12.0).color(p.secondary))
+                            .on_hover_text(app.display().to_string());
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::minus_button(ui, p).on_hover_text("移除").clicked() {
+                            remove = Some(i);
+                        }
+                        if !app.exists() {
+                            theme::chip(ui, p.red, "文件不存在");
+                        }
+                    });
+                });
+                if i + 1 < n {
+                    theme::hairline(ui, p);
+                }
+            }
+        });
+        if let Some(i) = remove {
+            self.draft.block_all.allow_apps.remove(i);
+        }
+
+        theme::section(ui, p, &format!("例外地址 {} 条", self.draft.block_all.allow_remote.len()));
+        let mut remove = None;
+        theme::card(ui, p, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 80.0;
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_remote)
+                        .hint_text("VPN 服务器地址，例如 198.51.100.7 或 198.51.100.0/24")
+                        .desired_width(w)
+                        .margin(Margin::symmetric(8, 5)),
+                );
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::accent_button(ui, p, "添加", true).clicked() || enter {
+                    self.add_remote_entry();
+                }
+            });
+            if let Some(e) = &self.remote_error {
+                ui.label(RichText::new(e).size(12.0).color(p.red));
+            }
+            for (i, entry) in self.draft.block_all.allow_remote.iter().enumerate() {
+                theme::hairline(ui, p);
+                ui.horizontal(|ui| {
+                    ui.set_min_height(32.0);
+                    ui.label(RichText::new(entry).monospace().color(p.label));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::minus_button(ui, p).on_hover_text("移除").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(i) = remove {
+            self.draft.block_all.allow_remote.remove(i);
+        }
+        theme::footnote(
+            ui,
+            p,
+            "部分 VPN（如 WireGuard）由系统内核发送流量，按程序放行无效，请在这里填写 VPN 服务器的 IP。",
+        );
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1009,6 +1235,7 @@ impl eframe::App for App {
                         Page::Overview => self.overview(ui, &p),
                         Page::Whitelist => self.whitelist(ui, &p),
                         Page::Apps => self.apps(ui, &p),
+                        Page::Network => self.network(ui, &p),
                         Page::Settings => self.settings(ui, &p),
                         Page::Log => {}
                     }

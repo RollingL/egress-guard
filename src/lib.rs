@@ -2,6 +2,7 @@
 //!
 //! 出口 IP 在白名单内 → 放行；否则 → 通过 WFP 阻断配置中列出的应用。
 
+pub mod blockall;
 pub mod config;
 pub mod controller;
 pub mod discovery;

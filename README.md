@@ -4,6 +4,7 @@
 
 - 出口 IP 命中白名单 → 放行
 - 出口 IP 不在白名单内（或检测失败）→ 用 **WFP（Windows Filtering Platform）** 阻断这些应用的全部网络连接
+- 可选**全局断网**：出口 IP 不在白名单时切断本机全部网络，只保留必要的例外（本工具、回环、DHCP，以及可选的局域网、DNS、VPN 客户端和 VPN 服务器地址）
 
 Rust 编写，只用 WFP 用户态 API（`fwpuclnt.dll`），**不需要安装驱动**。
 
@@ -18,7 +19,7 @@ Rust 编写，只用 WFP 用户态 API（`fwpuclnt.dll`），**不需要安装�
 | --- | --- |
 | ![概览（浅色）](docs/overview-light.png) | ![概览（深色）](docs/overview-dark.png) |
 | ![白名单](docs/whitelist-light.png) | ![设置（深色）](docs/settings-dark.png) |
-| ![受控应用与自动识别](docs/apps-light.png) | |
+| ![受控应用与自动识别](docs/apps-light.png) | ![全局断网（深色）](docs/network-dark.png) |
 
 界面采用苹果风格：左侧边栏导航、大标题、分组圆角卡片、iOS 式开关，浅色/深色可在 **设置 → 外观** 中切换（默认跟随系统）。
 
@@ -32,6 +33,7 @@ Rust 编写，只用 WFP 用户态 API（`fwpuclnt.dll`），**不需要安装�
 | 出口 IP 检测 | 定时（默认 60 秒）依次查询配置的公网 IP 服务，取第一个成功结果；同时用 `NotifyIpInterfaceChange` / `NotifyUnicastIpAddressChange` / `NotifyRouteChange2` 监听网卡、地址、路由变化，变化后防抖 2 秒立即重新检测。 |
 | 防泄漏 | 默认启动时先阻断；网络变化时也先阻断，确认新出口 IP 在白名单后再放行。 |
 | 子进程 | 每秒扫描进程树，受控应用启动的子进程（即使是不同的 exe，含多级后代）自动加入阻断，并记录到 `learned-apps.txt`。用进程创建时间排除 PID 复用误判；`%WINDIR%` 下的系统程序不会被加入。可选同时阻断受控应用所在目录下的全部 exe。规则增量更新，没有放行空档。 |
+| 全局断网 | 开启后阻断时额外添加一条不带条件的兜底 Block 过滤器（四个层，`CLEAR_ACTION_RIGHT`）和若干 Permit 例外：本工具自身（按应用 ID）、回环（`FWP_CONDITION_FLAG_IS_LOOPBACK`）、DHCP（UDP 本地端口 68/546），以及可选的局域网网段、DNS（远端端口 53）、例外程序和例外地址。同一子层内按权重裁决：受控应用阻断 15 > 例外放行 8 > 兜底阻断 0，所以受控应用不享受这些例外。切换时同样断开非例外的 IPv4 TCP 连接。 |
 | 白名单 | 单个 IPv4/IPv6 地址或 CIDR 网段（如 `198.51.100.0/24`、`2001:db8::/32`）。 |
 
 ## 快速开始（图形界面）
@@ -83,6 +85,7 @@ Register-ScheduledTask -TaskName "egress-guard-cli" -Action $action -Trigger $tr
 - `apps` 写 exe 完整路径，TOML 里用单引号就不用转义反斜杠。应用文件必须存在（WFP 根据文件路径生成应用 ID）。
 - `detect.fail_mode`：检测失败时 `block`（默认）/ `allow` / `keep`，在连续失败 `failure_threshold` 次后生效。
 - `detect.services`：任意返回包含 IP 文本的 HTTPS 地址都可以。
+- `[block_all]`：全局断网，界面里在 **全局断网** 页设置。默认放行局域网和 DNS。
 
 ## 注意事项与已知限制
 
@@ -91,6 +94,8 @@ Register-ScheduledTask -TaskName "egress-guard-cli" -Action $action -Trigger $tr
 - 阻断同样会切断受控应用到本机（127.0.0.1）的连接，例如连接本地代理端口。
 - 动态会话意味着**结束本进程即解除阻断**。如果需要"即使工具被关掉也保持阻断"，需要改为持久化规则（后续可选）。
 - 主动断开已有连接只支持 IPv4 TCP（Windows API 限制）；其他已有流量依赖 WFP 在过滤器变更后的重新授权。
+- **全局断网**期间 VPN 想要重连，需要把 VPN 客户端加入例外程序；WireGuard 等由系统内核发包的 VPN 按程序放行无效，需要把 VPN 服务器 IP 加入例外地址。白名单为空时开启全局断网，本机会一直断网直到退出程序。
+- 全局断网放行 DNS 时，域名查询本身仍可能经非白名单出口发出；对此敏感可以关闭，但本工具的出口 IP 检测也需要 DNS，关闭后可能一直无法恢复（除非 DNS 走局域网）。
 - 同一时间只能运行一个实例（固定子层 GUID，第二个实例会提示已存在）。
 - 界面保存配置时会重写 `config.toml`，手写的注释不会保留。
 - 子进程识别靠每秒一次的进程快照：新出现的子进程在被识别前（约 1 秒内）可能已发出少量连接。识别结果会被记住，之后再启动就从第一刻起被阻断；对安全要求高的应用可以再开启"阻断所在目录的全部程序"，提前覆盖尚未运行的辅助程序。
@@ -124,15 +129,16 @@ src/
   config.rs         TOML 配置解析/保存、白名单（IP/CIDR）匹配
   egress.rs         公网出口 IP 查询（ureq + 系统 TLS）
   controller.rs     阻断/放行决策逻辑，Firewall 抽象，dry-run 后端
+  blockall.rs       全局断网的例外规则（局域网网段、DNS、DHCP 端口）
   discovery.rs      子进程 / 同目录关联程序识别
   logbuf.rs         日志（stderr / 文件 / 界面）
   gui/mod.rs        界面页面（eframe/egui）
   gui/theme.rs      苹果风格配色、样式和自绘控件（开关、分段控件、卡片、图标）
   gui/tray.rs       系统托盘（独立消息循环线程）
   gui/icons.rs      运行时绘制的状态图标
-  win/wfp.rs        WFP 动态会话、子层、按应用 ID 的阻断过滤器
+  win/wfp.rs        WFP 动态会话、子层、按应用 ID 的阻断过滤器、全局断网规则
   win/netwatch.rs   网卡/地址/路由变化监听
-  win/tcpkill.rs    断开受控应用已有的 IPv4 TCP 连接
+  win/tcpkill.rs    断开已有的 IPv4 TCP 连接
   win/procs.rs      进程枚举
   win/autostart.rs  任务计划程序开机自启
 assets/             exe 图标、界面程序清单（requireAdministrator）
