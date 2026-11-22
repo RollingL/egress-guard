@@ -94,7 +94,7 @@ CPID=$!
 sleep 5
 COPIED=$(pbpaste)
 [[ "$COPIED" == "egress-guard-copy-ok" ]] && echo "OK：界面里复制的文字到了系统剪贴板" \
-  || fail "界面里复制的文字没有到系统剪贴板（pbpaste：$COPIED）"
+  || fail "界面里复制的文字没有到系统剪贴板（pbpaste：${COPIED}）"
 printf '203.0.113.7' | pbcopy
 # 模拟按下 ⌘V（发给前台程序，需要辅助功能权限；GitHub 的 macOS 虚拟机一般已授予）
 KEYED=0
@@ -113,7 +113,7 @@ sleep 2
 screencapture -x "$SHOTS/10-clipboard-paste.png" || true
 wait "$CPID"
 PASTED=$(python3 -c "import json; print(json.load(open('$CLIP_OUT'))['pasted'])" 2>/dev/null)
-echo "输入框内容：$PASTED（按键方式 $KEYED）"
+echo "输入框内容：${PASTED}（按键方式 ${KEYED}）"
 if [[ "$PASTED" == "203.0.113.7" ]]; then
   echo "OK：⌘V 把系统剪贴板的内容粘贴进了输入框"
 elif [[ "$KEYED" == 1 ]]; then
