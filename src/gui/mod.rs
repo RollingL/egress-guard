@@ -40,6 +40,11 @@ const PER_APP: bool = !cfg!(target_os = "macos");
 #[cfg(not(target_os = "macos"))]
 mod text {
     pub const ENGINE_RUNNING: &str = "WFP 运行中";
+    pub const OVERVIEW_SUB: &str = "根据本机公网出口 IP，自动放行或阻断受控应用的网络连接。";
+    pub const NETWORK_SUB: &str = "出口 IP 不在白名单内时，切断本机的全部网络连接，而不只是受控应用。";
+    pub const BLOCK_ALL_OFF: &str = "关闭时只阻断「受控应用」中的程序";
+    pub const NETWORK_FOOTNOTE: &str = "受控应用不受下面的例外影响，阻断时仍然完全断网。退出程序会立即恢复全部网络。";
+    pub const CHILDREN_SUB: &str = "受控应用启动的其他程序（即使是不同的 exe）自动加入阻断";
     pub const BACKEND_UNAVAILABLE: &str = "WFP 不可用，当前为模拟模式。请以管理员身份运行。";
     pub const CLOSE_HINT: &str = "点窗口右上角的 × 会隐藏到托盘，程序继续运行。要退出，请右键托盘图标选择「退出程序」，退出后所有阻断随之解除。";
     pub const PROGRAM: &str = "exe";
@@ -53,6 +58,11 @@ mod text {
 #[cfg(target_os = "macos")]
 mod text {
     pub const ENGINE_RUNNING: &str = "pf 运行中";
+    pub const OVERVIEW_SUB: &str = "根据本机公网出口 IP，自动放行或切断本机的网络连接。";
+    pub const NETWORK_SUB: &str = "出口 IP 不在白名单内时，切断本机的全部网络连接。macOS 版只能用这种方式拦截。";
+    pub const BLOCK_ALL_OFF: &str = "关闭时不拦截任何连接（macOS 版不能按应用断网）";
+    pub const NETWORK_FOOTNOTE: &str = "断网时只放行下面列出的连接。退出程序会立即恢复全部网络。";
+    pub const CHILDREN_SUB: &str = "受控应用启动的其他程序自动加入阻断";
     pub const BACKEND_UNAVAILABLE: &str = "pf 不可用，当前为模拟模式。";
     pub const CLOSE_HINT: &str = "点窗口左上角的关闭按钮会隐藏到菜单栏，程序继续运行。要退出，请点菜单栏图标选择「退出」，退出后所有阻断随之解除。";
     pub const PROGRAM: &str = "应用";
@@ -259,6 +269,8 @@ fn start_backend(cfg: Config, _config_path: &std::path::Path, reporter: engine::
 fn tray_state(s: &Status) -> tray::TrayState {
     let (shade, what) = if !s.running {
         (Shade::Gray, if s.backend_error.is_some() { "未连接后台服务" } else { "已停止" }.to_string())
+    } else if inert(s) {
+        (Shade::Amber, "未拦截（全局断网未开启）".to_string())
     } else if s.blocked {
         (Shade::Red, "已阻断".to_string())
     } else if s.egress_ip.is_some() {
@@ -282,6 +294,16 @@ fn scope_name(s: &Status) -> &'static str {
     if s.block_all { "全部网络" } else { "受控应用" }
 }
 
+/// 引擎判定要阻断，但后端只能全局断网而全局断网没开（macOS 未开启全局断网时），实际什么也不拦截。
+fn inert(s: &Status) -> bool {
+    s.running && s.blocked && !s.per_app && !s.block_all && !s.simulated
+}
+
+/// 概览大标题：带上阻断范围（「受控应用已阻断」），未运行或未拦截时不带。
+fn headline(s: &Status, title: &str) -> String {
+    if !s.running || inert(s) { title.to_owned() } else { format!("{}{title}", scope_name(s)) }
+}
+
 /// 状态的展示信息：标题、说明（说的是接下来会发生什么）、颜色。
 fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
     if !s.running {
@@ -289,6 +311,8 @@ fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
             Some(e) => ("未连接", format!("{e}。"), p.gray),
             None => ("已停止", "后台引擎没有运行。".into(), p.gray),
         }
+    } else if inert(s) {
+        ("未拦截", "出口 IP 没有通过白名单，但全局断网未开启，网络没有被切断。".into(), p.orange)
     } else if s.blocked {
         let why = match (s.egress_ip, &s.detect_error) {
             (Some(_), _) => "出口 IP 不在白名单内。出口回到白名单后会自动恢复。",
@@ -559,7 +583,7 @@ impl App {
 
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.status.lock().unwrap().clone();
-        theme::page_title(ui, p, "概览", "根据本机公网出口 IP，自动放行或阻断受控应用的网络连接。");
+        theme::page_title(ui, p, "概览", text::OVERVIEW_SUB);
 
         if let Some(e) = &self.load_error {
             warning_card(ui, p, "配置文件读取失败", &format!("当前使用默认设置，保存会覆盖原文件。{e}"));
@@ -583,7 +607,9 @@ impl App {
 
         // 主视觉：本机 ── 闸门 ── 互联网
         let (title, desc, color) = describe(&s, p);
-        let route = if !s.running || s.blocked {
+        let route = if inert(&s) {
+            theme::Route::Open
+        } else if !s.running || s.blocked {
             theme::Route::Closed
         } else if s.egress_ip.is_some() {
             theme::Route::Open
@@ -592,6 +618,8 @@ impl App {
         };
         let scope = if s.block_all || !PER_APP { "全部网络".to_owned() } else { format!("{} 个受控应用", self.applied.apps.len()) };
         let gate = match (s.whitelisted, s.blocked) {
+            _ if !s.running => if s.backend_error.is_some() { "未连接" } else { "已停止" },
+            _ if inert(&s) => "未通过，未拦截",
             (Some(true), _) => "命中，放行",
             (Some(false), _) => "未命中，阻断",
             (None, true) => "未确认，阻断",
@@ -603,7 +631,7 @@ impl App {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("{}{title}", scope_name(&s))).font(theme::bold(22.0)).color(p.label));
+                    ui.label(RichText::new(headline(&s, title)).font(theme::bold(22.0)).color(p.label));
                     ui.add_space(-4.0);
                     ui.label(RichText::new(desc).color(p.secondary));
                 });
@@ -831,7 +859,7 @@ impl App {
                 ui,
                 p,
                 "一并阻断子进程",
-                Some("受控应用启动的其他程序（即使是不同的 exe）自动加入阻断"),
+                Some(text::CHILDREN_SUB),
                 |ui| {
                     if theme::toggle(ui, p, &mut tree).changed() {
                         c.mode = if tree { ChildMode::Tree } else { ChildMode::Off };
@@ -1006,7 +1034,7 @@ impl App {
             ui,
             p,
             "全局断网",
-            "出口 IP 不在白名单内时，切断本机的全部网络连接，而不只是受控应用。",
+            text::NETWORK_SUB,
         );
 
         theme::card(ui, p, |ui| {
@@ -1014,7 +1042,7 @@ impl App {
                 ui,
                 p,
                 "不在白名单时切断全部网络",
-                Some("关闭时只阻断「受控应用」中的程序"),
+                Some(text::BLOCK_ALL_OFF),
                 |ui| {
                     theme::toggle(ui, p, &mut self.draft.block_all.enabled);
                 },
@@ -1028,7 +1056,7 @@ impl App {
         theme::footnote(
             ui,
             p,
-            "受控应用不受下面的例外影响，阻断时仍然完全断网。退出程序会立即恢复全部网络。",
+            text::NETWORK_FOOTNOTE,
         );
 
         let b = &mut self.draft.block_all;

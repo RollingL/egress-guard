@@ -113,7 +113,9 @@ fn main() {
     }
     #[cfg(unix)]
     if matches!(cli.command, Some(Command::Daemon { .. })) {
-        logbuf::init(&cli.log_level, true, Some(&daemon_log_path()));
+        // launchd 把 stderr 重定向到单独的文件（只用来收集崩溃信息），日志只写日志文件；手动 sudo 运行时也打印到终端
+        use std::io::IsTerminal;
+        logbuf::init(&cli.log_level, std::io::stderr().is_terminal(), Some(&daemon_log_path()));
     }
     logbuf::init(&cli.log_level, true, None);
     if let Err(e) = real_main(cli) {
