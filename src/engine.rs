@@ -2,6 +2,7 @@
 //! 命令行和图形界面共用。
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -11,8 +12,12 @@ use anyhow::{anyhow, Result};
 
 use crate::config::Config;
 use crate::controller::{Controller, DryRunFirewall, Firewall};
+use crate::discovery::{self, ExtraApp, WatchSettings};
 use crate::egress::EgressDetector;
 use crate::logbuf;
+
+/// 阻断规则同步失败后的重试间隔。
+const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 发给引擎的事件。
 pub enum Event {
@@ -26,6 +31,10 @@ pub enum Event {
     Shutdown,
     /// 内部：检测线程返回结果。
     Detected { generation: u64, result: Result<IpAddr> },
+    /// 内部：自动识别到的关联程序发生变化。
+    ExtraApps(Vec<ExtraApp>),
+    /// 清空子进程识别记录。
+    ClearLearned,
 }
 
 /// 引擎对外报告的状态快照。
@@ -51,6 +60,8 @@ pub struct Status {
     pub simulated: bool,
     /// 引擎是否在运行。
     pub running: bool,
+    /// 自动识别到、一并阻断的关联程序。
+    pub extra_apps: Vec<ExtraApp>,
 }
 
 pub type Reporter = Arc<dyn Fn(&Status) + Send + Sync>;
@@ -88,12 +99,19 @@ impl EngineHandle {
 ///
 /// - `dry_run`：只模拟，不修改网络。
 /// - `strict`：WFP 打开失败时直接报错退出（命令行用）；否则降级为模拟模式并在状态中报告（界面用）。
-pub fn spawn(cfg: Config, dry_run: bool, strict: bool, reporter: Reporter) -> EngineHandle {
+/// - `learned_file`：子进程识别记录的保存位置（通常在配置文件旁）。
+pub fn spawn(
+    cfg: Config,
+    dry_run: bool,
+    strict: bool,
+    learned_file: Option<PathBuf>,
+    reporter: Reporter,
+) -> EngineHandle {
     let (tx, rx) = mpsc::channel();
     let loop_tx = tx.clone();
     let join = std::thread::Builder::new()
         .name("engine".into())
-        .spawn(move || run(cfg, dry_run, strict, loop_tx, rx, reporter))
+        .spawn(move || run(cfg, dry_run, strict, learned_file, loop_tx, rx, reporter))
         .expect("无法创建引擎线程");
     EngineHandle { tx, join: Mutex::new(Some(join)) }
 }
@@ -102,6 +120,7 @@ fn run(
     cfg: Config,
     dry_run: bool,
     strict: bool,
+    learned_file: Option<PathBuf>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     reporter: Reporter,
@@ -149,6 +168,8 @@ fn run(
     );
 
     let mut ctrl = Controller::new(cfg.clone(), fw);
+
+    // 先阻断配置的受控应用，再载入关联程序，避免启动扫描期间出现放行空档
     if cfg.behavior.start_blocked {
         log::info!("启动时先阻断，等待首次出口 IP 检测");
         if let Err(e) = ctrl.firewall().block() {
@@ -156,12 +177,28 @@ fn run(
         }
     }
 
+    // 关联程序识别：先同步载入已知的，再启动后台线程持续识别
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    let mut watch_version = 0u64;
+    let watch = Arc::new(Mutex::new(WatchSettings::from_config(&cfg, watch_version)));
+    let initial = discovery::initial_extra(&watch.lock().unwrap(), learned_file.clone(), &windir);
+    if !initial.is_empty() {
+        log::info!("载入 {} 个已识别的关联程序", initial.len());
+    }
+    if let Err(e) = ctrl.set_extra(initial.iter().map(|x| x.path.clone()).collect()) {
+        log::error!("{e:#}");
+    }
+    status.extra_apps = initial;
+    discovery::spawn(watch.clone(), learned_file, snapshot_fn(), windir, tx.clone());
+
     let mut detector = Arc::new(make_detector(&cfg));
     let mut generation: u64 = 0;
     let mut checking = false;
     let mut next_check: Option<Instant> = Some(Instant::now());
     let mut debounce_until: Option<Instant> = None;
     let mut after_change = false;
+    // 规则同步失败或有程序暂未加上规则时，定时重试
+    let mut next_retry: Option<Instant> = None;
 
     let start_check = |checking: &mut bool, detector: &Arc<EgressDetector>, generation: u64| {
         if *checking {
@@ -180,7 +217,12 @@ fn run(
     reporter(&status);
 
     loop {
-        let deadline = [next_check, debounce_until].into_iter().flatten().min();
+        if ctrl.needs_retry() {
+            next_retry.get_or_insert_with(|| Instant::now() + RETRY_INTERVAL);
+        } else {
+            next_retry = None;
+        }
+        let deadline = [next_check, debounce_until, next_retry].into_iter().flatten().min();
         let event = match deadline {
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -212,12 +254,29 @@ fn run(
                     new_cfg.whitelist.len()
                 );
                 detector = Arc::new(make_detector(&new_cfg));
+                watch_version += 1;
+                {
+                    let mut w = watch.lock().unwrap();
+                    let clear = w.clear_learned;
+                    *w = WatchSettings::from_config(&new_cfg, watch_version);
+                    w.clear_learned = clear;
+                }
                 if let Err(e) = ctrl.reconfigure(new_cfg) {
                     log::error!("应用新配置失败: {e:#}");
                 }
                 generation += 1;
                 next_check = None;
                 start_check(&mut checking, &detector, generation);
+            }
+            Ok(Event::ExtraApps(extra)) => {
+                log::info!("关联程序更新：共 {} 个", extra.len());
+                if let Err(e) = ctrl.set_extra(extra.iter().map(|x| x.path.clone()).collect()) {
+                    log::error!("更新关联程序的阻断规则失败: {e:#}");
+                }
+                status.extra_apps = extra;
+            }
+            Ok(Event::ClearLearned) => {
+                watch.lock().unwrap().clear_learned = true;
             }
             Ok(Event::Detected { generation: g, result }) => {
                 checking = false;
@@ -251,6 +310,12 @@ fn run(
                     next_check = None;
                     start_check(&mut checking, &detector, generation);
                 }
+                if next_retry.is_some_and(|d| d <= now) {
+                    next_retry = None;
+                    if let Err(e) = ctrl.retry_pending() {
+                        log::warn!("重试同步阻断规则失败，稍后再试: {e:#}");
+                    }
+                }
             }
         }
 
@@ -278,6 +343,16 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
 
 fn make_detector(cfg: &Config) -> EgressDetector {
     EgressDetector::new(cfg.detect.services.clone(), Duration::from_secs(cfg.detect.timeout_secs))
+}
+
+#[cfg(windows)]
+fn snapshot_fn() -> discovery::SnapshotFn {
+    crate::win::procs::snapshot
+}
+
+#[cfg(not(windows))]
+fn snapshot_fn() -> discovery::SnapshotFn {
+    Vec::new
 }
 
 #[cfg(windows)]

@@ -1,2 +1,4 @@
 /target
 config.toml
+learned-apps.txt
+egress-guard.log

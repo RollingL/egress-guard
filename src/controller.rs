@@ -14,6 +14,10 @@ pub trait Firewall {
     fn is_blocked(&self) -> bool;
     /// 更换受控应用列表；若当前处于阻断状态，新列表立即生效。
     fn set_apps(&mut self, apps: Vec<PathBuf>, kill_existing_tcp: bool) -> Result<()>;
+    /// 是否有程序暂未能加上规则（文件暂不存在或单个程序添加失败），需要稍后重试。
+    fn has_pending(&self) -> bool {
+        false
+    }
 }
 
 /// 根据检测结果计算目标状态：Some(true)=阻断，Some(false)=放行，None=保持不变。
@@ -35,15 +39,27 @@ pub fn decide(
 
 pub struct Controller {
     cfg: Config,
+    /// 自动识别到的关联程序（子进程 / 同目录）。
+    extra: Vec<PathBuf>,
     fw: Box<dyn Firewall>,
     failures: u32,
     last_ip: Option<IpAddr>,
     last_error: Option<String>,
+    /// 上次把程序列表同步到防火墙失败，需要重试。
+    apps_dirty: bool,
 }
 
 impl Controller {
     pub fn new(cfg: Config, fw: Box<dyn Firewall>) -> Self {
-        Self { cfg, fw, failures: 0, last_ip: None, last_error: None }
+        Self {
+            cfg,
+            extra: Vec::new(),
+            fw,
+            failures: 0,
+            last_ip: None,
+            last_error: None,
+            apps_dirty: false,
+        }
     }
 
     pub fn firewall(&mut self) -> &mut dyn Firewall {
@@ -70,12 +86,54 @@ impl Controller {
         self.failures
     }
 
+    /// 实际需要阻断的程序：配置的受控应用 + 自动识别的关联程序（去重）。
+    pub fn effective_apps(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        self.cfg
+            .apps
+            .iter()
+            .chain(self.extra.iter())
+            .filter(|p| seen.insert(crate::discovery::normalize_path(p)))
+            .cloned()
+            .collect()
+    }
+
+    /// 更新自动识别到的关联程序；若当前处于阻断状态，新程序立即被阻断。
+    pub fn set_extra(&mut self, extra: Vec<PathBuf>) -> Result<()> {
+        if extra == self.extra && !self.apps_dirty {
+            return Ok(());
+        }
+        self.extra = extra;
+        self.push_apps()
+    }
+
+    /// 把当前程序列表推送到防火墙；失败时记下，等 `retry_pending` 重试。
+    fn push_apps(&mut self) -> Result<()> {
+        let r = self.fw.set_apps(self.effective_apps(), self.cfg.behavior.kill_existing_tcp);
+        self.apps_dirty = r.is_err();
+        r
+    }
+
+    /// 是否有未完成的规则同步需要重试。
+    pub fn needs_retry(&self) -> bool {
+        self.apps_dirty || self.fw.has_pending()
+    }
+
+    /// 重试之前失败或未完成的规则同步。
+    pub fn retry_pending(&mut self) -> Result<()> {
+        if !self.needs_retry() {
+            return Ok(());
+        }
+        self.push_apps()
+    }
+
     /// 应用新配置。受控应用变化会立即反映到防火墙规则上。
     pub fn reconfigure(&mut self, cfg: Config) -> Result<()> {
-        if cfg.apps != self.cfg.apps || cfg.behavior.kill_existing_tcp != self.cfg.behavior.kill_existing_tcp {
-            self.fw.set_apps(cfg.apps.clone(), cfg.behavior.kill_existing_tcp)?;
-        }
+        let changed = cfg.apps != self.cfg.apps
+            || cfg.behavior.kill_existing_tcp != self.cfg.behavior.kill_existing_tcp;
         self.cfg = cfg;
+        // 规则同步失败也继续按新白名单决策，错误最后再返回
+        let sync = if changed || self.apps_dirty { self.push_apps() } else { Ok(()) };
         // 白名单可能已变化：用最近一次的出口 IP 立即重新决策
         if let Some(ip) = self.last_ip {
             let want_block = !self.cfg.is_whitelisted(ip);
@@ -87,7 +145,7 @@ impl Controller {
                 self.fw.unblock()?;
             }
         }
-        Ok(())
+        sync
     }
 
     /// 网络变化时调用：按配置先行阻断。
@@ -216,6 +274,55 @@ mod tests {
         let new = Config::parse("whitelist=[\"198.51.100.0/24\"]\napps=[]").unwrap();
         c.reconfigure(new).unwrap();
         assert!(!c.is_blocked());
+    }
+
+    /// set_apps 前 N 次失败的测试后端。
+    struct FlakyFirewall {
+        fail_left: std::rc::Rc<std::cell::Cell<u32>>,
+        applied: std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>,
+    }
+
+    impl Firewall for FlakyFirewall {
+        fn block(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn unblock(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_blocked(&self) -> bool {
+            true
+        }
+        fn set_apps(&mut self, apps: Vec<PathBuf>, _kill: bool) -> Result<()> {
+            if self.fail_left.get() > 0 {
+                self.fail_left.set(self.fail_left.get() - 1);
+                return Err(anyhow!("WFP 暂时不可用"));
+            }
+            *self.applied.borrow_mut() = apps;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_sync_is_retried() {
+        let fail_left = std::rc::Rc::new(std::cell::Cell::new(1));
+        let applied = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fw = FlakyFirewall { fail_left: fail_left.clone(), applied: applied.clone() };
+        let mut c = Controller::new(cfg(""), Box::new(fw));
+        let extra = vec![PathBuf::from("C:\\b.exe")];
+
+        assert!(c.set_extra(extra.clone()).is_err());
+        assert!(c.needs_retry());
+        // 同样的列表再次到达时不能因"没变化"而跳过
+        c.set_extra(extra.clone()).unwrap();
+        assert!(!c.needs_retry());
+        assert_eq!(applied.borrow().len(), 2);
+
+        // 定时重试路径
+        fail_left.set(1);
+        assert!(c.set_extra(vec![]).is_err());
+        c.retry_pending().unwrap();
+        assert!(!c.needs_retry());
+        assert_eq!(applied.borrow().len(), 1);
     }
 
     #[test]
