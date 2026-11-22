@@ -1,0 +1,82 @@
+//! 监听网卡、IP 地址和路由变化（IP Helper 通知），用于立即触发出口 IP 重新检测。
+
+use std::ffi::c_void;
+use std::sync::mpsc::Sender;
+use std::sync::OnceLock;
+
+use anyhow::{bail, Result};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::NetworkManagement::IpHelper::*;
+use windows::Win32::Networking::WinSock::AF_UNSPEC;
+
+use crate::engine::Event;
+
+static TX: OnceLock<Sender<Event>> = OnceLock::new();
+
+fn notify() {
+    if let Some(tx) = TX.get() {
+        let _ = tx.send(Event::NetworkChanged);
+    }
+}
+
+unsafe extern "system" fn on_interface(
+    _ctx: *const c_void,
+    _row: *const MIB_IPINTERFACE_ROW,
+    _t: MIB_NOTIFICATION_TYPE,
+) {
+    notify();
+}
+
+unsafe extern "system" fn on_address(
+    _ctx: *const c_void,
+    _row: *const MIB_UNICASTIPADDRESS_ROW,
+    _t: MIB_NOTIFICATION_TYPE,
+) {
+    notify();
+}
+
+unsafe extern "system" fn on_route(
+    _ctx: *const c_void,
+    _row: *const MIB_IPFORWARD_ROW2,
+    _t: MIB_NOTIFICATION_TYPE,
+) {
+    notify();
+}
+
+pub struct NetWatcher {
+    handles: Vec<HANDLE>,
+}
+
+impl NetWatcher {
+    pub fn start(tx: Sender<Event>) -> Result<Self> {
+        if TX.set(tx).is_err() {
+            bail!("NetWatcher 只能启动一次");
+        }
+        let mut w = Self { handles: Vec::new() };
+        unsafe {
+            let mut h = HANDLE::default();
+            NotifyIpInterfaceChange(AF_UNSPEC, Some(on_interface), None, false, &mut h).ok()?;
+            w.handles.push(h);
+
+            let mut h = HANDLE::default();
+            NotifyUnicastIpAddressChange(AF_UNSPEC, Some(on_address), None, false, &mut h).ok()?;
+            w.handles.push(h);
+
+            // 路由变化可捕获 VPN 连接/断开导致的默认路由切换
+            let mut h = HANDLE::default();
+            NotifyRouteChange2(AF_UNSPEC, Some(on_route), std::ptr::null(), false, &mut h).ok()?;
+            w.handles.push(h);
+        }
+        Ok(w)
+    }
+}
+
+impl Drop for NetWatcher {
+    fn drop(&mut self) {
+        for h in self.handles.drain(..) {
+            unsafe {
+                let _ = CancelMibChangeNotify2(h);
+            }
+        }
+    }
+}

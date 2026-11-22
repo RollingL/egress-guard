@@ -1,0 +1,54 @@
+[package]
+name = "egress-guard"
+version = "0.2.0"
+edition = "2021"
+description = "根据本机公网出口 IP 判断是否用 WFP 阻断选中应用的网络连接"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+ipnet = { version = "2", features = ["serde"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+
+# 界面在 Windows 上发布；非 Windows 平台仅用于开发时预览界面
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"
+rfd = "0.18"
+raw-window-handle = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Rpc",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[[bin]]
+name = "egress-guard"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "egress-guard-gui"
+path = "src/bin/gui.rs"
+
+[profile.release]
+lto = true
+strip = true
