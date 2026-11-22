@@ -1,6 +1,6 @@
 [package]
 name = "egress-guard"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "根据本机公网出口 IP 判断是否用 WFP 阻断选中应用的网络连接"
 

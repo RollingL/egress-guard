@@ -202,19 +202,21 @@ fn scope_name(s: &Status) -> &'static str {
     if s.block_all { "全部网络" } else { "受控应用" }
 }
 
-/// 状态的展示信息：标题、说明、颜色。
+/// 状态的展示信息：标题、说明（说的是接下来会发生什么）、颜色。
 fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
     if !s.running {
         ("已停止", "后台引擎没有运行。".into(), p.gray)
     } else if s.blocked {
         let why = match (s.egress_ip, &s.detect_error) {
-            (Some(ip), _) => format!("出口 IP {ip} 不在白名单内，{}已断网。", scope_name(s)),
-            (None, Some(_)) => "无法确定出口 IP，为安全起见已断网。".into(),
-            (None, None) => format!("正在确认出口 IP，确认前{}保持断网。", scope_name(s)),
+            (Some(_), _) => "出口 IP 不在白名单内。出口回到白名单后会自动恢复。",
+            (None, Some(_)) => "无法确定出口 IP，为安全起见保持断网。",
+            (None, None) => "正在确认出口 IP，确认前保持断网。",
         };
-        ("已阻断", why, p.red)
-    } else if let Some(ip) = s.egress_ip {
-        ("已放行", format!("出口 IP {ip} 在白名单内，{}可以正常联网。", scope_name(s)), p.green)
+        ("已阻断", why.into(), p.red)
+    } else if s.egress_ip.is_some() {
+        ("已放行", "出口 IP 在白名单内。网络一有变化就会重新检查。".into(), p.green)
+    } else if s.detect_error.is_some() {
+        ("状态未知", "出口 IP 检测失败，按「检测失败时」的设置保持当前状态。".into(), p.orange)
     } else {
         ("检测中", "正在确认出口 IP…".into(), p.gray)
     }
@@ -396,46 +398,50 @@ impl App {
             ui.add_space(4.0);
         }
 
-        // 主状态卡
+        // 主视觉：本机 ── 闸门 ── 互联网
         let (title, desc, color) = describe(&s, p);
+        let route = if !s.running || s.blocked {
+            theme::Route::Closed
+        } else if s.egress_ip.is_some() {
+            theme::Route::Open
+        } else {
+            theme::Route::Checking
+        };
+        let scope = if s.block_all { "全部网络".to_owned() } else { format!("{} 个受控应用", self.applied.apps.len()) };
+        let gate = match (s.whitelisted, s.blocked) {
+            (Some(true), _) => "命中，放行",
+            (Some(false), _) => "未命中，阻断",
+            (None, true) => "未确认，阻断",
+            (None, false) if s.detect_error.is_some() => "检测失败",
+            (None, false) => "检测中",
+        };
+        let ip = s.egress_ip.map(|i| i.to_string()).unwrap_or_else(|| "未知".into());
         theme::card(ui, p, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                theme::status_badge(ui, 64.0, color);
-                ui.add_space(6.0);
                 ui.vertical(|ui| {
-                    ui.add_space(8.0);
                     ui.label(RichText::new(format!("{}{title}", scope_name(&s))).font(theme::bold(22.0)).color(p.label));
+                    ui.add_space(-4.0);
                     ui.label(RichText::new(desc).color(p.secondary));
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     if s.checking {
+                        ui.add_space(8.0);
                         ui.add(egui::Spinner::new().size(18.0));
-                    } else if theme::accent_button(ui, p, "立即检测", true).clicked() {
+                    } else if theme::gray_button(ui, p, "立即检测").clicked() {
                         self.engine.send(Event::CheckNow);
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(14.0);
+            theme::route_diagram(ui, p, route, color, [("本机", &scope), ("白名单", gate), (&ip, "出口 IP")]);
         });
 
-        theme::section(ui, p, "网络");
+        theme::section(ui, p, "检测");
         theme::card(ui, p, |ui| {
-            theme::row(ui, p, "出口 IP", None, |ui| {
-                let ip = s.egress_ip.map(|i| i.to_string()).unwrap_or_else(|| "未知".into());
-                ui.label(RichText::new(ip).monospace().color(p.label));
-            });
-            theme::hairline(ui, p);
-            theme::row(ui, p, "白名单", None, |ui| match s.whitelisted {
-                Some(true) => {
-                    theme::chip(ui, p.green, "命中");
-                }
-                Some(false) => {
-                    theme::chip(ui, p.red, "未命中");
-                }
-                None => {
-                    ui.label(RichText::new("—").color(p.secondary));
-                }
+            theme::row(ui, p, "检测方式", None, |ui| {
+                let secs = self.applied.detect.interval_secs;
+                ui.label(RichText::new(format!("每 {secs} 秒，网络变化时立即")).color(p.secondary));
             });
             theme::hairline(ui, p);
             theme::row(ui, p, "上次检测", None, |ui| {
@@ -528,6 +534,7 @@ impl App {
         });
 
         theme::section(ui, p, &format!("已添加 {} 条", self.draft.whitelist.len()));
+        let current = self.status.lock().unwrap().egress_ip;
         let mut remove = None;
         theme::card(ui, p, |ui| {
             if self.draft.whitelist.is_empty() {
@@ -549,6 +556,13 @@ impl App {
                             remove = Some(i);
                         }
                         ui.label(RichText::new(kind).size(12.0).color(p.secondary));
+                        let hit = match (parse_net(entry), current) {
+                            (Ok(net), Some(ip)) => net.contains(&ip),
+                            _ => false,
+                        };
+                        if hit {
+                            theme::chip(ui, p.green, "当前出口");
+                        }
                     });
                 });
                 if i + 1 < n {
@@ -607,7 +621,7 @@ impl App {
                     });
                 });
                 if i + 1 < n {
-                    theme::hairline(ui, p);
+                    theme::hairline_inset(ui, p, theme::ICON_INSET);
                 }
             }
         });
@@ -693,7 +707,7 @@ impl App {
                     });
                 });
                 if i + 1 < n {
-                    theme::hairline(ui, p);
+                    theme::hairline_inset(ui, p, theme::ICON_INSET);
                 }
             }
         });
@@ -779,7 +793,7 @@ impl App {
                                 }
                             });
                         });
-                        theme::hairline(ui, p);
+                        theme::hairline_inset(ui, p, theme::ICON_INSET);
                     }
                 });
             });
@@ -906,7 +920,7 @@ impl App {
                     });
                 });
                 if i + 1 < n {
-                    theme::hairline(ui, p);
+                    theme::hairline_inset(ui, p, theme::ICON_INSET);
                 }
             }
         });
@@ -1172,9 +1186,10 @@ fn letter_icon(ui: &mut egui::Ui, p: &Palette, name: &str) {
     let colors = [p.accent, p.orange, p.green, p.indigo, p.teal, p.red];
     let idx = name.bytes().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize)) % colors.len();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(7), colors[idx]);
+    // 浅色底 + 同色字母：比实心色块安静，列表里不会显得花哨
+    ui.painter().rect_filled(rect, CornerRadius::same(8), colors[idx].gamma_multiply(if p.dark { 0.24 } else { 0.14 }));
     let letter: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, letter, theme::bold(15.0), Color32::WHITE);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, letter, theme::bold(15.0), colors[idx]);
 }
 
 impl eframe::App for App {
