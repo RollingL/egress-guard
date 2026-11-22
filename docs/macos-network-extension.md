@@ -9,6 +9,18 @@ macOS 版从 0.7.0 起带有一个 **网络扩展**（Network Extension 的内�
 > - 因此 **按应用断网这部分还没有在真机上运行过**。CI 能验证的是：Swift 代码能编译、规则匹配逻辑、扩展与后台服务之间的通信协议（用同一份代码写的测试客户端连接真实的后台服务）、未签名时系统给出的错误。真正的拦截效果要等有了签名版本才能测。
 > - 没有签名之前，「全局断网」（pf）照常可用，不受影响。
 
+在 CI（GitHub 的 macOS 26 虚拟机）里，未签名版本点「启用」时系统返回的是：
+
+```
+OSSystemExtensionErrorDomain 2：Missing entitlement com.apple.developer.system-extension.install
+```
+
+界面会把它翻译成「程序缺少安装系统扩展的权限：需要用 Developer ID 签名并带上描述文件」。
+
+| 未签名版本 | 扩展已连接（CI 中由测试客户端模拟） | 概览：只阻断受控应用 |
+| --- | --- | --- |
+| ![](macos-apps-unsigned-light.png) | ![](macos-apps-connected-light.png) | ![](macos-perapp-blocked-light.png) |
+
 ## 它是怎么工作的
 
 ```
