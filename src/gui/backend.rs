@@ -114,7 +114,7 @@ pub use remote::Remote;
 
 #[cfg(target_os = "macos")]
 mod remote {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -278,7 +278,12 @@ mod remote {
             service::run_as_admin(
                 &[&cli.to_string_lossy(), "service", "uninstall"],
                 "Egress Guard 要卸载后台服务并移除全部 pf 规则。",
-            )
+            )?;
+            // 服务没了，登录时自动打开界面也就没有意义了
+            if let Err(e) = service::set_login_item(false, Path::new("")) {
+                log::warn!("无法移除登录项: {e:#}");
+            }
+            Ok(())
         }
 
         fn quit(&self) -> ! {

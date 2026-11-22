@@ -172,7 +172,7 @@ sudo egress-guard service uninstall  # 卸载（保留配置）
 sudo egress-guard unblock        # 紧急恢复：清空 pf 规则
 ```
 
-卸载：设置页"后台服务 → 卸载…"，然后删除 .app；如需彻底清理，再删除 `/Library/Application Support/EgressGuard` 和 `~/Library/LaunchAgents/com.egressguard.gui.plist`。
+卸载：设置页"后台服务 → 卸载…"，输入管理员密码。它会停止后台服务、移除全部 pf 规则、删除 `/Library/LaunchDaemons/com.egressguard.daemon.plist` 和服务程序，并关闭登录时自动打开，网络立即恢复原样；之后把 .app 拖进废纸篓即可。配置文件会保留在 `/Library/Application Support/EgressGuard`，重新安装后沿用；不需要的话可以手动删除这个文件夹和日志 `/Library/Logs/egress-guard*.log`。没有界面时也可以在终端执行 `sudo "/Applications/Egress Guard.app/Contents/MacOS/egress-guard" service uninstall`。
 
 ### 以后要做按应用断网需要什么
 
