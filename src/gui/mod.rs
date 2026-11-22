@@ -96,6 +96,9 @@ struct App {
     hide_on_first_frame: bool,
     /// 当前已应用到界面的外观。
     shown_appearance: Option<Appearance>,
+    /// 页面切换动效：上一帧显示的页面及切换时刻。
+    shown_page: Page,
+    page_since: f64,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -170,6 +173,8 @@ pub fn run(opts: Options) -> Result<()> {
                 autostart: autostart::is_enabled(),
                 hide_on_first_frame: opts.start_minimized,
                 shown_appearance: None,
+                shown_page: Page::Overview,
+                page_since: f64::NEG_INFINITY,
             }))
         }),
     )
@@ -333,23 +338,22 @@ impl App {
         let wl = self.draft.whitelist.len().to_string();
         let apps = self.draft.apps.len().to_string();
         let scope = if self.draft.block_all.enabled { "开" } else { "关" };
-        let items: [(Page, Glyph, Color32, &str, Option<&str>); 6] = [
-            (Page::Overview, Glyph::Shield, p.green, "概览", None),
-            (Page::Whitelist, Glyph::Check, p.accent, "出口 IP 白名单", Some(&wl)),
-            (Page::Apps, Glyph::Grid, p.orange, "受控应用", Some(&apps)),
-            (Page::Network, Glyph::Globe, p.red, "全局断网", Some(scope)),
-            (Page::Settings, Glyph::Gear, p.gray, "设置", None),
-            (Page::Log, Glyph::Lines, p.indigo, "日志", None),
+        let pages = [Page::Overview, Page::Whitelist, Page::Apps, Page::Network, Page::Settings, Page::Log];
+        let items = [
+            theme::NavItem { glyph: Glyph::Shield, icon_bg: p.green, text: "概览", badge: None },
+            theme::NavItem { glyph: Glyph::Check, icon_bg: p.accent, text: "出口 IP 白名单", badge: Some(&wl) },
+            theme::NavItem { glyph: Glyph::Grid, icon_bg: p.orange, text: "受控应用", badge: Some(&apps) },
+            theme::NavItem { glyph: Glyph::Globe, icon_bg: p.red, text: "全局断网", badge: Some(scope) },
+            theme::NavItem { glyph: Glyph::Gear, icon_bg: p.gray, text: "设置", badge: None },
+            theme::NavItem { glyph: Glyph::Lines, icon_bg: p.indigo, text: "日志", badge: None },
         ];
-        for (page, glyph, bg, text, badge) in items {
-            if theme::nav_item(ui, p, self.page == page, glyph, bg, text, badge) {
-                self.page = page;
-            }
-            ui.add_space(-4.0);
+        let selected = pages.iter().position(|x| *x == self.page).unwrap_or(0);
+        if let Some(i) = theme::nav_list(ui, p, &items, selected) {
+            self.page = pages[i];
         }
 
         // 底部：状态摘要 + 隐藏/退出（顶部留白把它们推到底部）
-        let bottom_h = if s.simulated { 150.0 } else { 132.0 };
+        let bottom_h = if s.simulated { 84.0 } else { 66.0 };
         ui.add_space((ui.available_height() - bottom_h).max(8.0));
         let (title, _, color) = describe(&s, p);
         egui::Frame::new()
@@ -373,14 +377,6 @@ impl App {
                     ui.label(RichText::new("模拟模式 · 规则未生效").size(12.0).color(p.orange));
                 }
             });
-        ui.add_space(4.0);
-        if theme::text_button(ui, p.accent, "隐藏到托盘").clicked() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-        ui.add_space(-6.0);
-        if theme::text_button(ui, p.red, "退出程序").on_hover_text("关闭程序，所有阻断规则随之移除").clicked() {
-            quit(&self.engine);
-        }
     }
 
     // ---------------- 页面 ----------------
@@ -492,7 +488,7 @@ impl App {
         if let Some(pg) = goto {
             self.page = pg;
         }
-        theme::footnote(ui, p, "关闭窗口后程序会在托盘中继续运行；退出程序会解除所有阻断。");
+        theme::footnote(ui, p, "点窗口右上角的 × 会隐藏到托盘，程序继续运行。要退出，请右键托盘图标选择「退出程序」，退出后所有阻断随之解除。");
     }
 
     fn whitelist(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1105,9 +1101,12 @@ impl App {
     fn save_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let dirty = self.dirty();
         let recent = self.message.as_ref().filter(|m| m.2.elapsed() < Duration::from_secs(4) || !m.0).cloned();
-        if !dirty && recent.is_none() {
+        let visible = dirty || recent.is_some();
+        let t = theme::ease(ui.ctx(), egui::Id::unique("save-bar"), visible, 0.2);
+        if !visible {
             return;
         }
+        ui.multiply_opacity(t);
         egui::Frame::new()
             .fill(p.card)
             .corner_radius(CornerRadius::same(12))
@@ -1237,9 +1236,23 @@ impl eframe::App for App {
                 .show(ui, |ui| self.save_bar(ui, &p));
         }
 
+        // 切换页面时内容淡入并轻微上移（约 0.2 秒），首次打开不播放
+        let now = ctx.input(|i| i.time);
+        if self.page != self.shown_page {
+            self.shown_page = self.page;
+            self.page_since = now;
+        }
+        let raw = if theme::reduced_motion() { 1.0 } else { ((now - self.page_since) / 0.2).clamp(0.0, 1.0) as f32 };
+        if raw < 1.0 {
+            ctx.request_repaint();
+        }
+        let enter = egui::emath::easing::cubic_out(raw);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 22, bottom: 8 }))
             .show(ui, |ui| {
+                ui.multiply_opacity(0.25 + 0.75 * enter);
+                ui.add_space((1.0 - enter) * 6.0);
                 if self.page == Page::Log {
                     self.log(ui, &p);
                     return;

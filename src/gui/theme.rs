@@ -1,5 +1,7 @@
 //! 苹果风格的配色、样式和自绘控件（开关、卡片、分组行、图标等）。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use eframe::egui::{
     self, epaint::Shadow, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Margin,
     Pos2, Rect, Response, RichText, Sense, Shape, Stroke, Theme, Ui, Vec2,
@@ -86,6 +88,46 @@ impl Palette {
     }
 }
 
+// ---------------- 动效 ----------------
+
+static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
+
+/// 系统关闭了动画（Windows“设置 → 辅助功能 → 视觉效果 → 动画效果”）时不播放动效。
+pub fn reduced_motion() -> bool {
+    REDUCED_MOTION.load(Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+fn system_animations_enabled() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut on: i32 = 1;
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut on as *mut i32 as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok();
+    !ok || on != 0
+}
+
+#[cfg(not(windows))]
+fn system_animations_enabled() -> bool {
+    std::env::var_os("EGRESS_GUARD_REDUCED_MOTION").is_none()
+}
+
+/// 0→1 的缓出动画进度；系统关闭动画时直接取终点。
+pub fn ease(ctx: &egui::Context, id: egui::Id, on: bool, secs: f32) -> f32 {
+    if reduced_motion() {
+        return if on { 1.0 } else { 0.0 };
+    }
+    ctx.animate_bool_with_time_and_easing(id, on, secs, egui::emath::easing::cubic_out)
+}
+
 /// 粗体字体族名称（Windows 上为微软雅黑 Bold）。
 pub const BOLD: &str = "bold";
 
@@ -136,6 +178,8 @@ pub fn setup_fonts(ctx: &egui::Context) {
 
 /// 为浅色、深色两套主题设置苹果风格的样式；跟随系统切换。
 pub fn apply_style(ctx: &egui::Context) {
+    REDUCED_MOTION.store(!system_animations_enabled(), Ordering::Relaxed);
+    let animation_time = if reduced_motion() { 0.0 } else { 0.14 };
     for (theme, p) in [(Theme::Light, Palette::LIGHT), (Theme::Dark, Palette::DARK)] {
         ctx.style_mut_of(theme, |style| {
             use egui::TextStyle;
@@ -148,6 +192,7 @@ pub fn apply_style(ctx: &egui::Context) {
             ]
             .into();
 
+            style.animation_time = animation_time;
             let s = &mut style.spacing;
             s.item_spacing = Vec2::new(8.0, 8.0);
             s.button_padding = Vec2::new(14.0, 5.0);
@@ -309,33 +354,84 @@ pub fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
     resp
 }
 
+/// 带悬停与按下反馈的填充按钮：悬停时颜色渐变，按下时略微收缩、变暗。
+fn push_button(
+    ui: &mut Ui,
+    text: &str,
+    font: FontId,
+    text_color: Color32,
+    fill: Color32,
+    hover_fill: Color32,
+    enabled: bool,
+) -> Response {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, text_color);
+    let pad = ui.spacing().button_padding;
+    let size = Vec2::new(galley.size().x + pad.x * 2.0, (galley.size().y + pad.y * 2.0).max(28.0));
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    if ui.is_rect_visible(rect) {
+        let ctx = ui.ctx();
+        let h = ease(ctx, resp.id.with("hover"), enabled && resp.hovered(), 0.12);
+        let pr = ease(ctx, resp.id.with("press"), enabled && resp.is_pointer_button_down_on(), 0.08);
+        let mut bg = lerp_color(lerp_color(fill, hover_fill, h), Color32::BLACK, 0.10 * pr);
+        let mut fg = text_color;
+        if !enabled {
+            bg = bg.gamma_multiply(0.45);
+            fg = fg.gamma_multiply(0.7);
+        }
+        let r = rect.shrink(pr * 1.2);
+        let painter = ui.painter();
+        painter.rect_filled(r, CornerRadius::same(7), bg);
+        painter.galley_with_override_text_color(r.center() - galley.size() / 2.0, galley, fg);
+        if resp.has_focus() {
+            painter.rect_stroke(rect.expand(2.0), CornerRadius::same(9), Stroke::new(2.0, ACCENT_FOCUS), egui::StrokeKind::Outside);
+        }
+    }
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// 键盘焦点环颜色。
+const ACCENT_FOCUS: Color32 = Color32::from_rgb(0x4C, 0x9A, 0xFF);
+
 /// 实心强调色按钮（主要操作）。
 pub fn accent_button(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> Response {
-    let fill = if enabled { p.accent } else { p.accent.gamma_multiply(0.4) };
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(text).color(Color32::WHITE).font(bold(14.0)))
-            .fill(fill)
-            .corner_radius(CornerRadius::same(7)),
-    )
+    let hover = lerp_color(p.accent, if p.dark { Color32::WHITE } else { Color32::BLACK }, 0.12);
+    push_button(ui, text, bold(14.0), Color32::WHITE, p.accent, hover, enabled)
 }
 
 /// 灰色填充按钮（次要操作）。
 pub fn gray_button(ui: &mut Ui, p: &Palette, text: &str) -> Response {
-    ui.add(egui::Button::new(RichText::new(text).color(p.label)).fill(p.fill).corner_radius(CornerRadius::same(7)))
+    push_button(ui, text, FontId::proportional(14.0), p.label, p.fill, p.fill_hover, true)
 }
 
-/// 无边框的文字按钮（链接样式）。
+/// 无边框的文字按钮（链接样式）：悬停时颜色渐淡。
 pub fn text_button(ui: &mut Ui, color: Color32, text: &str) -> Response {
-    ui.add(egui::Button::new(RichText::new(text).color(color)).frame(false))
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(14.0), color);
+    // 文字按钮几乎不留横向内边距，与行内其他文字对齐
+    let size = Vec2::new(galley.size().x + 4.0, (galley.size().y + 10.0).max(28.0));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let h = ease(ui.ctx(), resp.id.with("hover"), resp.hovered(), 0.12);
+        let pr = ease(ui.ctx(), resp.id.with("press"), resp.is_pointer_button_down_on(), 0.08);
+        let c = color.gamma_multiply(1.0 - 0.28 * h - 0.2 * pr);
+        ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, c);
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect, CornerRadius::same(7), Stroke::new(2.0, ACCENT_FOCUS), egui::StrokeKind::Inside);
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// 红色圆形减号按钮（删除一行）。
 pub fn minus_button(ui: &mut Ui, p: &Palette) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
     let c = rect.center();
-    let col = if resp.hovered() { p.red.gamma_multiply(0.8) } else { p.red };
-    ui.painter().circle_filled(c, 9.0, col);
+    let h = ease(ui.ctx(), resp.id.with("hover"), resp.hovered(), 0.12);
+    let col = lerp_color(p.red, Color32::BLACK, 0.18 * h);
+    ui.painter().circle_filled(c, 9.0 + h * 0.8, col);
     ui.painter().line_segment([c - Vec2::new(4.5, 0.0), c + Vec2::new(4.5, 0.0)], Stroke::new(2.0, Color32::WHITE));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -480,14 +576,56 @@ pub fn route_diagram(ui: &mut Ui, p: &Palette, route: Route, color: Color32, lab
     let idle = if p.dark { p.tertiary } else { p.separator };
     let line_w = 3.0;
 
+    // 状态切换时：闸门颜色从旧色渐变到新色，彩色线从本机一侧重新"流"过去。
+    // 首次显示时不播放。
+    let ctx = ui.ctx().clone();
+    let now = ctx.input(|i| i.time);
+    let mem_id = egui::Id::unique("route-transition");
+    let (prev_color, since) = ctx.data_mut(|d| {
+        let entry = d.get_temp_mut_or_insert_with(mem_id, || (route, color, color, f64::NEG_INFINITY));
+        if entry.0 != route || entry.2 != color {
+            // 从当前正在显示的颜色出发，避免连续切换时跳色
+            let shown_t = ((now - entry.3) / 0.5).clamp(0.0, 1.0) as f32;
+            let shown = lerp_color(entry.1, entry.2, egui::emath::easing::cubic_out(shown_t));
+            *entry = (route, shown, color, now);
+        }
+        (entry.1, entry.3)
+    });
+    let raw = if reduced_motion() { 1.0 } else { ((now - since) / 0.5).clamp(0.0, 1.0) as f32 };
+    if raw < 1.0 {
+        ctx.request_repaint();
+    }
+    let k = egui::emath::easing::cubic_out(raw);
+    // 红绿直接混合会经过一段浑浊的褐色，所以先褪到中性灰再变成新颜色
+    let color = if prev_color == color || k >= 1.0 {
+        color
+    } else if k < 0.5 {
+        lerp_color(prev_color, p.gray, k * 2.0)
+    } else {
+        lerp_color(p.gray, color, (k - 0.5) * 2.0)
+    };
+    // 彩色线可见到的最右位置
+    let reveal_x = left.x + (right.x - left.x) * k;
+    let clip = |a: Pos2, b: Pos2| -> Option<[Pos2; 2]> {
+        (reveal_x > a.x).then(|| [a, Pos2::new(b.x.min(reveal_x), b.y)])
+    };
+
     // 本机 → 闸门：流量总能到达闸门
-    let near = if route == Route::Checking { idle } else { color };
-    painter.line_segment([left + Vec2::X * r_end, gate - Vec2::X * r_gate], Stroke::new(line_w, near));
+    let (n0, n1) = (left + Vec2::X * r_end, gate - Vec2::X * r_gate);
+    painter.line_segment([n0, n1], Stroke::new(2.0, idle));
+    if route != Route::Checking {
+        if let Some(seg) = clip(n0, n1) {
+            painter.line_segment(seg, Stroke::new(line_w, color));
+        }
+    }
     // 闸门 → 互联网
     let (a, b) = (gate + Vec2::X * r_gate, right - Vec2::X * r_end);
     match route {
         Route::Open => {
-            painter.line_segment([a, b], Stroke::new(line_w, color));
+            painter.line_segment([a, b], Stroke::new(2.0, idle));
+            if let Some(seg) = clip(a, b) {
+                painter.line_segment(seg, Stroke::new(line_w, color));
+            }
         }
         Route::Closed => {
             painter.extend(Shape::dashed_line(&[a + Vec2::X * 8.0, b], Stroke::new(2.0, idle), 6.0, 6.0));
@@ -516,7 +654,7 @@ pub fn route_diagram(ui: &mut Ui, p: &Palette, route: Route, color: Color32, lab
         paint_glyph(painter, g, glyph, p.secondary);
     }
     // 闸门：外圈淡色光晕 + 实心圆 + 白色符号
-    painter.circle_filled(gate, r_gate + 7.0, color.gamma_multiply(0.14));
+    painter.circle_filled(gate, r_gate + 7.0 * k, color.gamma_multiply(0.14));
     painter.circle_filled(gate, r_gate, color);
     let g = Rect::from_center_size(gate, Vec2::splat(r_gate * 1.15));
     match route {
@@ -547,24 +685,59 @@ pub fn route_diagram(ui: &mut Ui, p: &Palette, route: Route, color: Color32, lab
     }
 }
 
-/// 侧边栏导航项。返回是否被点击。
-pub fn nav_item(ui: &mut Ui, p: &Palette, selected: bool, glyph: Glyph, icon_bg: Color32, text: &str, badge: Option<&str>) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+/// 侧边栏导航项。
+pub struct NavItem<'a> {
+    pub glyph: Glyph,
+    pub icon_bg: Color32,
+    pub text: &'a str,
+    pub badge: Option<&'a str>,
+}
+
+/// 侧边栏导航列表。选中项的蓝色高亮会从旧位置滑到新位置，文字颜色随之过渡。
+/// 返回被点击的序号。
+pub fn nav_list(ui: &mut Ui, p: &Palette, items: &[NavItem], selected: usize) -> Option<usize> {
+    let w = ui.available_width();
+    let mut rects = Vec::with_capacity(items.len());
+    let mut clicked = None;
+    for (i, _) in items.iter().enumerate() {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+        rects.push((rect, resp));
+        ui.add_space(-4.0);
+    }
+    let ctx = ui.ctx().clone();
+    let target = rects[selected.min(rects.len() - 1)].0;
+    let y = if reduced_motion() {
+        target.top()
+    } else {
+        ctx.animate_value_with_time(egui::Id::unique("nav-highlight"), target.top(), 0.18)
+    };
+    let hl = Rect::from_min_size(Pos2::new(target.left(), y), target.size());
+
     let painter = ui.painter();
-    if selected {
-        painter.rect_filled(rect, CornerRadius::same(7), p.accent);
-    } else if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(7), p.fill_hover.gamma_multiply(0.7));
+    for (i, (rect, resp)) in rects.iter().enumerate() {
+        let h = ease(&ctx, resp.id.with("hover"), resp.hovered() && i != selected, 0.12);
+        if h > 0.0 {
+            painter.rect_filled(*rect, CornerRadius::same(7), p.fill_hover.gamma_multiply(0.7 * h));
+        }
     }
-    let icon = Rect::from_min_size(Pos2::new(rect.left() + 8.0, rect.center().y - 10.0), Vec2::splat(20.0));
-    paint_app_icon(painter, icon, icon_bg, glyph);
-    let fg = if selected { Color32::WHITE } else { p.label };
-    painter.text(Pos2::new(icon.right() + 9.0, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(14.0), fg);
-    if let Some(b) = badge {
-        let col = if selected { Color32::WHITE.gamma_multiply(0.85) } else { p.secondary };
-        painter.text(Pos2::new(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, b, FontId::proportional(12.5), col);
+    painter.rect_filled(hl, CornerRadius::same(7), p.accent);
+    for (item, (rect, _)) in items.iter().zip(&rects) {
+        // 高亮覆盖本行的比例决定文字颜色，滑动时平滑过渡
+        let cover = (1.0 - (hl.top() - rect.top()).abs() / rect.height()).clamp(0.0, 1.0);
+        let icon = Rect::from_min_size(Pos2::new(rect.left() + 8.0, rect.center().y - 10.0), Vec2::splat(20.0));
+        paint_app_icon(painter, icon, item.icon_bg, item.glyph);
+        let fg = lerp_color(p.label, Color32::WHITE, cover);
+        painter.text(Pos2::new(icon.right() + 9.0, rect.center().y), Align2::LEFT_CENTER, item.text, FontId::proportional(14.0), fg);
+        if let Some(b) = item.badge {
+            let col = lerp_color(p.secondary, Color32::from_gray(235), cover);
+            painter.text(Pos2::new(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, b, FontId::proportional(12.5), col);
+        }
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    clicked
 }
 
 /// 分段控件（类似 macOS 的 NSSegmentedControl）。返回是否改变。
