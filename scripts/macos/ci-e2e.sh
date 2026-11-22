@@ -102,7 +102,28 @@ can_reach https://example.com && echo "OK：已放行" || fail "放行后仍不�
 [[ -z "$(sudo pfctl -a com.apple/egress-guard -s rules 2>/dev/null)" ]] || fail "放行后锚点里仍有规则"
 shot 3-allowed-dark overview
 shot 4-settings-dark settings 4
-shot 5-apps-dark apps 4
+shot 5-whitelist-dark whitelist 4
+
+step "菜单栏应用：窗口隐藏后再次打开应用会显示窗口"
+pkill -f "$GUI" 2>/dev/null
+open "$APP" --args --minimized
+sleep 6
+GPID=$(pgrep -f "$GUI" | head -1)
+# 本进程在屏幕上的普通窗口数（CGWindowList，不需要辅助功能权限）
+windows() {
+  osascript -l JavaScript -e "ObjC.import('CoreGraphics');
+    const l = ObjC.deepUnwrap(ObjC.castRefToObject(\$.CGWindowListCopyWindowInfo(\$.kCGWindowListOptionOnScreenOnly, 0)));
+    l.filter(w => w.kCGWindowOwnerPID == $GPID && w.kCGWindowLayer == 0).length" 2>/dev/null
+}
+echo "界面进程 $GPID，隐藏时窗口数：$(windows)"
+open "$APP"
+sleep 3
+N=$(windows)
+echo "再次打开后窗口数：$N"
+screencapture -x "$SHOTS/6-reopened.png" || true
+[[ "$N" == "0" ]] && fail "再次打开应用没有显示窗口"
+[[ "$(pgrep -f "$GUI" | wc -l | tr -d ' ')" == "1" ]] || fail "再次打开应用启动了第二个界面进程"
+pkill -f "$GUI" 2>/dev/null
 
 step "退出（stop）后不再阻断"
 write_cfg "" light

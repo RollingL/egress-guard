@@ -50,6 +50,8 @@ pub struct HelloInfo {
     pub log_path: String,
     /// 开机自动启动是否开启。
     pub autostart: bool,
+    /// 配置文件损坏、服务正在用默认设置（全局断网）运行时的原因。
+    pub config_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,12 +156,28 @@ fn write_reply(w: &mut impl Write, r: &Reply) -> std::io::Result<()> {
     w.flush()
 }
 
+/// 单个请求的最大长度（配置远小于这个值）。
+const MAX_REQUEST: u64 = 1 << 20;
+/// 空闲连接在这么久没有新请求后关闭（界面每个请求都用新连接，Watch 只写不读）。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> std::io::Result<()> {
+    use std::io::Read;
     let uid = peer_uid(&stream);
+    stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut w = stream.try_clone()?;
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = line?;
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        let n = (&mut reader).take(MAX_REQUEST).read_line(&mut line)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if !line.ends_with('\n') && n as u64 >= MAX_REQUEST {
+            write_reply(&mut w, &Reply::Err("请求过长".into()))?;
+            return Ok(());
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -223,7 +241,6 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
         };
         write_reply(&mut w, &reply)?;
     }
-    Ok(())
 }
 
 /// 在后台线程中接受连接，每个连接一个线程。
@@ -413,6 +430,18 @@ mod tests {
         hub.publish(&Status { running: true, blocked: true, ..Default::default() });
         let next = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(next.blocked);
+
+        // 超长请求被拒绝并断开，服务继续可用
+        {
+            let mut s = UnixStream::connect(&path).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let junk = vec![b'x'; MAX_REQUEST as usize + 10];
+            let _ = s.write_all(&junk);
+            let mut reply = String::new();
+            let _ = BufReader::new(s).read_line(&mut reply);
+            assert!(reply.contains("请求过长"), "{reply}");
+        }
+        assert!(c.status().unwrap().running);
 
         c.command(&Request::Stop, Duration::from_secs(5)).unwrap();
         assert!(handler.stopped.load(Ordering::SeqCst));

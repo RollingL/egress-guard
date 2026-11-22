@@ -144,7 +144,9 @@ pub fn install(src_bin: &Path) -> Result<()> {
     let bin = paths::daemon_bin();
     let dir = bin.parent().context("服务程序目录")?;
     std::fs::create_dir_all(dir).with_context(|| format!("无法创建 {}", dir.display()))?;
+    // root 运行的程序放在这里，目录必须只有 root 能写
     for d in [Path::new(SUPPORT_DIR), dir] {
+        std::os::unix::fs::chown(d, Some(0), Some(0)).with_context(|| format!("无法设置 {} 的所有者", d.display()))?;
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))?;
     }
     if src_bin != bin {

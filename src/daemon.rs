@@ -23,6 +23,8 @@ struct Daemon {
     config_path: PathBuf,
     log_path: PathBuf,
     raw: Mutex<RawConfig>,
+    /// 配置文件读取失败的原因；成功保存一次新配置后清除。
+    config_error: Mutex<Option<String>>,
 }
 
 impl Handler for Daemon {
@@ -32,6 +34,7 @@ impl Handler for Daemon {
             config_path: self.config_path.display().to_string(),
             log_path: self.log_path.display().to_string(),
             autostart: autostart_enabled(),
+            config_error: self.config_error.lock().unwrap().clone(),
         }
     }
 
@@ -43,6 +46,7 @@ impl Handler for Daemon {
         let cfg = Config::from_raw(raw)?;
         cfg.save(&self.config_path)?;
         *self.raw.lock().unwrap() = cfg.to_raw();
+        *self.config_error.lock().unwrap() = None;
         log::info!("界面保存了新配置");
         self.send(Event::Reconfigure(cfg));
         Ok(())
@@ -124,7 +128,7 @@ pub fn run(opts: Options) -> Result<()> {
         }
     };
     if load_error.is_some() {
-        log::warn!("使用默认设置运行，保存设置会覆盖损坏的配置文件");
+        log::warn!("配置文件有误，按默认设置并开启全局断网运行；在界面里保存设置会覆盖损坏的配置文件");
     }
     let listener = listener(&opts.socket)?;
     let hub = Arc::new(StatusHub::default());
@@ -139,6 +143,7 @@ pub fn run(opts: Options) -> Result<()> {
         config_path: opts.config_path.clone(),
         log_path: opts.log_path.clone(),
         raw: Mutex::new(cfg.to_raw()),
+        config_error: Mutex::new(load_error.map(|e| format!("{e:#}"))),
     });
     ipc::serve(listener, daemon, hub);
     {

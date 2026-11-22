@@ -57,7 +57,7 @@ pub fn snapshot() -> Vec<ProcEntry> {
         .collect()
 }
 
-/// 显示用的程序名：在 .app 包里的取包名（"Google Chrome Helper (Renderer)" 这类辅助程序取自己的名字）。
+/// 显示用的程序名：可执行文件名（.app 包里的辅助程序如 "Google Chrome Helper (Renderer)" 也显示自己的名字）。
 fn display_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_owned()
 }

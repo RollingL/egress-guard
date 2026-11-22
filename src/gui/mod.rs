@@ -36,11 +36,17 @@ pub const WINDOW_TITLE: &str = "出口 IP 网络控制 - egress-guard";
 /// 拦截后端能否按应用阻断（macOS 免签名版本用 pf，只能全局断网）。
 const PER_APP: bool = !cfg!(target_os = "macos");
 
+/// macOS 窗口不显示标题栏：侧边栏一直延伸到顶部，红绿灯按钮浮在侧边栏上（与「系统设置」一致）。
+/// 内容需要给标题栏区域（约 28pt）留出空间。
+const UNIFIED_TITLEBAR: bool = cfg!(target_os = "macos");
+const TITLEBAR_H: f32 = 28.0;
+
 /// 与平台相关的界面文字。
 #[cfg(not(target_os = "macos"))]
 mod text {
     pub const ENGINE_RUNNING: &str = "WFP 运行中";
     pub const OVERVIEW_SUB: &str = "根据本机公网出口 IP，自动放行或阻断受控应用的网络连接。";
+    pub const DNS_SUB: &str = "域名解析（端口 53）。关闭后本工具也可能无法检测出口 IP";
     pub const NETWORK_SUB: &str = "出口 IP 不在白名单内时，切断本机的全部网络连接，而不只是受控应用。";
     pub const BLOCK_ALL_OFF: &str = "关闭时只阻断「受控应用」中的程序";
     pub const NETWORK_FOOTNOTE: &str = "受控应用不受下面的例外影响，阻断时仍然完全断网。退出程序会立即恢复全部网络。";
@@ -59,12 +65,14 @@ mod text {
 mod text {
     pub const ENGINE_RUNNING: &str = "pf 运行中";
     pub const OVERVIEW_SUB: &str = "根据本机公网出口 IP，自动放行或切断本机的网络连接。";
+    // macOS 的域名解析由系统服务 mDNSResponder 代为发出，无法只放行本工具的 DNS 查询
+    pub const DNS_SUB: &str = "域名解析（端口 53）。关闭后断网期间无法解析检测服务的域名，出口回到白名单也不会自动恢复";
     pub const NETWORK_SUB: &str = "出口 IP 不在白名单内时，切断本机的全部网络连接。macOS 版只能用这种方式拦截。";
     pub const BLOCK_ALL_OFF: &str = "关闭时不拦截任何连接（macOS 版不能按应用断网）";
     pub const NETWORK_FOOTNOTE: &str = "断网时只放行下面列出的连接。退出程序会立即恢复全部网络。";
     pub const CHILDREN_SUB: &str = "受控应用启动的其他程序自动加入阻断";
     pub const BACKEND_UNAVAILABLE: &str = "pf 不可用，当前为模拟模式。";
-    pub const CLOSE_HINT: &str = "点窗口左上角的关闭按钮会隐藏到菜单栏，程序继续运行。要退出，请点菜单栏图标选择「退出」，退出后所有阻断随之解除。";
+    pub const CLOSE_HINT: &str = "关闭窗口后程序在菜单栏继续运行。要退出，请点菜单栏图标选择「退出并解除阻断」。";
     pub const PROGRAM: &str = "应用";
     pub const SYSTEM_DIRS_HINT: &str = "系统目录（/System、/usr、/bin 等）下的程序不会被自动加入。识别到的子进程会被记住。";
     pub const AUTOSTART_TITLE: &str = "开机自动启动";
@@ -174,7 +182,10 @@ pub fn run(opts: Options) -> Result<()> {
     };
 
     let viewport = egui::ViewportBuilder::default()
-        .with_title(WINDOW_TITLE)
+        .with_title(if UNIFIED_TITLEBAR { "Egress Guard" } else { WINDOW_TITLE })
+        .with_fullsize_content_view(UNIFIED_TITLEBAR)
+        .with_titlebar_shown(!UNIFIED_TITLEBAR)
+        .with_title_shown(!UNIFIED_TITLEBAR)
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([720.0, 480.0])
         .with_icon(egui::IconData { rgba: icons::shield_rgba(64, Shade::Green), width: 64, height: 64 });
@@ -286,12 +297,43 @@ fn tray_state(s: &Status) -> tray::TrayState {
     if s.simulated {
         tooltip.push_str("\n模拟模式（规则未生效）");
     }
-    tray::TrayState { shade, tooltip }
+    tray::TrayState {
+        shade,
+        tooltip,
+        #[cfg(target_os = "macos")]
+        status_line: status_line(s),
+    }
 }
 
-/// 阻断范围的名称。
+/// macOS 菜单栏菜单第一行：一句话说明现在的状态。
+#[cfg(target_os = "macos")]
+fn status_line(s: &Status) -> String {
+    let line = if !s.running {
+        if s.backend_error.is_some() { "未连接后台服务".to_owned() } else { "已停止".to_owned() }
+    } else if inert(s) {
+        "未拦截：全局断网没有开启".to_owned()
+    } else if s.blocked {
+        match s.egress_ip {
+            Some(ip) => format!("已切断网络：出口 IP {ip} 不在白名单"),
+            None => "已切断网络：正在确认出口 IP".to_owned(),
+        }
+    } else if let Some(ip) = s.egress_ip {
+        format!("网络已放行：出口 IP {ip}")
+    } else {
+        "正在检测出口 IP…".to_owned()
+    };
+    if s.simulated { format!("{line}（模拟模式）") } else { line }
+}
+
+/// 阻断范围的名称。只能整机断网的平台（macOS）直接说「网络」。
 fn scope_name(s: &Status) -> &'static str {
-    if s.block_all { "全部网络" } else { "受控应用" }
+    if !s.per_app {
+        "网络"
+    } else if s.block_all {
+        "全部网络"
+    } else {
+        "受控应用"
+    }
 }
 
 /// 引擎判定要阻断，但后端只能全局断网而全局断网没开（macOS 未开启全局断网时），实际什么也不拦截。
@@ -439,6 +481,8 @@ impl App {
         let done = self.service_job.as_ref().and_then(|(j, msg)| j.lock().unwrap().take().map(|r| (r, *msg)));
         if let Some((r, msg)) = done {
             self.service_job = None;
+            // 安装/卸载会改变自动启动的状态（卸载时一并关闭）
+            self.autostart = self.backend.autostart_enabled();
             match r {
                 Ok(()) => self.notify(true, msg),
                 Err(e) if e == "已取消" => {}
@@ -523,7 +567,7 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.status.lock().unwrap().clone();
-        ui.add_space(6.0);
+        ui.add_space(if UNIFIED_TITLEBAR { TITLEBAR_H + 4.0 } else { 6.0 });
         ui.horizontal(|ui| {
             theme::app_icon(ui, 34.0, p.green, Glyph::Shield);
             ui.vertical(|ui| {
@@ -538,15 +582,17 @@ impl App {
         let wl = self.draft.whitelist.len().to_string();
         let apps = self.draft.apps.len().to_string();
         let scope = if self.draft.block_all.enabled { "开" } else { "关" };
-        let pages = [Page::Overview, Page::Whitelist, Page::Apps, Page::Network, Page::Settings, Page::Log];
-        let items = [
-            theme::NavItem { glyph: Glyph::Shield, icon_bg: p.green, text: "概览", badge: None },
-            theme::NavItem { glyph: Glyph::Check, icon_bg: p.accent, text: "出口 IP 白名单", badge: Some(&wl) },
-            theme::NavItem { glyph: Glyph::Grid, icon_bg: p.orange, text: "受控应用", badge: Some(&apps) },
-            theme::NavItem { glyph: Glyph::Globe, icon_bg: p.red, text: "全局断网", badge: Some(scope) },
-            theme::NavItem { glyph: Glyph::Gear, icon_bg: p.gray, text: "设置", badge: None },
-            theme::NavItem { glyph: Glyph::Lines, icon_bg: p.indigo, text: "日志", badge: None },
+        let all = [
+            (Page::Overview, theme::NavItem { glyph: Glyph::Shield, icon_bg: p.green, text: "概览", badge: None }),
+            (Page::Whitelist, theme::NavItem { glyph: Glyph::Check, icon_bg: p.accent, text: "出口 IP 白名单", badge: Some(&wl) }),
+            (Page::Apps, theme::NavItem { glyph: Glyph::Grid, icon_bg: p.orange, text: "受控应用", badge: Some(&apps) }),
+            (Page::Network, theme::NavItem { glyph: Glyph::Globe, icon_bg: p.red, text: "全局断网", badge: Some(scope) }),
+            (Page::Settings, theme::NavItem { glyph: Glyph::Gear, icon_bg: p.gray, text: "设置", badge: None }),
+            (Page::Log, theme::NavItem { glyph: Glyph::Lines, icon_bg: p.indigo, text: "日志", badge: None }),
         ];
+        // 不能按应用断网的平台不显示「受控应用」（列表仍保留在配置里）
+        let (pages, items): (Vec<Page>, Vec<theme::NavItem>) =
+            all.into_iter().filter(|(page, _)| PER_APP || *page != Page::Apps).unzip();
         let selected = pages.iter().position(|x| *x == self.page).unwrap_or(0);
         if let Some(i) = theme::nav_list(ui, p, &items, selected) {
             self.page = pages[i];
@@ -585,7 +631,15 @@ impl App {
         let s = self.status.lock().unwrap().clone();
         theme::page_title(ui, p, "概览", text::OVERVIEW_SUB);
 
-        if let Some(e) = &self.load_error {
+        if let Some(e) = self.backend.config_error() {
+            warning_card(
+                ui,
+                p,
+                "后台服务的配置文件有误",
+                &format!("为安全起见，后台服务正按默认设置运行并开启了全局断网。检查各项设置后点「保存并应用」，会覆盖损坏的文件。{e}"),
+            );
+            ui.add_space(4.0);
+        } else if let Some(e) = &self.load_error {
             warning_card(ui, p, "配置文件读取失败", &format!("当前使用默认设置，保存会覆盖原文件。{e}"));
             ui.add_space(4.0);
         }
@@ -679,20 +733,26 @@ impl App {
                 }
             });
             theme::hairline(ui, p);
-            let scope = if self.applied.block_all.enabled { "全部网络" } else { "仅受控应用" };
+            let scope = match (self.applied.block_all.enabled, PER_APP) {
+                (true, _) => "全部网络",
+                (false, true) => "仅受控应用",
+                (false, false) => "未开启",
+            };
             theme::row(ui, p, "断网范围", None, |ui| {
                 if theme::text_button(ui, p.accent, &format!("{scope}  ›")).clicked() {
                     goto = Some(Page::Network);
                 }
             });
-            theme::hairline(ui, p);
-            let extra_n = s.extra_apps.len();
-            let sub = (extra_n > 0).then(|| format!("另有 {extra_n} 个自动识别的关联程序"));
-            theme::row(ui, p, "受控应用", sub.as_deref(), |ui| {
-                if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
-                    goto = Some(Page::Apps);
-                }
-            });
+            if PER_APP {
+                theme::hairline(ui, p);
+                let extra_n = s.extra_apps.len();
+                let sub = (extra_n > 0).then(|| format!("另有 {extra_n} 个自动识别的关联程序"));
+                theme::row(ui, p, "受控应用", sub.as_deref(), |ui| {
+                    if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
+                        goto = Some(Page::Apps);
+                    }
+                });
+            }
             theme::hairline(ui, p);
             theme::row(ui, p, "白名单条目", None, |ui| {
                 if theme::text_button(ui, p.accent, &format!("{} 条  ›", self.applied.whitelist.len())).clicked() {
@@ -1092,7 +1152,7 @@ impl App {
                 },
             );
             theme::hairline(ui, p);
-            theme::row(ui, p, "DNS 查询", Some("域名解析（端口 53）。关闭后本工具也可能无法检测出口 IP"), |ui| {
+            theme::row(ui, p, "DNS 查询", Some(text::DNS_SUB), |ui| {
                 theme::toggle(ui, p, &mut b.allow_dns);
             });
         });
@@ -1530,8 +1590,9 @@ impl eframe::App for App {
         }
         let enter = egui::emath::easing::cubic_out(raw);
 
+        let top = if UNIFIED_TITLEBAR { 22 + TITLEBAR_H as i8 / 2 } else { 22 };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 22, bottom: 8 }))
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top, bottom: 8 }))
             .show(ui, |ui| {
                 ui.multiply_opacity(0.25 + 0.75 * enter);
                 ui.add_space((1.0 - enter) * 6.0);
@@ -1557,6 +1618,21 @@ impl eframe::App for App {
         if self.page == Page::Log {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        if UNIFIED_TITLEBAR {
+            titlebar_drag_area(ui);
+        }
+    }
+}
+
+/// 隐藏标题栏后，顶部一条仍然可以拖动窗口、双击缩放（系统通常自己处理，这里兜底）。
+fn titlebar_drag_area(ui: &mut egui::Ui) {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(ui.ctx().content_rect().width(), TITLEBAR_H));
+    let r = ui.interact(rect, egui::Id::unique("titlebar-drag"), egui::Sense::click_and_drag());
+    if r.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    } else if r.double_clicked() {
+        let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
     }
 }
 

@@ -42,6 +42,10 @@ pub trait Backend: Send + Sync {
     fn service(&self) -> ServiceState {
         ServiceState::NotApplicable
     }
+    /// 后台服务读取配置文件失败（正在按默认设置并开启全局断网运行）的原因。
+    fn config_error(&self) -> Option<String> {
+        None
+    }
     /// 安装或更新后台服务（会弹出管理员密码对话框，阻塞直到完成）。
     fn install_service(&self) -> Result<()> {
         bail!("此平台不需要后台服务")
@@ -208,7 +212,12 @@ mod remote {
         }
 
         fn apply(&self, cfg: &Config) -> Result<()> {
-            self.client.command(&Request::SetConfig(Box::new(cfg.to_raw())), T)
+            self.client.command(&Request::SetConfig(Box::new(cfg.to_raw())), T)?;
+            // 服务保存成功后损坏的配置已被覆盖
+            if let Some(h) = self.hello.lock().unwrap().as_mut() {
+                h.config_error = None;
+            }
+            Ok(())
         }
 
         fn logs(&self) -> Vec<String> {
@@ -265,6 +274,10 @@ mod remote {
             }
         }
 
+        fn config_error(&self) -> Option<String> {
+            self.hello.lock().unwrap().as_ref().and_then(|h| h.config_error.clone())
+        }
+
         fn install_service(&self) -> Result<()> {
             let cli = Self::cli_path()?;
             service::run_as_admin(
@@ -288,9 +301,21 @@ mod remote {
 
         fn quit(&self) -> ! {
             log::info!("用户选择退出");
-            if self.hello.lock().unwrap().is_some() {
+            let connected = self.hello.lock().unwrap().is_some();
+            if connected {
                 if let Err(e) = self.client.command(&Request::Stop, Duration::from_secs(5)) {
                     log::warn!("无法停止后台服务: {e:#}");
+                    // 菜单写的是「退出并解除阻断」，做不到时必须告诉用户网络仍可能被切断
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("后台服务仍在运行")
+                        .set_description(format!(
+                            "无法停止后台服务，阻断规则仍然有效：{e:#}\n\n\
+                             修改或停止后台服务需要管理员账户。可以用管理员账户打开 Egress Guard 退出，\
+                             或在终端用 sudo 运行 .app 里的 Contents/MacOS/egress-guard stop。"
+                        ))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
                 }
             }
             std::process::exit(0);
