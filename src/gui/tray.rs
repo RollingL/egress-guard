@@ -67,7 +67,7 @@ pub fn spawn(t: TrayCtx, state_rx: Receiver<TrayState>) {
 fn run(t: TrayCtx, state_rx: Receiver<TrayState>) -> anyhow::Result<()> {
     let show = MenuItem::new("显示主窗口", true, None);
     let check = MenuItem::new("立即检测出口 IP", true, None);
-    let quit = MenuItem::new("退出（解除所有阻断）", true, None);
+    let quit = MenuItem::new("退出程序（解除所有阻断）", true, None);
     let menu = Menu::new();
     menu.append_items(&[&show, &check, &PredefinedMenuItem::separator(), &quit])?;
 
