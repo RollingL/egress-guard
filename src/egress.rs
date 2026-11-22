@@ -18,7 +18,7 @@ impl EgressDetector {
             // 使用系统 TLS（Windows 上为 SChannel），无需额外证书
             .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
             .timeout_global(Some(timeout))
-            .user_agent("egress-guard/0.2")
+            .user_agent("egress-guard/0.3")
             .build()
             .into();
         Self { agent, services }

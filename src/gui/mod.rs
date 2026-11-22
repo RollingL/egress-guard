@@ -1,26 +1,30 @@
-//! 图形界面（eframe/egui）：状态、白名单、受控应用、设置、日志，以及系统托盘。
+//! 图形界面（eframe/egui），苹果风格：侧边栏导航、大标题、分组圆角卡片、开关控件，
+//! 浅色/深色跟随系统。另有系统托盘。
 
 mod icons;
 mod platform;
+mod theme;
 #[cfg(windows)]
 mod tray;
 #[cfg(not(windows))]
 #[path = "tray_stub.rs"]
 mod tray;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText};
 
-use crate::config::{parse_net, Config, FailMode, RawConfig};
+use crate::config::{parse_net, Appearance, Config, FailMode, RawConfig};
 use crate::engine::{self, EngineHandle, Event, Status};
 use crate::logbuf;
-use platform::{autostart, procs};
 use icons::Shade;
+use platform::{autostart, procs};
+use theme::{Glyph, Palette};
 
 pub const WINDOW_TITLE: &str = "出口 IP 网络控制 - egress-guard";
 
@@ -37,11 +41,18 @@ pub struct Options {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab {
+enum Page {
+    Overview,
     Whitelist,
     Apps,
     Settings,
     Log,
+}
+
+impl Page {
+    fn editable(self) -> bool {
+        matches!(self, Page::Whitelist | Page::Apps | Page::Settings)
+    }
 }
 
 struct ProcPicker {
@@ -59,14 +70,17 @@ struct App {
     /// 正在编辑的配置。
     draft: RawConfig,
     services_text: String,
-    tab: Tab,
+    page: Page,
     new_entry: String,
     entry_error: Option<String>,
-    message: Option<(bool, String)>,
+    /// (是否成功, 文本, 时间)
+    message: Option<(bool, String, Instant)>,
     load_error: Option<String>,
     picker: Option<ProcPicker>,
     autostart: bool,
     hide_on_first_frame: bool,
+    /// 当前已应用到界面的外观。
+    shown_appearance: Option<Appearance>,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -85,8 +99,8 @@ pub fn run(opts: Options) -> Result<()> {
 
     let viewport = egui::ViewportBuilder::default()
         .with_title(WINDOW_TITLE)
-        .with_inner_size([820.0, 600.0])
-        .with_min_inner_size([640.0, 460.0])
+        .with_inner_size([900.0, 620.0])
+        .with_min_inner_size([720.0, 480.0])
         .with_icon(egui::IconData { rgba: icons::shield_rgba(64, Shade::Green), width: 64, height: 64 });
     let native = eframe::NativeOptions { viewport, ..Default::default() };
 
@@ -94,7 +108,8 @@ pub fn run(opts: Options) -> Result<()> {
         "egress-guard",
         native,
         Box::new(move |cc| {
-            setup_fonts(&cc.egui_ctx);
+            theme::setup_fonts(&cc.egui_ctx);
+            theme::apply_style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let status = Arc::new(Mutex::new(Status::default()));
             let (tray_tx, tray_rx) = mpsc::channel();
@@ -129,7 +144,7 @@ pub fn run(opts: Options) -> Result<()> {
                 services_text: raw.detect.services.join("\n"),
                 applied: raw.clone(),
                 draft: raw,
-                tab: Tab::Whitelist,
+                page: Page::Overview,
                 new_entry: String::new(),
                 entry_error: None,
                 message: None,
@@ -137,30 +152,11 @@ pub fn run(opts: Options) -> Result<()> {
                 picker: None,
                 autostart: autostart::is_enabled(),
                 hide_on_first_frame: opts.start_minimized,
+                shown_appearance: None,
             }))
         }),
     )
     .map_err(|e| anyhow::anyhow!("界面启动失败: {e}"))
-}
-
-/// egui 自带字体不含中文：加载 Windows 自带的中文字体。
-fn setup_fonts(ctx: &egui::Context) {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-    let candidates = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc", "Deng.ttf"];
-    let mut fonts = egui::FontDefinitions::default();
-    for name in candidates {
-        let path = Path::new(&windir).join("Fonts").join(name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            fonts
-                .font_data
-                .insert("cjk".into(), Arc::new(egui::FontData::from_owned(bytes)));
-            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "cjk".into());
-            fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".into());
-            log::debug!("使用字体 {}", path.display());
-            break;
-        }
-    }
-    ctx.set_fonts(fonts);
 }
 
 fn tray_state(s: &Status) -> tray::TrayState {
@@ -184,9 +180,22 @@ fn tray_state(s: &Status) -> tray::TrayState {
     tray::TrayState { shade, tooltip }
 }
 
-fn color(shade: Shade) -> Color32 {
-    let [r, g, b] = shade.rgb();
-    Color32::from_rgb(r, g, b)
+/// 状态的展示信息：标题、说明、颜色。
+fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
+    if !s.running {
+        ("已停止", "后台引擎没有运行。".into(), p.gray)
+    } else if s.blocked {
+        let why = match (s.egress_ip, &s.detect_error) {
+            (Some(ip), _) => format!("出口 IP {ip} 不在白名单内，受控应用已断网。"),
+            (None, Some(_)) => "无法确定出口 IP，为安全起见已断网。".into(),
+            (None, None) => "正在确认出口 IP，确认前受控应用保持断网。".into(),
+        };
+        ("已阻断", why, p.red)
+    } else if let Some(ip) = s.egress_ip {
+        ("已放行", format!("出口 IP {ip} 在白名单内，受控应用可以正常联网。"), p.green)
+    } else {
+        ("检测中", "正在确认出口 IP…".into(), p.gray)
+    }
 }
 
 impl App {
@@ -194,9 +203,12 @@ impl App {
         self.draft != self.applied
     }
 
+    fn notify(&mut self, ok: bool, text: impl Into<String>) {
+        self.message = Some((ok, text.into(), Instant::now()));
+    }
+
     fn save_and_apply(&mut self) {
-        self.draft.detect.services =
-            self.services_text.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+        self.sync_services();
         match Config::from_raw(self.draft.clone()).and_then(|cfg| {
             cfg.save(&self.config_path)?;
             Ok(cfg)
@@ -206,9 +218,9 @@ impl App {
                 self.draft = self.applied.clone();
                 self.engine.send(Event::Reconfigure(cfg));
                 self.load_error = None;
-                self.message = Some((true, format!("已保存到 {} 并生效", self.config_path.display())));
+                self.notify(true, "已保存并生效");
             }
-            Err(e) => self.message = Some((false, format!("保存失败：{e:#}"))),
+            Err(e) => self.notify(false, format!("保存失败：{e:#}")),
         }
     }
 
@@ -216,6 +228,12 @@ impl App {
         self.draft = self.applied.clone();
         self.services_text = self.draft.detect.services.join("\n");
         self.message = None;
+        self.entry_error = None;
+    }
+
+    fn sync_services(&mut self) {
+        self.draft.detect.services =
+            self.services_text.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
     }
 
     fn add_whitelist_entry(&mut self, entry: String) {
@@ -243,139 +261,237 @@ impl App {
         }
     }
 
-    // ---------------- 各区域 ----------------
+    // ---------------- 侧边栏 ----------------
 
-    fn status_panel(&mut self, ui: &mut egui::Ui) {
+    fn sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.status.lock().unwrap().clone();
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let (text, shade) = if !s.running {
-                ("● 已停止", Shade::Gray)
-            } else if s.blocked {
-                ("● 已阻断受控应用", Shade::Red)
-            } else if s.egress_ip.is_some() {
-                ("● 已放行受控应用", Shade::Green)
-            } else {
-                ("● 正在检测…", Shade::Gray)
-            };
-            ui.label(RichText::new(text).size(22.0).strong().color(color(shade)));
-            if s.simulated {
-                ui.label(RichText::new("模拟模式").color(color(Shade::Amber)).strong());
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("退出程序").on_hover_text("关闭程序，所有阻断规则随之移除").clicked() {
-                    quit(&self.engine);
-                }
-                if ui.button("隐藏到托盘").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
-                let check = ui.add_enabled(!s.checking, egui::Button::new("立即检测"));
-                if check.clicked() {
-                    self.engine.send(Event::CheckNow);
-                }
+            theme::app_icon(ui, 34.0, p.green, Glyph::Shield);
+            ui.vertical(|ui| {
+                ui.add_space(1.0);
+                ui.label(RichText::new("Egress Guard").font(theme::bold(15.0)).color(p.label));
+                ui.add_space(-7.0);
+                ui.label(RichText::new("出口 IP 网络控制").size(11.5).color(p.secondary));
             });
         });
+        ui.add_space(16.0);
 
-        egui::Grid::new("status_grid").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.label("出口 IP");
-            ui.horizontal(|ui| {
-                match s.egress_ip {
-                    Some(ip) => {
-                        ui.label(RichText::new(ip.to_string()).monospace().strong());
-                        if s.whitelisted == Some(true) {
-                            ui.label(RichText::new("命中白名单").color(color(Shade::Green)));
-                        } else {
-                            ui.label(RichText::new("不在白名单内").color(color(Shade::Red)));
-                        }
-                    }
-                    None => {
-                        ui.label("未知");
-                    }
-                }
-                if s.checking {
-                    ui.spinner();
-                }
-            });
-            ui.end_row();
-
-            ui.label("上次检测");
-            ui.label(s.last_check.clone().unwrap_or_else(|| "尚未完成".into()));
-            ui.end_row();
-
-            if let Some(err) = &s.detect_error {
-                ui.label("检测错误");
-                ui.label(
-                    RichText::new(format!("（连续 {} 次）{}", s.failures, shorten(err, 160)))
-                        .color(color(Shade::Amber)),
-                )
-                .on_hover_text(err);
-                ui.end_row();
+        let wl = self.draft.whitelist.len().to_string();
+        let apps = self.draft.apps.len().to_string();
+        let items: [(Page, Glyph, Color32, &str, Option<&str>); 5] = [
+            (Page::Overview, Glyph::Shield, p.green, "概览", None),
+            (Page::Whitelist, Glyph::Check, p.accent, "出口 IP 白名单", Some(&wl)),
+            (Page::Apps, Glyph::Grid, p.orange, "受控应用", Some(&apps)),
+            (Page::Settings, Glyph::Gear, p.gray, "设置", None),
+            (Page::Log, Glyph::Lines, p.indigo, "日志", None),
+        ];
+        for (page, glyph, bg, text, badge) in items {
+            if theme::nav_item(ui, p, self.page == page, glyph, bg, text, badge) {
+                self.page = page;
             }
-
-            ui.label("拦截引擎");
-            match &s.backend_error {
-                Some(e) => {
-                    ui.label(
-                        RichText::new(format!("不可用，规则未生效：{e}")).color(color(Shade::Red)),
-                    );
-                }
-                None if s.running => {
-                    ui.label("WFP 动态会话（程序退出时规则自动移除）");
-                }
-                None => {
-                    ui.label("未运行");
-                }
-            }
-            ui.end_row();
-        });
-
-        if let Some(e) = &self.load_error {
-            ui.colored_label(
-                color(Shade::Red),
-                format!("配置文件读取失败，当前使用默认设置（保存会覆盖原文件）：{e}"),
-            );
+            ui.add_space(-4.0);
         }
-        ui.add_space(6.0);
+
+        // 底部：状态摘要 + 隐藏/退出（顶部留白把它们推到底部）
+        let bottom_h = if s.simulated { 150.0 } else { 132.0 };
+        ui.add_space((ui.available_height() - bottom_h).max(8.0));
+        let (title, _, color) = describe(&s, p);
+        egui::Frame::new()
+            .fill(p.card.gamma_multiply(if p.dark { 0.6 } else { 0.8 }))
+            .corner_radius(CornerRadius::same(9))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.5, color);
+                    ui.label(RichText::new(title).font(theme::bold(13.0)).color(p.label));
+                    if s.checking {
+                        ui.add(egui::Spinner::new().size(12.0));
+                    }
+                });
+                let ip = s.egress_ip.map(|i| i.to_string()).unwrap_or_else(|| "出口 IP 未知".into());
+                ui.label(RichText::new(ip).size(12.0).color(p.secondary));
+                if s.simulated {
+                    ui.label(RichText::new("模拟模式 · 规则未生效").size(12.0).color(p.orange));
+                }
+            });
+        ui.add_space(4.0);
+        if theme::text_button(ui, p.accent, "隐藏到托盘").clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        ui.add_space(-6.0);
+        if theme::text_button(ui, p.red, "退出程序").on_hover_text("关闭程序，所有阻断规则随之移除").clicked() {
+            quit(&self.engine);
+        }
     }
 
-    fn whitelist_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label("出口 IP 命中以下任一条目时放行受控应用，否则阻断。支持单个 IP（IPv4/IPv6）和 CIDR 网段。");
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut self.new_entry)
-                    .hint_text("例如 203.0.113.10 或 198.51.100.0/24")
-                    .desired_width(280.0),
-            );
-            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("添加").clicked() || enter {
-                let e = self.new_entry.clone();
-                self.add_whitelist_entry(e);
+    // ---------------- 页面 ----------------
+
+    fn overview(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let s = self.status.lock().unwrap().clone();
+        theme::page_title(ui, p, "概览", "根据本机公网出口 IP，自动放行或阻断受控应用的网络连接。");
+
+        if let Some(e) = &self.load_error {
+            warning_card(ui, p, "配置文件读取失败", &format!("当前使用默认设置，保存会覆盖原文件。{e}"));
+            ui.add_space(4.0);
+        }
+        if let Some(e) = &s.backend_error {
+            warning_card(ui, p, "拦截规则未生效", &format!("WFP 不可用，当前为模拟模式。请以管理员身份运行。{e}"));
+            ui.add_space(4.0);
+        }
+
+        // 主状态卡
+        let (title, desc, color) = describe(&s, p);
+        theme::card(ui, p, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                theme::status_badge(ui, 64.0, color);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("受控应用{title}")).font(theme::bold(22.0)).color(p.label));
+                    ui.label(RichText::new(desc).color(p.secondary));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if s.checking {
+                        ui.add(egui::Spinner::new().size(18.0));
+                    } else if theme::accent_button(ui, p, "立即检测", true).clicked() {
+                        self.engine.send(Event::CheckNow);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        });
+
+        theme::section(ui, p, "网络");
+        theme::card(ui, p, |ui| {
+            theme::row(ui, p, "出口 IP", None, |ui| {
+                let ip = s.egress_ip.map(|i| i.to_string()).unwrap_or_else(|| "未知".into());
+                ui.label(RichText::new(ip).monospace().color(p.label));
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "白名单", None, |ui| match s.whitelisted {
+                Some(true) => {
+                    theme::chip(ui, p.green, "命中");
+                }
+                Some(false) => {
+                    theme::chip(ui, p.red, "未命中");
+                }
+                None => {
+                    ui.label(RichText::new("—").color(p.secondary));
+                }
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "上次检测", None, |ui| {
+                ui.label(RichText::new(s.last_check.clone().unwrap_or_else(|| "尚未完成".into())).color(p.secondary));
+            });
+            if let Some(err) = &s.detect_error {
+                theme::hairline(ui, p);
+                theme::row(ui, p, "检测失败", Some(&shorten(err, 90)), |ui| {
+                    theme::chip(ui, p.orange, &format!("连续 {} 次", s.failures));
+                });
+            }
+        });
+
+        theme::section(ui, p, "保护");
+        let mut goto = None;
+        theme::card(ui, p, |ui| {
+            theme::row(ui, p, "拦截引擎", None, |ui| {
+                if s.backend_error.is_some() {
+                    theme::chip(ui, p.orange, "模拟模式");
+                } else if s.running {
+                    theme::chip(ui, p.green, "WFP 运行中");
+                } else {
+                    theme::chip(ui, p.gray, "未运行");
+                }
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "受控应用", None, |ui| {
+                if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
+                    goto = Some(Page::Apps);
+                }
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "白名单条目", None, |ui| {
+                if theme::text_button(ui, p.accent, &format!("{} 条  ›", self.applied.whitelist.len())).clicked() {
+                    goto = Some(Page::Whitelist);
+                }
+            });
+        });
+        if let Some(pg) = goto {
+            self.page = pg;
+        }
+        theme::footnote(ui, p, "关闭窗口后程序会在托盘中继续运行；退出程序会解除所有阻断。");
+    }
+
+    fn whitelist(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::page_title(
+            ui,
+            p,
+            "出口 IP 白名单",
+            "出口 IP 命中任一条目时放行受控应用，否则阻断。支持单个 IPv4/IPv6 地址和 CIDR 网段。",
+        );
+
+        theme::card(ui, p, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 80.0;
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_entry)
+                        .hint_text("例如 203.0.113.10 或 198.51.100.0/24")
+                        .desired_width(w)
+                        .margin(Margin::symmetric(8, 5)),
+                );
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::accent_button(ui, p, "添加", true).clicked() || enter {
+                    let e = self.new_entry.clone();
+                    self.add_whitelist_entry(e);
+                }
+            });
+            if let Some(e) = &self.entry_error {
+                ui.label(RichText::new(e).size(12.0).color(p.red));
             }
             let current = self.status.lock().unwrap().egress_ip;
             if let Some(ip) = current {
-                if ui.button(format!("添加当前出口 IP（{ip}）")).clicked() {
-                    self.add_whitelist_entry(ip.to_string());
+                let s = ip.to_string();
+                if !self.draft.whitelist.contains(&s)
+                    && theme::text_button(ui, p.accent, &format!("＋ 添加当前出口 IP（{s}）")).clicked()
+                {
+                    self.add_whitelist_entry(s);
                 }
             }
         });
-        if let Some(e) = &self.entry_error {
-            ui.colored_label(color(Shade::Red), e);
-        }
-        ui.separator();
 
-        if self.draft.whitelist.is_empty() {
-            ui.label(RichText::new("白名单为空：任何出口 IP 都会阻断受控应用。").color(color(Shade::Amber)));
-        }
+        theme::section(ui, p, &format!("已添加 {} 条", self.draft.whitelist.len()));
         let mut remove = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        theme::card(ui, p, |ui| {
+            if self.draft.whitelist.is_empty() {
+                empty_state(ui, p, "白名单为空", "任何出口 IP 都会阻断受控应用。");
+                return;
+            }
+            let n = self.draft.whitelist.len();
             for (i, entry) in self.draft.whitelist.iter().enumerate() {
+                let kind = match parse_net(entry) {
+                    Ok(net) if net.prefix_len() == net.max_prefix_len() => "单个地址",
+                    Ok(_) => "网段",
+                    Err(_) => "无效",
+                };
                 ui.horizontal(|ui| {
-                    if ui.small_button("删除").clicked() {
-                        remove = Some(i);
-                    }
-                    ui.label(RichText::new(entry).monospace());
+                    ui.set_min_height(32.0);
+                    ui.label(RichText::new(entry).monospace().color(p.label));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::minus_button(ui, p).on_hover_text("移除").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.label(RichText::new(kind).size(12.0).color(p.secondary));
+                    });
                 });
+                if i + 1 < n {
+                    theme::hairline(ui, p);
+                }
             }
         });
         if let Some(i) = remove {
@@ -383,219 +499,339 @@ impl App {
         }
     }
 
-    fn apps_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label("出口 IP 不在白名单内时，以下程序的全部网络连接会被阻断。");
-        ui.label(
-            RichText::new("提示：浏览器等多进程程序通常只需添加主程序；若有独立的更新器或辅助程序（不同 exe），也需要一并添加。")
-                .weak(),
-        );
-        ui.add_space(4.0);
+    fn apps(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::page_title(ui, p, "受控应用", "出口 IP 不在白名单内时，以下程序的全部网络连接会被阻断。");
+
         ui.horizontal(|ui| {
-            if ui.button("浏览选择 exe…").clicked() {
+            if theme::gray_button(ui, p, "浏览选择程序…").clicked() {
                 for f in platform::pick_exe_files() {
                     self.add_app(f);
                 }
             }
-            if ui.button("从正在运行的程序中选择…").clicked() {
+            if theme::gray_button(ui, p, "从正在运行的程序中选择…").clicked() {
                 self.picker = Some(ProcPicker { filter: String::new(), list: procs::list_processes() });
             }
         });
-        ui.separator();
+        ui.add_space(4.0);
 
-        if self.draft.apps.is_empty() {
-            ui.label(RichText::new("尚未添加受控应用。").color(color(Shade::Amber)));
-        }
+        theme::section(ui, p, &format!("{} 个应用", self.draft.apps.len()));
         let mut remove = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        theme::card(ui, p, |ui| {
+            if self.draft.apps.is_empty() {
+                empty_state(ui, p, "尚未添加受控应用", "添加后，出口 IP 不在白名单内时这些程序会被断网。");
+                return;
+            }
+            let n = self.draft.apps.len();
             for (i, app) in self.draft.apps.iter().enumerate() {
+                let name = exe_name(&app.to_string_lossy());
                 ui.horizontal(|ui| {
-                    if ui.small_button("删除").clicked() {
-                        remove = Some(i);
-                    }
-                    if app.exists() {
-                        ui.label(RichText::new("存在").color(color(Shade::Green)));
-                    } else {
-                        ui.label(RichText::new("文件不存在").color(color(Shade::Red)));
-                    }
-                    ui.label(RichText::new(app.display().to_string()).monospace());
+                    ui.set_min_height(44.0);
+                    letter_icon(ui, p, &name);
+                    ui.vertical(|ui| {
+                        ui.add_space(3.0);
+                        ui.label(RichText::new(&name).font(theme::bold(14.0)).color(p.label));
+                        ui.add_space(-6.0);
+                        ui.label(RichText::new(shorten(&app.display().to_string(), 70)).size(12.0).color(p.secondary))
+                            .on_hover_text(app.display().to_string());
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::minus_button(ui, p).on_hover_text("移除").clicked() {
+                            remove = Some(i);
+                        }
+                        if !app.exists() {
+                            theme::chip(ui, p.red, "文件不存在");
+                        }
+                    });
                 });
+                if i + 1 < n {
+                    theme::hairline(ui, p);
+                }
             }
         });
         if let Some(i) = remove {
             self.draft.apps.remove(i);
         }
+        theme::footnote(
+            ui,
+            p,
+            "浏览器等多进程程序通常只需添加主程序；若有独立的更新器或辅助程序（不同的 exe），也需要一并添加。",
+        );
     }
 
-    fn picker_window(&mut self, ctx: &egui::Context) {
+    fn picker_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(picker) = &mut self.picker else { return };
         let mut open = true;
         let mut chosen = None;
         egui::Window::new("从正在运行的程序中选择")
             .open(&mut open)
-            .default_size([620.0, 420.0])
+            .default_size([620.0, 440.0])
             .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("筛选");
-                    ui.add(egui::TextEdit::singleline(&mut picker.filter).desired_width(240.0));
-                    if ui.button("刷新").clicked() {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut picker.filter)
+                            .hint_text("搜索名称或路径")
+                            .desired_width(ui.available_width() - 70.0)
+                            .margin(Margin::symmetric(8, 5)),
+                    );
+                    if theme::gray_button(ui, p, "刷新").clicked() {
                         picker.list = procs::list_processes();
                     }
                 });
-                ui.separator();
+                ui.add_space(4.0);
                 let f = picker.filter.to_lowercase();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for p in picker.list.iter().filter(|p| {
-                        f.is_empty() || p.name.to_lowercase().contains(&f) || p.path.to_lowercase().contains(&f)
+                    for proc_ in picker.list.iter().filter(|x| {
+                        f.is_empty() || x.name.to_lowercase().contains(&f) || x.path.to_lowercase().contains(&f)
                     }) {
                         ui.horizontal(|ui| {
-                            if ui.small_button("添加").clicked() {
-                                chosen = Some(PathBuf::from(&p.path));
-                            }
-                            ui.label(RichText::new(&p.name).strong());
-                            ui.label(RichText::new(&p.path).weak()).on_hover_text(format!("PID {}", p.pid));
+                            ui.set_min_height(40.0);
+                            letter_icon(ui, p, &proc_.name);
+                            ui.vertical(|ui| {
+                                ui.add_space(2.0);
+                                ui.label(RichText::new(&proc_.name).color(p.label));
+                                ui.add_space(-6.0);
+                                ui.label(RichText::new(shorten(&proc_.path, 60)).size(12.0).color(p.secondary))
+                                    .on_hover_text(format!("{}\nPID {}", proc_.path, proc_.pid));
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if theme::accent_button(ui, p, "添加", true).clicked() {
+                                    chosen = Some(PathBuf::from(&proc_.path));
+                                }
+                            });
                         });
+                        theme::hairline(ui, p);
                     }
                 });
             });
-        if let Some(p) = chosen {
-            self.add_app(p);
+        if let Some(path) = chosen {
+            self.add_app(path);
+            self.notify(true, "已添加，记得保存");
         }
         if !open {
             self.picker = None;
         }
     }
 
-    fn settings_tab(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.heading("出口 IP 检测");
-            egui::Grid::new("detect_grid").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                let d = &mut self.draft.detect;
-                ui.label("定时检测间隔");
-                ui.add(egui::DragValue::new(&mut d.interval_secs).range(5..=86400).suffix(" 秒"));
-                ui.end_row();
-                ui.label("单个服务超时");
-                ui.add(egui::DragValue::new(&mut d.timeout_secs).range(1..=60).suffix(" 秒"));
-                ui.end_row();
-                ui.label("检测失败时");
-                egui::ComboBox::from_id_salt("fail_mode")
-                    .selected_text(match d.fail_mode {
-                        FailMode::Block => "阻断（推荐）",
-                        FailMode::Allow => "放行",
-                        FailMode::Keep => "保持当前状态",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.fail_mode, FailMode::Block, "阻断（推荐）");
-                        ui.selectable_value(&mut d.fail_mode, FailMode::Allow, "放行");
-                        ui.selectable_value(&mut d.fail_mode, FailMode::Keep, "保持当前状态");
-                    });
-                ui.end_row();
-                ui.label("连续失败几次后执行");
-                ui.add(egui::DragValue::new(&mut d.failure_threshold).range(1..=20).suffix(" 次"));
-                ui.end_row();
-            });
-            ui.add_space(4.0);
-            ui.label("出口 IP 查询服务（每行一个，按顺序尝试）：");
-            ui.label(
-                RichText::new("如果使用按应用/域名分流的 VPN 或代理，请选择与受控应用走同一出口的服务。").weak(),
-            );
-            ui.add(egui::TextEdit::multiline(&mut self.services_text).desired_rows(4).desired_width(f32::INFINITY));
-            // 同步到草稿，以便“未保存”状态能正确显示
-            self.draft.detect.services = self
-                .services_text
-                .lines()
-                .map(|l| l.trim().to_owned())
-                .filter(|l| !l.is_empty())
-                .collect();
+    fn settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::page_title(ui, p, "设置", "");
 
-            ui.add_space(8.0);
-            ui.heading("行为");
+        theme::section(ui, p, "外观");
+        theme::card(ui, p, |ui| {
+            theme::row(ui, p, "界面外观", None, |ui| {
+                theme::segmented(
+                    ui,
+                    p,
+                    &mut self.draft.ui.appearance,
+                    &[(Appearance::Dark, "深色"), (Appearance::Light, "浅色"), (Appearance::System, "跟随系统")],
+                );
+            });
+        });
+
+        theme::section(ui, p, "出口 IP 检测");
+        theme::card(ui, p, |ui| {
+            let d = &mut self.draft.detect;
+            theme::row(ui, p, "定时检测间隔", Some("网卡、地址或路由变化时还会立即检测"), |ui| {
+                ui.add(egui::DragValue::new(&mut d.interval_secs).range(5..=86400).suffix(" 秒"));
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "单个服务超时", None, |ui| {
+                ui.add(egui::DragValue::new(&mut d.timeout_secs).range(1..=60).suffix(" 秒"));
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "检测失败时", None, |ui| {
+                egui::ComboBox::from_id_salt("fail_mode")
+                    .selected_text(fail_mode_text(d.fail_mode))
+                    .show_ui(ui, |ui| {
+                        for m in [FailMode::Block, FailMode::Allow, FailMode::Keep] {
+                            ui.selectable_value(&mut d.fail_mode, m, fail_mode_text(m));
+                        }
+                    });
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "连续失败几次后执行", None, |ui| {
+                ui.add(egui::DragValue::new(&mut d.failure_threshold).range(1..=20).suffix(" 次"));
+            });
+        });
+
+        theme::section(ui, p, "出口 IP 查询服务");
+        theme::card(ui, p, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.services_text)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .margin(Margin::symmetric(8, 6)),
+            );
+        });
+        self.sync_services();
+        theme::footnote(
+            ui,
+            p,
+            "每行一个，按顺序尝试。若使用按应用或域名分流的 VPN/代理，请选择与受控应用走同一出口的服务。",
+        );
+
+        theme::section(ui, p, "行为");
+        theme::card(ui, p, |ui| {
             let b = &mut self.draft.behavior;
-            ui.checkbox(&mut b.start_blocked, "启动时先阻断，确认出口 IP 在白名单后再放行");
-            ui.checkbox(&mut b.block_on_network_change, "网络变化时立即先阻断，重新检测确认后再放行");
-            ui.checkbox(&mut b.kill_existing_tcp, "切换为阻断时，主动断开受控应用已有的 TCP 连接");
-            ui.horizontal(|ui| {
-                ui.label("网络变化防抖");
+            theme::row(ui, p, "启动时先阻断", Some("确认出口 IP 在白名单后再放行"), |ui| {
+                theme::toggle(ui, p, &mut b.start_blocked);
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "网络变化时先阻断", Some("防止切换网络的瞬间泄漏"), |ui| {
+                theme::toggle(ui, p, &mut b.block_on_network_change);
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "断开已有连接", Some("切换为阻断时，主动断开受控应用的 TCP 连接"), |ui| {
+                theme::toggle(ui, p, &mut b.kill_existing_tcp);
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "网络变化防抖", None, |ui| {
                 ui.add(egui::DragValue::new(&mut b.debounce_ms).range(0..=30000).suffix(" 毫秒"));
             });
+        });
 
-            ui.add_space(8.0);
-            ui.heading("启动");
-            let mut auto = self.autostart;
-            if ui
-                .checkbox(&mut auto, "登录 Windows 时自动启动（以管理员权限运行在托盘，不弹出 UAC）")
-                .changed()
-            {
-                let res = match std::env::current_exe() {
-                    Ok(exe) if auto => autostart::enable(&exe),
-                    Ok(_) => autostart::disable(),
-                    Err(e) => Err(e.into()),
-                };
-                match res {
-                    Ok(()) => {
-                        self.message =
-                            Some((true, if auto { "已开启开机自启".into() } else { "已关闭开机自启".into() }));
-                    }
-                    Err(e) => self.message = Some((false, format!("{e:#}"))),
-                }
-                self.autostart = autostart::is_enabled();
-            }
+        theme::section(ui, p, "启动");
+        let mut auto = self.autostart;
+        let mut changed = false;
+        theme::card(ui, p, |ui| {
+            theme::row(ui, p, "登录时自动启动", Some("以管理员权限在托盘中运行，不弹出 UAC"), |ui| {
+                changed = theme::toggle(ui, p, &mut auto).changed();
+            });
         });
-    }
-
-    fn log_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("清空").clicked() {
-                logbuf::clear();
+        if changed {
+            let res = match std::env::current_exe() {
+                Ok(exe) if auto => autostart::enable(&exe),
+                Ok(_) => autostart::disable(),
+                Err(e) => Err(e.into()),
+            };
+            match res {
+                Ok(()) => self.notify(true, if auto { "已开启开机自启" } else { "已关闭开机自启" }),
+                Err(e) => self.notify(false, format!("{e:#}")),
             }
-            if let Some(dir) = crate::exe_dir() {
-                ui.label(RichText::new(format!("完整日志：{}", dir.join("egress-guard.log").display())).weak());
-            }
-        });
-        ui.separator();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for line in logbuf::recent_lines() {
-                let c = if line.contains(" ERROR ") {
-                    Some(color(Shade::Red))
-                } else if line.contains(" WARN ") {
-                    Some(color(Shade::Amber))
-                } else {
-                    None
-                };
-                let t = RichText::new(line).monospace();
-                ui.label(match c {
-                    Some(c) => t.color(c),
-                    None => t,
-                });
-            }
-        });
-    }
-
-    fn save_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let dirty = self.dirty();
-            if ui.add_enabled(dirty, egui::Button::new(RichText::new("保存并应用").strong())).clicked() {
-                self.save_and_apply();
-            }
-            if ui.add_enabled(dirty, egui::Button::new("撤销修改")).clicked() {
-                self.revert();
-            }
-            if dirty {
-                ui.colored_label(color(Shade::Amber), "有未保存的修改");
-            } else if let Some((ok, msg)) = &self.message {
-                ui.colored_label(if *ok { color(Shade::Green) } else { color(Shade::Red) }, msg);
-            } else {
-                ui.label(RichText::new(format!("配置文件：{}", self.config_path.display())).weak());
-            }
-        });
-        if self.dirty() {
-            if let Some((false, msg)) = &self.message {
-                ui.colored_label(color(Shade::Red), msg);
-            }
+            self.autostart = autostart::is_enabled();
         }
-        ui.add_space(4.0);
+        theme::footnote(ui, p, &format!("配置文件：{}", self.config_path.display()));
     }
+
+    fn log(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("日志").font(theme::bold(26.0)).color(p.label));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::gray_button(ui, p, "清空").clicked() {
+                    logbuf::clear();
+                }
+            });
+        });
+        if let Some(dir) = crate::exe_dir() {
+            ui.label(RichText::new(format!("完整日志：{}", dir.join("egress-guard.log").display())).color(p.secondary));
+        }
+        ui.add_space(8.0);
+        theme::card(ui, p, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                for line in logbuf::recent_lines() {
+                    let c = if line.contains(" ERROR ") {
+                        p.red
+                    } else if line.contains(" WARN ") {
+                        p.orange
+                    } else {
+                        p.label
+                    };
+                    ui.label(RichText::new(line).monospace().size(12.5).color(c));
+                }
+            });
+        });
+    }
+
+    /// 底部浮动保存栏：有未保存修改或刚保存时显示。
+    fn save_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let dirty = self.dirty();
+        let recent = self.message.as_ref().filter(|m| m.2.elapsed() < Duration::from_secs(4) || !m.0).cloned();
+        if !dirty && recent.is_none() {
+            return;
+        }
+        egui::Frame::new()
+            .fill(p.card)
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(16, 10))
+            .stroke(egui::Stroke::new(0.5, p.separator))
+            .shadow(ui.visuals().popup_shadow)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    match (&recent, dirty) {
+                        (Some((false, msg, _)), _) => {
+                            ui.label(RichText::new(shorten(msg, 80)).color(p.red)).on_hover_text(msg);
+                        }
+                        (_, true) => {
+                            ui.label(RichText::new("有未保存的修改").color(p.label));
+                        }
+                        (Some((true, msg, _)), false) => {
+                            ui.label(RichText::new(msg).color(p.green));
+                        }
+                        _ => {}
+                    }
+                    if dirty {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::accent_button(ui, p, "保存并应用", true).clicked() {
+                                self.save_and_apply();
+                            }
+                            if theme::gray_button(ui, p, "撤销").clicked() {
+                                self.revert();
+                            }
+                        });
+                    }
+                });
+            });
+        if recent.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+    }
+}
+
+fn fail_mode_text(m: FailMode) -> &'static str {
+    match m {
+        FailMode::Block => "阻断（推荐）",
+        FailMode::Allow => "放行",
+        FailMode::Keep => "保持当前状态",
+    }
+}
+
+fn warning_card(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
+    egui::Frame::new()
+        .fill(p.orange.gamma_multiply(0.12))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 8.0, p.orange);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "!", theme::bold(12.0), Color32::WHITE);
+                ui.label(RichText::new(title).font(theme::bold(14.0)).color(p.orange));
+            });
+            ui.label(RichText::new(text).size(12.5).color(p.label));
+        });
+}
+
+fn empty_state(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(14.0);
+        ui.label(RichText::new(title).font(theme::bold(15.0)).color(p.secondary));
+        ui.label(RichText::new(text).size(12.5).color(p.tertiary));
+        ui.add_space(14.0);
+    });
+}
+
+/// 用首字母做的应用图标。
+fn letter_icon(ui: &mut egui::Ui, p: &Palette, name: &str) {
+    let colors = [p.accent, p.orange, p.green, p.indigo, p.teal, p.red];
+    let idx = name.bytes().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize)) % colors.len();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(7), colors[idx]);
+    let letter: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, letter, theme::bold(15.0), Color32::WHITE);
 }
 
 impl eframe::App for App {
@@ -618,32 +854,64 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        egui::Panel::top("status").show(ui, |ui| self.status_panel(ui));
-        if self.tab != Tab::Log {
-            egui::Panel::bottom("save").show(ui, |ui| self.save_bar(ui));
-        }
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let wl = format!("出口 IP 白名单（{}）", self.draft.whitelist.len());
-                let apps = format!("受控应用（{}）", self.draft.apps.len());
-                ui.selectable_value(&mut self.tab, Tab::Whitelist, wl);
-                ui.selectable_value(&mut self.tab, Tab::Apps, apps);
-                ui.selectable_value(&mut self.tab, Tab::Settings, "设置");
-                ui.selectable_value(&mut self.tab, Tab::Log, "日志");
+        // 外观修改立即预览，保存后写入配置
+        if self.shown_appearance != Some(self.draft.ui.appearance) {
+            self.shown_appearance = Some(self.draft.ui.appearance);
+            ctx.set_theme(match self.draft.ui.appearance {
+                Appearance::System => egui::ThemePreference::System,
+                Appearance::Light => egui::ThemePreference::Light,
+                Appearance::Dark => egui::ThemePreference::Dark,
             });
-            ui.separator();
-            match self.tab {
-                Tab::Whitelist => self.whitelist_tab(ui),
-                Tab::Apps => self.apps_tab(ui),
-                Tab::Settings => self.settings_tab(ui),
-                Tab::Log => self.log_tab(ui),
-            }
-        });
-        self.picker_window(&ctx);
-        // 日志页需要持续刷新
-        if self.tab == Tab::Log {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        let p = Palette::of(ui);
+
+        egui::Panel::left("sidebar")
+            .exact_size(220.0)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(12, 14)))
+            .show(ui, |ui| self.sidebar(ui, &p));
+
+        if self.page.editable() {
+            egui::Panel::bottom("save")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 0, bottom: 14 }))
+                .show(ui, |ui| self.save_bar(ui, &p));
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 22, bottom: 8 }))
+            .show(ui, |ui| {
+                if self.page == Page::Log {
+                    self.log(ui, &p);
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_max_width(ui.available_width().min(760.0));
+                    match self.page {
+                        Page::Overview => self.overview(ui, &p),
+                        Page::Whitelist => self.whitelist(ui, &p),
+                        Page::Apps => self.apps(ui, &p),
+                        Page::Settings => self.settings(ui, &p),
+                        Page::Log => {}
+                    }
+                    ui.add_space(12.0);
+                });
+            });
+
+        self.picker_window(&ctx, &p);
+        if self.page == Page::Log {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+}
+
+/// 从 Windows 路径中取出不带扩展名的程序名（与运行平台无关）。
+fn exe_name(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    match file.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem.to_owned(),
+        _ => file.to_owned(),
     }
 }
 

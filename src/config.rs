@@ -33,6 +33,26 @@ pub struct RawConfig {
     pub detect: DetectConfig,
     #[serde(default)]
     pub behavior: BehaviorConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// 界面外观。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    /// 跟随系统浅色/深色设置。
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// 界面相关设置（命令行版本忽略）。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UiConfig {
+    pub appearance: Appearance,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -98,6 +118,7 @@ pub struct Config {
     pub apps: Vec<PathBuf>,
     pub detect: DetectConfig,
     pub behavior: BehaviorConfig,
+    pub ui: UiConfig,
 }
 
 impl Config {
@@ -135,7 +156,7 @@ impl Config {
         }
         let mut detect = raw.detect;
         detect.services.retain(|s| !s.trim().is_empty());
-        Ok(Self { whitelist, apps: raw.apps, detect, behavior: raw.behavior })
+        Ok(Self { whitelist, apps: raw.apps, detect, behavior: raw.behavior, ui: raw.ui })
     }
 
     /// 转回可序列化/可编辑的原始配置。
@@ -145,6 +166,7 @@ impl Config {
             apps: self.apps.clone(),
             detect: self.detect.clone(),
             behavior: self.behavior.clone(),
+            ui: self.ui.clone(),
         }
     }
 

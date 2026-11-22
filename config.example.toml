@@ -44,3 +44,7 @@ block_on_network_change = true
 kill_existing_tcp = true
 # 网络变化事件防抖（毫秒）
 debounce_ms = 2000
+
+[ui]
+# 界面外观：system（跟随系统）/ light（浅色）/ dark（深色）。命令行版本忽略此项
+appearance = "system"
