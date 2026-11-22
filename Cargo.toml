@@ -1,6 +1,6 @@
 [package]
 name = "egress-guard"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "根据本机公网出口 IP 判断是否阻断选中应用（Windows：WFP；macOS：网络扩展）或全部网络（Windows：WFP；macOS：pf）的连接"
 
@@ -16,13 +16,14 @@ toml = "0.9"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 # 界面在 Windows、macOS 上发布；Linux 仅用于开发时预览界面
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+# clipboard：接入系统剪贴板（不开时只能在程序内部复制粘贴，从别处复制的内容粘不进来）
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard", "x11"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = "0.26"

@@ -1,5 +1,6 @@
 #!/bin/bash
 # 在 GitHub 的 macOS 虚拟机上做端到端测试（需要免密 sudo）：
+# 界面与系统剪贴板互通（复制、⌘V 粘贴）→
 # 安装后台服务 → 按应用断网的规则推送（用测试客户端代替网络扩展）→ 全局断网生效（检测仍可用、例外地址可达）
 # → 出口进入白名单后放行 → 退出 → 卸载。中间启动界面截图，保存到 target/macos/shots/。
 #
@@ -83,6 +84,44 @@ echo "$SELF"
 echo "$SELF" | python3 -c "import json,sys; s=json.load(sys.stdin); print('bundled', s['bundled'], 'team', s.get('team_id'), 'phase', s['phase']); sys.exit(0 if s['bundled'] and s['loaded'] else 1)" \
   || fail "网络扩展自检失败：$SELF"
 sudo rm -rf "/Applications/Egress Guard.app"
+
+step "复制粘贴：界面与系统剪贴板互通（⌘C / ⌘V）"
+CLIP_OUT=/tmp/eg-clipboard.json
+rm -f "$CLIP_OUT"
+printf 'before' | pbcopy
+"$GUI" --clipboard-selftest "$CLIP_OUT" 10 >/tmp/eg-clipboard.log 2>&1 &
+CPID=$!
+sleep 5
+COPIED=$(pbpaste)
+[[ "$COPIED" == "egress-guard-copy-ok" ]] && echo "OK：界面里复制的文字到了系统剪贴板" \
+  || fail "界面里复制的文字没有到系统剪贴板（pbpaste：$COPIED）"
+printf '203.0.113.7' | pbcopy
+# 模拟按下 ⌘V（发给前台程序，需要辅助功能权限；GitHub 的 macOS 虚拟机一般已授予）
+KEYED=0
+if osascript -e 'tell application "System Events" to keystroke "v" using command down' 2>/tmp/eg-key.err; then
+  KEYED=1
+else
+  echo "System Events 发送按键失败：$(cat /tmp/eg-key.err)；改用 CGEvent"
+  osascript -l JavaScript -e "ObjC.import('CoreGraphics');
+    for (const down of [true, false]) {
+      const e = \$.CGEventCreateKeyboardEvent(null, 9, down);
+      \$.CGEventSetFlags(e, \$.kCGEventFlagMaskCommand);
+      \$.CGEventPost(\$.kCGHIDEventTap, e);
+    }" && KEYED=2
+fi
+sleep 2
+screencapture -x "$SHOTS/10-clipboard-paste.png" || true
+wait "$CPID"
+PASTED=$(python3 -c "import json; print(json.load(open('$CLIP_OUT'))['pasted'])" 2>/dev/null)
+echo "输入框内容：$PASTED（按键方式 $KEYED）"
+if [[ "$PASTED" == "203.0.113.7" ]]; then
+  echo "OK：⌘V 把系统剪贴板的内容粘贴进了输入框"
+elif [[ "$KEYED" == 1 ]]; then
+  fail "按下 ⌘V 后输入框里没有系统剪贴板的内容"
+  cat /tmp/eg-clipboard.log
+else
+  echo "WARN：没能模拟按键（没有辅助功能权限），只验证了复制"
+fi
 
 step "安装后台服务"
 sudo "$CLI" service install || fail "安装失败"

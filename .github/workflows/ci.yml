@@ -38,6 +38,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      - name: 复制粘贴：界面与系统剪贴板互通（Ctrl+C / Ctrl+V）
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'clipboard.json'
+          Set-Clipboard -Value 'before'
+          $p = Start-Process target\release\egress-guard-gui.exe -ArgumentList '--clipboard-selftest', $out, '10' -PassThru
+          Start-Sleep 5
+          $copied = Get-Clipboard -Raw
+          if ($copied -ne 'egress-guard-copy-ok') { Write-Error "界面里复制的文字没有到系统剪贴板：$copied" }
+          else { 'OK：界面里复制的文字到了系统剪贴板' }
+          Set-Clipboard -Value '203.0.113.7'
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.SendKeys]::SendWait('^v')
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); Write-Error '自检窗口没有按时退出' }
+          $pasted = (Get-Content $out -Raw | ConvertFrom-Json).pasted
+          "输入框内容：$pasted"
+          if ($pasted -ne '203.0.113.7') { Write-Error 'Ctrl+V 没有把系统剪贴板的内容粘贴进输入框' }
+          else { 'OK：Ctrl+V 把系统剪贴板的内容粘贴进了输入框' }
       - uses: actions/upload-artifact@v4
         with:
           name: egress-guard-windows

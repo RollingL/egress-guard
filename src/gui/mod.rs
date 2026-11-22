@@ -199,16 +199,7 @@ pub fn run(opts: Options) -> Result<()> {
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([720.0, 480.0])
         .with_icon(egui::IconData { rgba: icons::shield_rgba(64, Shade::Green), width: 64, height: 64 });
-    #[allow(unused_mut)]
-    let mut native = eframe::NativeOptions { viewport, ..Default::default() };
-    // macOS：菜单栏应用，不在程序坞显示图标（与 Info.plist 的 LSUIElement 一致）
-    #[cfg(target_os = "macos")]
-    {
-        native.event_loop_builder = Some(Box::new(|b| {
-            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-            b.with_activation_policy(ActivationPolicy::Accessory);
-        }));
-    }
+    let native = native_options(viewport);
     let start_page = opts.start_page.as_deref().and_then(Page::from_name).unwrap_or(Page::Overview);
 
     eframe::run_native(
@@ -269,6 +260,79 @@ pub fn run(opts: Options) -> Result<()> {
                 netext: Default::default(),
                 netext_refreshed: None,
             }))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("界面启动失败: {e}"))
+}
+
+/// 界面窗口的 eframe 设置（正式界面与剪贴板自检共用，保证自检测到的就是用户用的那一套）。
+fn native_options(viewport: egui::ViewportBuilder) -> eframe::NativeOptions {
+    #[allow(unused_mut)]
+    let mut native = eframe::NativeOptions { viewport, ..Default::default() };
+    // macOS：菜单栏应用，不在程序坞显示图标（与 Info.plist 的 LSUIElement 一致）
+    #[cfg(target_os = "macos")]
+    {
+        native.event_loop_builder = Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Accessory);
+        }));
+    }
+    native
+}
+
+/// 剪贴板自检（CI 用）：程序启动时复制的文字。
+pub const CLIPBOARD_PROBE_COPY: &str = "egress-guard-copy-ok";
+
+/// 剪贴板自检（CI 用）：打开一个只有输入框的窗口并让它获得焦点。
+///
+/// 第一帧把 [`CLIPBOARD_PROBE_COPY`] 复制到系统剪贴板（检查「复制」能到达其他程序）；
+/// 之后 CI 往系统剪贴板放一段文字、模拟按下 ⌘V / Ctrl+V，`seconds` 秒后把输入框里的内容
+/// 写入 `out`（JSON：`{"pasted": "..."}`）并退出（检查「粘贴」能从其他程序拿到内容）。
+pub fn clipboard_selftest(out: PathBuf, seconds: f64) -> Result<()> {
+    struct Probe {
+        text: String,
+        out: PathBuf,
+        deadline: f64,
+        started: bool,
+        done: bool,
+    }
+    impl eframe::App for Probe {
+        fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if !self.started {
+                self.started = true;
+                ctx.copy_text(CLIPBOARD_PROBE_COPY.to_owned());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                #[cfg(target_os = "macos")]
+                tray::bring_to_front();
+            }
+            let now = ctx.input(|i| i.time);
+            if now >= self.deadline && !self.done {
+                self.done = true;
+                let json = serde_json::json!({ "pasted": self.text });
+                if let Err(e) = std::fs::write(&self.out, json.to_string()) {
+                    eprintln!("无法写入 {}: {e}", self.out.display());
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.label("剪贴板自检");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(f32::INFINITY));
+                r.request_focus();
+            });
+        }
+    }
+
+    let viewport = egui::ViewportBuilder::default().with_title("Egress Guard 剪贴板自检").with_inner_size([420.0, 120.0]);
+    eframe::run_native(
+        "egress-guard-clipboard-selftest",
+        native_options(viewport),
+        Box::new(move |cc| {
+            theme::setup_fonts(&cc.egui_ctx);
+            Ok(Box::new(Probe { text: String::new(), out, deadline: seconds, started: false, done: false }))
         }),
     )
     .map_err(|e| anyhow::anyhow!("界面启动失败: {e}"))
