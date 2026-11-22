@@ -19,7 +19,7 @@ pub struct Rules {
     pub kill_existing_tcp: bool,
 }
 
-/// 防火墙后端抽象。Windows 上由 WFP 实现，--dry-run 时只打日志。
+/// 防火墙后端抽象。Windows 上由 WFP 实现，macOS 上由 pf 实现，--dry-run 时只打日志。
 pub trait Firewall {
     fn block(&mut self) -> Result<()>;
     fn unblock(&mut self) -> Result<()>;
@@ -29,6 +29,10 @@ pub trait Firewall {
     /// 是否有程序暂未能加上规则（文件暂不存在或单个程序添加失败），需要稍后重试。
     fn has_pending(&self) -> bool {
         false
+    }
+    /// 能否按应用阻断。不能时（macOS pf）只有全局断网生效。
+    fn per_app(&self) -> bool {
+        true
     }
 }
 
@@ -84,6 +88,10 @@ impl Controller {
 
     pub fn is_blocked(&self) -> bool {
         self.fw.is_blocked()
+    }
+
+    pub fn per_app(&self) -> bool {
+        self.fw.per_app()
     }
 
     pub fn last_ip(&self) -> Option<IpAddr> {

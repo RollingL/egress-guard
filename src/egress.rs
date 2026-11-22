@@ -10,22 +10,90 @@ use ureq::Agent;
 pub struct EgressDetector {
     agent: Agent,
     services: Vec<String>,
+    #[cfg_attr(windows, allow(dead_code))]
+    timeout: Duration,
 }
 
 impl EgressDetector {
     pub fn new(services: Vec<String>, timeout: Duration) -> Self {
         let agent: Agent = Agent::config_builder()
-            // 使用系统 TLS（Windows 上为 SChannel），无需额外证书
+            // 使用系统 TLS（Windows 上为 SChannel，macOS 上为 Security.framework），无需额外证书
             .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
             .timeout_global(Some(timeout))
-            .user_agent("egress-guard/0.5")
+            .user_agent("egress-guard/0.6")
             .build()
             .into();
-        Self { agent, services }
+        Self { agent, services, timeout }
+    }
+
+    /// 检测出口 IP。
+    ///
+    /// macOS 上以 root 运行时（后台服务），检测放在以 `nobody` 身份运行的子进程中进行：
+    /// 全局断网的 pf 规则按套接字所属用户放行它，而不必放行所有 root 进程。
+    pub fn detect(&self) -> Result<IpAddr> {
+        #[cfg(target_os = "macos")]
+        if unsafe { libc::geteuid() } == 0 {
+            return self.detect_unprivileged();
+        }
+        self.detect_direct()
+    }
+
+    /// 在子进程中以 nobody 身份检测（子进程运行 `egress-guard probe`）。
+    #[cfg(unix)]
+    pub fn detect_unprivileged(&self) -> Result<IpAddr> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let (uid, gid) = unsafe {
+            let pw = libc::getpwnam(c"nobody".as_ptr());
+            if pw.is_null() {
+                return Err(anyhow!("系统中没有 nobody 用户"));
+            }
+            ((*pw).pw_uid, (*pw).pw_gid)
+        };
+        let exe = std::env::current_exe()?;
+        let mut child = Command::new(exe)
+            .arg("probe")
+            .arg("--timeout")
+            .arg(self.timeout.as_secs().max(1).to_string())
+            .args(&self.services)
+            .uid(uid)
+            .gid(gid)
+            .env("HOME", "/var/empty")
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("无法启动检测子进程: {e}"))?;
+        // 每个服务最多 timeout，再留一些余量
+        let deadline = Instant::now() + self.timeout * (self.services.len() as u32).max(1) + Duration::from_secs(5);
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("检测子进程超时"));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = child.wait_with_output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if out.status.success() {
+            if let Ok(ip) = stdout.trim().parse() {
+                return Ok(ip);
+            }
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let msg = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("检测子进程异常退出");
+        Err(anyhow!("{}", msg.trim()))
     }
 
     /// 依次尝试各服务，返回第一个成功解析的出口 IP。
-    pub fn detect(&self) -> Result<IpAddr> {
+    pub fn detect_direct(&self) -> Result<IpAddr> {
         let mut errors = Vec::new();
         for url in &self.services {
             match self.query(url) {
