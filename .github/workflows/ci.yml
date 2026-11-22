@@ -43,8 +43,10 @@ jobs:
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'clipboard.json'
           Set-Clipboard -Value 'before'
-          $p = Start-Process target\release\egress-guard-gui.exe -ArgumentList '--clipboard-selftest', $out, '10' -PassThru
+          $err = Join-Path $env:RUNNER_TEMP 'clipboard.err'
+          $p = Start-Process target\release\egress-guard-gui.exe -ArgumentList '--clipboard-selftest', $out, '10' -PassThru -RedirectStandardError $err
           Start-Sleep 5
+          if ($p.HasExited) { Get-Content $err -ErrorAction SilentlyContinue; Write-Error "自检窗口启动失败（退出码 $($p.ExitCode)）" }
           $copied = Get-Clipboard -Raw
           if ($copied -ne 'egress-guard-copy-ok') { Write-Error "界面里复制的文字没有到系统剪贴板：$copied" }
           else { 'OK：界面里复制的文字到了系统剪贴板' }
