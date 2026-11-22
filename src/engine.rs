@@ -44,8 +44,10 @@ pub struct Status {
     pub egress_ip: Option<IpAddr>,
     /// 该 IP 是否命中白名单。
     pub whitelisted: Option<bool>,
-    /// 受控应用当前是否被阻断。
+    /// 当前是否处于阻断状态。
     pub blocked: bool,
+    /// 阻断范围是全部网络（全局断网已开启）。
+    pub block_all: bool,
     /// 是否正在检测。
     pub checking: bool,
     /// 上次检测完成时间（本地 HH:MM:SS）。
@@ -160,14 +162,18 @@ fn run(
     };
 
     log::info!(
-        "引擎启动：受控应用 {} 个，白名单 {} 条，检测间隔 {}s{}",
+        "引擎启动：受控应用 {} 个，白名单 {} 条，检测间隔 {}s{}{}",
         cfg.apps.len(),
         cfg.whitelist.len(),
         cfg.detect.interval_secs,
+        if cfg.block_all.enabled { "，不在白名单时切断全部网络" } else { "" },
         if status.simulated { "（模拟模式）" } else { "" }
     );
 
     let mut ctrl = Controller::new(cfg.clone(), fw);
+    if let Err(e) = ctrl.apply_rules() {
+        log::error!("{e:#}");
+    }
 
     // 先阻断配置的受控应用，再载入关联程序，避免启动扫描期间出现放行空档
     if cfg.behavior.start_blocked {
@@ -336,6 +342,7 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.egress_ip = ctrl.last_ip();
     s.whitelisted = ctrl.last_ip().map(|ip| ctrl.config().is_whitelisted(ip));
     s.blocked = ctrl.is_blocked();
+    s.block_all = ctrl.config().block_all.enabled;
     s.checking = checking;
     s.detect_error = ctrl.last_error().map(str::to_owned);
     s.failures = ctrl.failures();
@@ -357,10 +364,8 @@ fn snapshot_fn() -> discovery::SnapshotFn {
 
 #[cfg(windows)]
 fn open_backend(cfg: &Config) -> Result<Box<dyn Firewall>> {
-    Ok(Box::new(crate::win::wfp::WfpFirewall::open(
-        cfg.apps.clone(),
-        cfg.behavior.kill_existing_tcp,
-    )?))
+    let _ = cfg;
+    Ok(Box::new(crate::win::wfp::WfpFirewall::open()?))
 }
 
 #[cfg(not(windows))]

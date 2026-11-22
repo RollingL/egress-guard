@@ -7,6 +7,8 @@ use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::blockall::BlockAllPolicy;
+
 /// 出口 IP 检测失败时的处理方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +39,29 @@ pub struct RawConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub children: ChildrenConfig,
+    #[serde(default)]
+    pub block_all: BlockAllConfig,
+}
+
+/// 全局断网：出口 IP 不在白名单时切断本机全部网络（而不只是受控应用）。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BlockAllConfig {
+    pub enabled: bool,
+    /// 放行局域网（私有网段、链路本地、组播）。
+    pub allow_lan: bool,
+    /// 放行 DNS 查询（远端端口 53）。关闭后本工具也可能无法检测出口 IP。
+    pub allow_dns: bool,
+    /// 例外程序（exe 完整路径），如 VPN 客户端。
+    pub allow_apps: Vec<PathBuf>,
+    /// 例外远端地址/网段，如 VPN 服务器地址。
+    pub allow_remote: Vec<String>,
+}
+
+impl Default for BlockAllConfig {
+    fn default() -> Self {
+        Self { enabled: false, allow_lan: true, allow_dns: true, allow_apps: Vec::new(), allow_remote: Vec::new() }
+    }
 }
 
 /// 子进程识别模式。
@@ -144,6 +169,7 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub ui: UiConfig,
     pub children: ChildrenConfig,
+    pub block_all: BlockAllConfig,
 }
 
 impl Config {
@@ -170,6 +196,18 @@ impl Config {
                 bail!("应用路径必须是完整路径: {}", app.display());
             }
         }
+        for app in &raw.block_all.allow_apps {
+            if !is_windows_absolute(&app.to_string_lossy()) {
+                bail!("例外程序路径必须是完整路径: {}", app.display());
+            }
+        }
+        let mut block_all = raw.block_all;
+        block_all.allow_remote = block_all
+            .allow_remote
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| parse_net(s).map(|n| format_net(&n)).with_context(|| "例外地址有误"))
+            .collect::<Result<Vec<_>>>()?;
         if raw.detect.services.iter().all(|s| s.trim().is_empty()) {
             bail!("至少需要一个出口 IP 查询服务");
         }
@@ -181,7 +219,15 @@ impl Config {
         }
         let mut detect = raw.detect;
         detect.services.retain(|s| !s.trim().is_empty());
-        Ok(Self { whitelist, apps: raw.apps, detect, behavior: raw.behavior, ui: raw.ui, children: raw.children })
+        Ok(Self {
+            whitelist,
+            apps: raw.apps,
+            detect,
+            behavior: raw.behavior,
+            ui: raw.ui,
+            children: raw.children,
+            block_all,
+        })
     }
 
     /// 转回可序列化/可编辑的原始配置。
@@ -193,7 +239,19 @@ impl Config {
             behavior: self.behavior.clone(),
             ui: self.ui.clone(),
             children: self.children.clone(),
+            block_all: self.block_all.clone(),
         }
+    }
+
+    /// 全局断网开启时返回其例外规则。
+    pub fn block_all_policy(&self) -> Option<BlockAllPolicy> {
+        let b = &self.block_all;
+        b.enabled.then(|| BlockAllPolicy {
+            allow_lan: b.allow_lan,
+            allow_dns: b.allow_dns,
+            allow_apps: b.allow_apps.clone(),
+            allow_remote: b.allow_remote.iter().filter_map(|s| parse_net(s).ok()).collect(),
+        })
     }
 
     /// 写入 TOML 文件（注释不会保留）。
@@ -293,6 +351,22 @@ apps = ['C:\Program Files\App\app.exe']
         let text = toml::to_string_pretty(&raw).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.to_raw(), raw);
+    }
+
+    #[test]
+    fn block_all_section() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert!(cfg.block_all_policy().is_none());
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[block_all]\nenabled=true\nallow_dns=false\nallow_apps=['C:\\vpn\\vpn.exe']\nallow_remote=[\"198.51.100.7\", \"203.0.113.9/24\"]"
+        ))
+        .unwrap();
+        let p = cfg.block_all_policy().unwrap();
+        assert!(p.allow_lan && !p.allow_dns);
+        assert_eq!(p.allow_apps.len(), 1);
+        assert_eq!(cfg.block_all.allow_remote, vec!["198.51.100.7", "203.0.113.0/24"]);
+        assert!(Config::parse(&format!("{SAMPLE}\n[block_all]\nallow_remote=[\"x\"]")).is_err());
+        assert!(Config::parse(&format!("{SAMPLE}\n[block_all]\nallow_apps=['vpn.exe']")).is_err());
     }
 
     #[test]
