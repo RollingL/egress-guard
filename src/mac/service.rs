@@ -157,8 +157,8 @@ pub fn install(src_bin: &Path) -> Result<()> {
         }
         std::fs::rename(&tmp, &bin)?;
     }
-    // 重新安装时保留原来的「自动启动」设置
-    let run = if is_installed() { run_at_load() } else { true };
+    // 重新安装时保留原来的「自动启动」设置；首次安装默认关闭（与界面的开关一致，开启后才开机自动保护）
+    let run = is_installed() && run_at_load();
     // 先停止旧服务（它收到 SIGTERM 后会清空自己的规则）
     let target = format!("system/{DAEMON_LABEL}");
     let _ = launchctl(&["bootout", &target]);

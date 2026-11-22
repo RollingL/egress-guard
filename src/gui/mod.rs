@@ -442,6 +442,8 @@ impl App {
                 "macOS 上由一个以 root 运行的后台服务负责检测出口 IP、设置 pf 防火墙。安装时需要输入一次管理员密码，之后日常使用不再需要。".to_owned(),
                 "安装后台服务…",
             ),
+            // 刚启动、还没尝试连接过
+            ServiceState::Unreachable(e) if e.is_empty() => return,
             ServiceState::Unreachable(e) => ("正在连接后台服务", format!("{e}。如果一直连不上，可以重新安装。"), "重新安装…"),
         };
         let body = match &self.service_error {
