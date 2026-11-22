@@ -118,6 +118,17 @@ macOS 版与 Windows 版共用同一套检测、决策逻辑和界面（苹果�
 | 开机自启 | 任务计划程序 | 后台服务开机即保护 + 登录后在菜单栏显示 |
 | 需要签名吗 | 不需要 | 不需要（ad-hoc 签名即可运行） |
 
+<p>
+  <img src="docs/macos-blocked-light.png" width="49%" alt="macOS 概览：出口 IP 不在白名单，全部网络已阻断">
+  <img src="docs/macos-allowed-dark.png" width="49%" alt="macOS 概览（深色）：出口 IP 命中白名单，已放行">
+</p>
+<p>
+  <img src="docs/macos-network-light.png" width="49%" alt="macOS 全局断网设置页">
+  <img src="docs/macos-setup-light.png" width="49%" alt="首次打开：安装后台服务">
+</p>
+
+以上截图来自 GitHub Actions 的 macOS 虚拟机，CI 每次都会真实安装后台服务并验证断网与恢复。菜单栏图标：<img src="docs/macos-menubar.png" height="22" alt="菜单栏中的红色盾牌图标">
+
 ### 为什么 macOS 版不能按应用断网
 
 macOS 上唯一能按应用拦截出站连接的官方机制是 **Network Extension 内容过滤（NEFilterDataProvider 系统扩展）**，Little Snitch、LuLu 都用它。它要求：
@@ -135,7 +146,7 @@ macOS 上唯一能按应用拦截出站连接的官方机制是 **Network Extens
 3. 概览页点 **安装后台服务…**，输入一次管理员密码。之后修改设置、开机自启都不再需要密码（修改设置要求当前用户是管理员）。
 4. **出口 IP 白名单** 页添加当前出口 IP；**全局断网** 页打开"不在白名单时切断全部网络"，按需保留局域网、DNS，并把 VPN 服务器地址加入例外地址。底部点"保存并应用"。
 
-菜单栏图标颜色与 Windows 托盘相同：绿色放行，红色阻断，灰色检测中/未连接，黄色模拟模式。点关闭按钮只是隐藏窗口；菜单栏图标里选「退出（解除所有阻断）」会让后台服务移除全部规则并停止，下次打开界面时服务会自动重新启动。
+菜单栏图标颜色与 Windows 托盘相同：绿色放行，红色阻断，灰色检测中/未连接，黄色表示规则没有真正生效（模拟模式，或者全局断网没开、出口 IP 不在白名单也不会断网）。点关闭按钮只是隐藏窗口；菜单栏图标里选「退出（解除所有阻断）」会让后台服务移除全部规则并停止，下次打开界面时服务会自动重新启动。
 
 ### macOS 工作原理
 
