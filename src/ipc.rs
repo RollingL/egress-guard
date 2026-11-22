@@ -499,6 +499,11 @@ mod tests {
         assert!(c.status().unwrap().running);
 
         c.command(&Request::Stop, Duration::from_secs(5)).unwrap();
+        // 服务先回复再调用 stop()（stop 可能直接退出进程），所以这里稍等片刻
+        let t = std::time::Instant::now();
+        while !handler.stopped.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(handler.stopped.load(Ordering::SeqCst));
         let _ = std::fs::remove_file(&path);
     }
