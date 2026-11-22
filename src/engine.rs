@@ -16,6 +16,9 @@ use crate::discovery::{self, ExtraApp, WatchSettings};
 use crate::egress::EgressDetector;
 use crate::logbuf;
 
+/// 阻断规则同步失败后的重试间隔。
+const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// 发给引擎的事件。
 pub enum Event {
     /// 网卡/地址/路由发生变化。
@@ -166,6 +169,14 @@ fn run(
 
     let mut ctrl = Controller::new(cfg.clone(), fw);
 
+    // 先阻断配置的受控应用，再载入关联程序，避免启动扫描期间出现放行空档
+    if cfg.behavior.start_blocked {
+        log::info!("启动时先阻断，等待首次出口 IP 检测");
+        if let Err(e) = ctrl.firewall().block() {
+            log::error!("{e:#}");
+        }
+    }
+
     // 关联程序识别：先同步载入已知的，再启动后台线程持续识别
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
     let mut watch_version = 0u64;
@@ -180,19 +191,14 @@ fn run(
     status.extra_apps = initial;
     discovery::spawn(watch.clone(), learned_file, snapshot_fn(), windir, tx.clone());
 
-    if cfg.behavior.start_blocked {
-        log::info!("启动时先阻断，等待首次出口 IP 检测");
-        if let Err(e) = ctrl.firewall().block() {
-            log::error!("{e:#}");
-        }
-    }
-
     let mut detector = Arc::new(make_detector(&cfg));
     let mut generation: u64 = 0;
     let mut checking = false;
     let mut next_check: Option<Instant> = Some(Instant::now());
     let mut debounce_until: Option<Instant> = None;
     let mut after_change = false;
+    // 规则同步失败或有程序暂未加上规则时，定时重试
+    let mut next_retry: Option<Instant> = None;
 
     let start_check = |checking: &mut bool, detector: &Arc<EgressDetector>, generation: u64| {
         if *checking {
@@ -211,7 +217,12 @@ fn run(
     reporter(&status);
 
     loop {
-        let deadline = [next_check, debounce_until].into_iter().flatten().min();
+        if ctrl.needs_retry() {
+            next_retry.get_or_insert_with(|| Instant::now() + RETRY_INTERVAL);
+        } else {
+            next_retry = None;
+        }
+        let deadline = [next_check, debounce_until, next_retry].into_iter().flatten().min();
         let event = match deadline {
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -298,6 +309,12 @@ fn run(
                 if next_check.is_some_and(|d| d <= now) {
                     next_check = None;
                     start_check(&mut checking, &detector, generation);
+                }
+                if next_retry.is_some_and(|d| d <= now) {
+                    next_retry = None;
+                    if let Err(e) = ctrl.retry_pending() {
+                        log::warn!("重试同步阻断规则失败，稍后再试: {e:#}");
+                    }
                 }
             }
         }

@@ -1,6 +1,7 @@
 //! 进程枚举与进程路径查询。
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, FILETIME};
@@ -22,13 +23,12 @@ pub struct ProcInfo {
 pub use crate::discovery::normalize as normalize_path;
 use crate::discovery::ProcEntry;
 
-/// 查询进程的 exe 路径和创建时间。
-fn path_and_time(pid: u32) -> (Option<String>, u64) {
+/// 查询进程的 exe 路径和创建时间。`buf` 由调用方复用，避免每个进程都分配 64KB。
+fn path_and_time(pid: u32, buf: &mut [u16]) -> (Option<String>, u64) {
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
             return (None, 0);
         };
-        let mut buf = vec![0u16; 32768];
         let mut len = buf.len() as u32;
         let path = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
             .ok()
@@ -45,9 +45,30 @@ fn path_and_time(pid: u32) -> (Option<String>, u64) {
     }
 }
 
+/// 快照缓存的一项：同一 PID、同一父进程、同一 exe 名时直接复用，不再打开进程。
+struct Cached {
+    ppid: u32,
+    name: [u16; 260],
+    path: String,
+    created: u64,
+}
+
+thread_local! {
+    static CACHE: RefCell<HashMap<u32, Cached>> = RefCell::new(HashMap::new());
+}
+
 /// 进程树快照（含父进程 ID、创建时间、exe 路径），用于识别子进程。
+///
+/// 每秒调用一次。已见过的进程（PID、父 PID、exe 名都没变）直接用缓存，
+/// 只对新进程调用 OpenProcess；已退出进程的缓存项随之清掉。
 pub fn snapshot() -> Vec<ProcEntry> {
+    CACHE.with(|c| snapshot_cached(&mut c.borrow_mut()))
+}
+
+fn snapshot_cached(cache: &mut HashMap<u32, Cached>) -> Vec<ProcEntry> {
     let mut out = Vec::new();
+    let mut buf = vec![0u16; 32768];
+    let mut next: HashMap<u32, Cached> = HashMap::with_capacity(cache.len());
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return out;
@@ -60,14 +81,23 @@ pub fn snapshot() -> Vec<ProcEntry> {
         while ok {
             let pid = e.th32ProcessID;
             if pid > 4 {
-                let (path, created) = path_and_time(pid);
-                // 无法打开的进程（受保护）创建时间未知，记为 0：不会被当成"晚于子进程创建"
-                out.push(ProcEntry { pid, ppid: e.th32ParentProcessID, created, path: path.unwrap_or_default() });
+                let ppid = e.th32ParentProcessID;
+                let hit = cache
+                    .remove(&pid)
+                    .filter(|c| c.ppid == ppid && c.name == e.szExeFile);
+                let entry = hit.unwrap_or_else(|| {
+                    // 无法打开的进程（受保护）创建时间未知，记为 0，识别时会断开祖先链
+                    let (path, created) = path_and_time(pid, &mut buf);
+                    Cached { ppid, name: e.szExeFile, path: path.unwrap_or_default(), created }
+                });
+                out.push(ProcEntry { pid, ppid, created: entry.created, path: entry.path.clone() });
+                next.insert(pid, entry);
             }
             ok = Process32NextW(snap, &mut e).is_ok();
         }
         let _ = CloseHandle(snap);
     }
+    *cache = next;
     out
 }
 

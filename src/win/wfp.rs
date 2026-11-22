@@ -5,7 +5,7 @@
 //! - 按应用 ID（FWPM_CONDITION_ALE_APP_ID）在 ALE 连接/接受层阻断 IPv4 与 IPv6。
 
 use std::ffi::c_void;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -40,6 +40,10 @@ pub struct WfpFirewall {
     filters: HashMap<String, Vec<u64>>,
     blocked: bool,
     kill_existing_tcp: bool,
+    /// 本轮未能加上规则的程序（文件不存在或添加失败），等待重试。
+    pending: HashSet<String>,
+    /// 已经警告过的程序，避免每次重试都刷屏。
+    warned: HashSet<String>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -80,7 +84,15 @@ impl WfpFirewall {
             "FwpmEngineOpen0",
         )?;
 
-        let fw = Self { engine, apps, filters: HashMap::new(), blocked: false, kill_existing_tcp };
+        let fw = Self {
+            engine,
+            apps,
+            filters: HashMap::new(),
+            blocked: false,
+            kill_existing_tcp,
+            pending: HashSet::new(),
+            warned: HashSet::new(),
+        };
 
         let mut sl_name = wide("egress-guard sublayer");
         let sublayer = FWPM_SUBLAYER0 {
@@ -116,8 +128,8 @@ impl WfpFirewall {
             &format!("FwpmGetAppIdFromFileName0({})", app.display()),
         )?;
 
+        let mut ids = Vec::with_capacity(LAYERS.len());
         let result = (|| {
-            let mut ids = Vec::with_capacity(LAYERS.len());
             for (layer, layer_name) in LAYERS {
                 let mut cond = FWPM_FILTER_CONDITION0 {
                     fieldKey: FWPM_CONDITION_ALE_APP_ID,
@@ -150,12 +162,21 @@ impl WfpFirewall {
                 )?;
                 ids.push(id);
             }
-            Ok(ids)
+            Ok(())
         })();
 
         let mut p = app_id as *mut c_void;
         unsafe { FwpmFreeMemory0(&mut p) };
-        result
+        match result {
+            Ok(()) => Ok(ids),
+            Err(e) => {
+                // 删掉已加上的部分过滤器，不留半套规则
+                for id in ids {
+                    unsafe { FwpmFilterDeleteById0(self.engine, id) };
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -173,25 +194,46 @@ impl WfpFirewall {
             .map(|(k, p)| (k.clone(), p.clone()))
             .collect();
         if to_remove.is_empty() && to_add.is_empty() {
+            self.pending.clear();
+            self.warned.clear();
             return Ok(Vec::new());
         }
 
         let mut added: Vec<(String, PathBuf, Vec<u64>)> = Vec::new();
+        let mut pending = HashSet::new();
+        let mut warnings = Vec::new();
         self.in_transaction(|fw| {
             for k in &to_remove {
                 for id in &fw.filters[k] {
                     check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
                 }
             }
+            // 单个程序失败（文件不存在、路径无效等）只跳过它，不影响其他程序的阻断
             for (k, app) in &to_add {
                 if !app.exists() {
-                    log::warn!("程序不存在，跳过: {}", app.display());
+                    pending.insert(k.clone());
+                    warnings.push((k.clone(), format!("程序不存在，暂时跳过: {}", app.display())));
                     continue;
                 }
-                added.push((k.clone(), app.clone(), fw.add_app_filters(app)?));
+                match fw.add_app_filters(app) {
+                    Ok(ids) => added.push((k.clone(), app.clone(), ids)),
+                    Err(e) => {
+                        pending.insert(k.clone());
+                        warnings.push((k.clone(), format!("无法阻断 {}，稍后重试: {e:#}", app.display())));
+                    }
+                }
             }
             Ok(())
         })?;
+
+        for (k, msg) in warnings {
+            if self.warned.insert(k) {
+                log::warn!("{msg}");
+            }
+        }
+        // 已成功或已不再需要的程序，之后再失败时重新警告
+        self.warned.retain(|k| pending.contains(k));
+        self.pending = pending;
 
         for k in &to_remove {
             self.filters.remove(k);
@@ -201,13 +243,15 @@ impl WfpFirewall {
             self.filters.insert(k, ids);
             new_apps.push(app);
         }
-        let total: usize = self.filters.values().map(Vec::len).sum();
-        log::info!(
-            "WFP 规则已更新：新增 {} 个程序，移除 {} 个，当前 {} 个过滤器",
-            new_apps.len(),
-            to_remove.len(),
-            total
-        );
+        if !new_apps.is_empty() || !to_remove.is_empty() {
+            let total: usize = self.filters.values().map(Vec::len).sum();
+            log::info!(
+                "WFP 规则已更新：新增 {} 个程序，移除 {} 个，当前 {} 个过滤器",
+                new_apps.len(),
+                to_remove.len(),
+                total
+            );
+        }
         Ok(new_apps)
     }
 
@@ -247,12 +291,17 @@ impl Firewall for WfpFirewall {
         })?;
         log::info!("WFP 已删除 {} 个阻断过滤器", ids.len());
         self.filters.clear();
+        self.pending.clear();
         self.blocked = false;
         Ok(())
     }
 
     fn is_blocked(&self) -> bool {
         self.blocked
+    }
+
+    fn has_pending(&self) -> bool {
+        self.blocked && !self.pending.is_empty()
     }
 
     fn set_apps(&mut self, apps: Vec<PathBuf>, kill_existing_tcp: bool) -> Result<()> {
