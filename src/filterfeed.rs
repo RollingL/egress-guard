@@ -133,17 +133,21 @@ pub struct FeedFirewall {
     hub: &'static FilterHub,
     blocked: bool,
     rules: Rules,
+    /// 引擎已经做出过第一次阻断/放行决定。在此之前不推送：扩展保留原来的规则
+    /// （服务崩溃重启时是上次的规则，开机时是放行），不会在启动的一瞬间先收到一次「放行」。
+    decided: bool,
     warned: bool,
 }
 
 impl FeedFirewall {
     pub fn new(inner: Box<dyn Firewall>, hub: &'static FilterHub) -> Self {
-        let me = Self { inner, hub, blocked: false, rules: Rules::default(), warned: false };
-        me.publish();
-        me
+        Self { inner, hub, blocked: false, rules: Rules::default(), decided: false, warned: false }
     }
 
     fn publish(&self) {
+        if !self.decided {
+            return;
+        }
         self.hub.set(FilterState {
             blocked: self.blocked,
             inspect_existing: self.rules.kill_existing_tcp,
@@ -163,6 +167,7 @@ impl Firewall for FeedFirewall {
     fn block(&mut self) -> Result<()> {
         // 先通知扩展（只是内存里的一次更新），再改 pf
         self.blocked = true;
+        self.decided = true;
         self.publish();
         self.warn_if_inert();
         self.inner.block()
@@ -170,6 +175,7 @@ impl Firewall for FeedFirewall {
 
     fn unblock(&mut self) -> Result<()> {
         self.blocked = false;
+        self.decided = true;
         self.publish();
         self.inner.unblock()
     }
@@ -202,6 +208,7 @@ impl Drop for FeedFirewall {
     fn drop(&mut self) {
         // 退出时让扩展放行；inner 随后自己清理（pf 清空锚点）
         self.blocked = false;
+        self.decided = true;
         self.publish();
     }
 }
@@ -257,7 +264,6 @@ mod tests {
         use crate::controller::DryRunFirewall;
         let hub: &'static FilterHub = Box::leak(Box::default());
         let mut fw = FeedFirewall::new(Box::new(DryRunFirewall::default()), hub);
-        assert_eq!(hub.wait_newer(0, Duration::from_millis(1)).0, 1, "创建时就写入一次，扩展可以马上拿到规则");
         assert!(!fw.per_app());
         fw.set_rules(Rules {
             apps: vec!["/Applications/A.app".into()],
@@ -265,6 +271,7 @@ mod tests {
             kill_existing_tcp: true,
         })
         .unwrap();
+        assert_eq!(hub.wait_newer(0, Duration::from_millis(1)).0, 0, "做出第一次决定之前不推送");
         fw.block().unwrap();
         let s = hub.current();
         assert!(s.blocked && s.inspect_existing && s.apps == ["/Applications/A.app"]);
