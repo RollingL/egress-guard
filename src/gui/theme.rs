@@ -185,6 +185,38 @@ fn system_fonts() -> SystemFonts {
 
 /// 加载中文字体（常规 + 粗体）。egui 自带字体不含中文。
 pub fn setup_fonts(ctx: &egui::Context) {
+    load_fonts(ctx, 0.0, 0.0);
+}
+
+/// 中文字体的上升高度通常比下降大很多，egui 按行框排版时字形整体偏上：按钮、标签、
+/// 输入框里的文字看起来不在正中。首帧（字体已载入）时量出字形相对行框中心的偏移，
+/// 用 FontTweak 把常规、粗体两种字形各自移回中心。只在第一次调用时生效，返回是否调整了。
+pub fn center_glyphs(ctx: &egui::Context) -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    let regular = glyph_offset_factor(ctx, FontId::proportional(64.0));
+    let bold_off = glyph_offset_factor(ctx, bold(64.0));
+    log::debug!("字形垂直偏移：常规 {regular:.3} em，粗体 {bold_off:.3} em");
+    if regular.abs() < 0.005 && bold_off.abs() < 0.005 {
+        return false;
+    }
+    load_fonts(ctx, regular, bold_off);
+    true
+}
+
+/// 「中」字的墨迹中心比行框中心高出多少（以字号为单位，正数表示需要下移）。
+fn glyph_offset_factor(ctx: &egui::Context, font: FontId) -> f32 {
+    let size = font.size;
+    let g = ctx.fonts_mut(|f| f.layout_no_wrap("中".into(), font, Color32::WHITE));
+    if !g.mesh_bounds.is_positive() {
+        return 0.0;
+    }
+    ((g.rect.center().y - g.mesh_bounds.center().y) / size).clamp(-0.4, 0.4)
+}
+
+fn load_fonts(ctx: &egui::Context, regular_offset: f32, bold_offset: f32) {
     let mut fonts = egui::FontDefinitions::default();
     let defaults = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
 
@@ -194,18 +226,22 @@ pub fn setup_fonts(ctx: &egui::Context) {
         d.index = index;
         d
     };
+    let shifted = |mut d: egui::FontData, factor: f32| {
+        d.tweak.y_offset_factor = factor;
+        d
+    };
     if let Some(face) = mono {
         fonts.font_data.insert("consolas".into(), ui_face(face).into());
         fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "consolas".into());
     }
     if let Some(bytes) = regular {
-        fonts.font_data.insert("cjk".into(), ui_face(bytes).into());
+        fonts.font_data.insert("cjk".into(), shifted(ui_face(bytes), regular_offset).into());
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "cjk".into());
         fonts.families.entry(FontFamily::Monospace).or_default().push("cjk".into());
     }
     let mut bold_family = Vec::new();
     if let Some(bytes) = bold_font {
-        fonts.font_data.insert("cjk-bold".into(), ui_face(bytes).into());
+        fonts.font_data.insert("cjk-bold".into(), shifted(ui_face(bytes), bold_offset).into());
         bold_family.push("cjk-bold".to_owned());
     } else if fonts.font_data.contains_key("cjk") {
         bold_family.push("cjk".to_owned());

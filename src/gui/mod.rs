@@ -1553,6 +1553,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if theme::center_glyphs(&ctx) {
+            ctx.request_repaint();
+        }
         // 外观修改立即预览，保存后写入配置
         if self.shown_appearance != Some(self.draft.ui.appearance) {
             self.shown_appearance = Some(self.draft.ui.appearance);
