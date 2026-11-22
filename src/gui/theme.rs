@@ -220,8 +220,7 @@ pub fn section(ui: &mut Ui, p: &Palette, text: &str) {
 
 /// 分组下方的说明文字。
 pub fn footnote(ui: &mut Ui, p: &Palette, text: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(12.0);
+    egui::Frame::new().inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 }).show(ui, |ui| {
         ui.label(RichText::new(text).size(12.0).color(p.secondary));
     });
 }

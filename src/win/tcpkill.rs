@@ -11,7 +11,8 @@ use anyhow::{bail, Result};
 use windows::Win32::NetworkManagement::IpHelper::*;
 use windows::Win32::Networking::WinSock::AF_INET;
 
-use super::procs::{normalize_path, process_image_path};
+use super::procs::process_image_path;
+use crate::discovery::normalize as normalize_path;
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 

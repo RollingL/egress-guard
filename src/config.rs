@@ -35,6 +35,30 @@ pub struct RawConfig {
     pub behavior: BehaviorConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub children: ChildrenConfig,
+}
+
+/// 子进程识别模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChildMode {
+    /// 不识别子进程。
+    Off,
+    /// 受控应用的整棵进程树（含不同 exe 的子进程）一起阻断（默认）。
+    #[default]
+    Tree,
+}
+
+/// 关联程序的自动识别。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ChildrenConfig {
+    pub mode: ChildMode,
+    /// 同时阻断受控应用 exe 所在目录（含子目录）下的全部 exe。
+    pub include_app_dir: bool,
+    /// 不自动阻断的程序（exe 完整路径）。
+    pub exclude: Vec<PathBuf>,
 }
 
 /// 界面外观。
@@ -119,6 +143,7 @@ pub struct Config {
     pub detect: DetectConfig,
     pub behavior: BehaviorConfig,
     pub ui: UiConfig,
+    pub children: ChildrenConfig,
 }
 
 impl Config {
@@ -156,7 +181,7 @@ impl Config {
         }
         let mut detect = raw.detect;
         detect.services.retain(|s| !s.trim().is_empty());
-        Ok(Self { whitelist, apps: raw.apps, detect, behavior: raw.behavior, ui: raw.ui })
+        Ok(Self { whitelist, apps: raw.apps, detect, behavior: raw.behavior, ui: raw.ui, children: raw.children })
     }
 
     /// 转回可序列化/可编辑的原始配置。
@@ -167,6 +192,7 @@ impl Config {
             detect: self.detect.clone(),
             behavior: self.behavior.clone(),
             ui: self.ui.clone(),
+            children: self.children.clone(),
         }
     }
 

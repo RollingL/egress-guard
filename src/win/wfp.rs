@@ -5,6 +5,7 @@
 //! - 按应用 ID（FWPM_CONDITION_ALE_APP_ID）在 ALE 连接/接受层阻断 IPv4 与 IPv6。
 
 use std::ffi::c_void;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -15,6 +16,7 @@ use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::tcpkill;
 use crate::controller::Firewall;
+use crate::discovery::normalize_path;
 
 /// 本工具子层的固定 GUID。固定值便于识别"已有实例在运行"。
 const SUBLAYER_KEY: GUID = GUID::from_u128(0x6a1e_93c4_2b7d_4f0e_9c51_3e8a_d4b2_7f10);
@@ -34,7 +36,8 @@ const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
 pub struct WfpFirewall {
     engine: HANDLE,
     apps: Vec<PathBuf>,
-    filter_ids: Vec<u64>,
+    /// 规范化路径 → 该程序的过滤器 ID。
+    filters: HashMap<String, Vec<u64>>,
     blocked: bool,
     kill_existing_tcp: bool,
 }
@@ -77,7 +80,7 @@ impl WfpFirewall {
             "FwpmEngineOpen0",
         )?;
 
-        let fw = Self { engine, apps, filter_ids: Vec::new(), blocked: false, kill_existing_tcp };
+        let fw = Self { engine, apps, filters: HashMap::new(), blocked: false, kill_existing_tcp };
 
         let mut sl_name = wide("egress-guard sublayer");
         let sublayer = FWPM_SUBLAYER0 {
@@ -156,34 +159,78 @@ impl WfpFirewall {
     }
 }
 
+impl WfpFirewall {
+    /// 在一个事务里让过滤器与 `apps` 一致：为缺少的程序添加、为多余的程序删除。
+    /// 返回新加入阻断的程序。整个过程没有"先全部删除再添加"的放行空档。
+    fn sync_filters(&mut self) -> Result<Vec<PathBuf>> {
+        let wanted: HashMap<String, PathBuf> =
+            self.apps.iter().map(|p| (normalize_path(p), p.clone())).collect();
+        let to_remove: Vec<String> =
+            self.filters.keys().filter(|k| !wanted.contains_key(*k)).cloned().collect();
+        let to_add: Vec<(String, PathBuf)> = wanted
+            .iter()
+            .filter(|(k, _)| !self.filters.contains_key(*k))
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
+        if to_remove.is_empty() && to_add.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut added: Vec<(String, PathBuf, Vec<u64>)> = Vec::new();
+        self.in_transaction(|fw| {
+            for k in &to_remove {
+                for id in &fw.filters[k] {
+                    check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
+                }
+            }
+            for (k, app) in &to_add {
+                if !app.exists() {
+                    log::warn!("程序不存在，跳过: {}", app.display());
+                    continue;
+                }
+                added.push((k.clone(), app.clone(), fw.add_app_filters(app)?));
+            }
+            Ok(())
+        })?;
+
+        for k in &to_remove {
+            self.filters.remove(k);
+        }
+        let mut new_apps = Vec::new();
+        for (k, app, ids) in added {
+            self.filters.insert(k, ids);
+            new_apps.push(app);
+        }
+        let total: usize = self.filters.values().map(Vec::len).sum();
+        log::info!(
+            "WFP 规则已更新：新增 {} 个程序，移除 {} 个，当前 {} 个过滤器",
+            new_apps.len(),
+            to_remove.len(),
+            total
+        );
+        Ok(new_apps)
+    }
+
+    fn kill_connections(&self, apps: &[PathBuf]) {
+        if !self.kill_existing_tcp || apps.is_empty() {
+            return;
+        }
+        match tcpkill::kill_tcp_connections(apps) {
+            Ok(0) => {}
+            Ok(n) => log::info!("已断开 {n} 条现有 IPv4 TCP 连接"),
+            Err(e) => log::warn!("断开现有 TCP 连接失败: {e:#}"),
+        }
+    }
+}
+
 impl Firewall for WfpFirewall {
     fn block(&mut self) -> Result<()> {
         if self.blocked {
             return Ok(());
         }
-        let apps = self.apps.clone();
-        let mut added = Vec::new();
-        self.in_transaction(|fw| {
-            for app in &apps {
-                if !app.exists() {
-                    log::warn!("应用不存在，跳过: {}", app.display());
-                    continue;
-                }
-                added.extend(fw.add_app_filters(app)?);
-            }
-            Ok(())
-        })?;
-        log::info!("WFP 已添加 {} 个阻断过滤器", added.len());
-        self.filter_ids = added;
+        let added = self.sync_filters()?;
         self.blocked = true;
-
-        if self.kill_existing_tcp {
-            match tcpkill::kill_tcp_connections(&self.apps) {
-                Ok(0) => {}
-                Ok(n) => log::info!("已断开受控应用的 {n} 条现有 IPv4 TCP 连接"),
-                Err(e) => log::warn!("断开现有 TCP 连接失败: {e:#}"),
-            }
-        }
+        self.kill_connections(&added);
         Ok(())
     }
 
@@ -191,18 +238,15 @@ impl Firewall for WfpFirewall {
         if !self.blocked {
             return Ok(());
         }
-        let ids = std::mem::take(&mut self.filter_ids);
-        let res = self.in_transaction(|fw| {
+        let ids: Vec<u64> = self.filters.values().flatten().copied().collect();
+        self.in_transaction(|fw| {
             for id in &ids {
                 check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
             }
             Ok(())
-        });
-        if let Err(e) = res {
-            self.filter_ids = ids; // 回滚：过滤器仍在
-            return Err(e);
-        }
+        })?;
         log::info!("WFP 已删除 {} 个阻断过滤器", ids.len());
+        self.filters.clear();
         self.blocked = false;
         Ok(())
     }
@@ -212,14 +256,11 @@ impl Firewall for WfpFirewall {
     }
 
     fn set_apps(&mut self, apps: Vec<PathBuf>, kill_existing_tcp: bool) -> Result<()> {
-        let was_blocked = self.blocked;
-        if was_blocked {
-            self.unblock()?;
-        }
         self.apps = apps;
         self.kill_existing_tcp = kill_existing_tcp;
-        if was_blocked {
-            self.block()?;
+        if self.blocked {
+            let added = self.sync_filters()?;
+            self.kill_connections(&added);
         }
         Ok(())
     }

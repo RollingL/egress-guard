@@ -45,6 +45,19 @@ kill_existing_tcp = true
 # 网络变化事件防抖（毫秒）
 debounce_ms = 2000
 
+[children]
+# 自动识别受控应用启动的子进程（即使是不同的 exe），一起阻断：
+#   tree（默认）= 整棵进程树；off = 关闭
+# 识别结果保存在配置文件旁的 learned-apps.txt，下次启动立即生效。
+# Windows 系统目录下的程序（cmd.exe、conhost.exe 等）永远不会被自动加入。
+mode = "tree"
+# 同时阻断受控应用 exe 所在目录（含子目录）下的全部 exe（尚未运行的辅助程序也会被提前阻断）
+include_app_dir = false
+# 不自动阻断的程序（完整路径），例如被应用调起的浏览器
+exclude = [
+    # 'C:\Program Files\Mozilla Firefox\firefox.exe',
+]
+
 [ui]
 # 界面外观：system（跟随系统）/ light（浅色）/ dark（深色）。命令行版本忽略此项
 appearance = "system"

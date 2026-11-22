@@ -35,6 +35,8 @@ pub fn decide(
 
 pub struct Controller {
     cfg: Config,
+    /// 自动识别到的关联程序（子进程 / 同目录）。
+    extra: Vec<PathBuf>,
     fw: Box<dyn Firewall>,
     failures: u32,
     last_ip: Option<IpAddr>,
@@ -43,7 +45,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(cfg: Config, fw: Box<dyn Firewall>) -> Self {
-        Self { cfg, fw, failures: 0, last_ip: None, last_error: None }
+        Self { cfg, extra: Vec::new(), fw, failures: 0, last_ip: None, last_error: None }
     }
 
     pub fn firewall(&mut self) -> &mut dyn Firewall {
@@ -70,12 +72,35 @@ impl Controller {
         self.failures
     }
 
+    /// 实际需要阻断的程序：配置的受控应用 + 自动识别的关联程序（去重）。
+    pub fn effective_apps(&self) -> Vec<PathBuf> {
+        let mut seen = std::collections::HashSet::new();
+        self.cfg
+            .apps
+            .iter()
+            .chain(self.extra.iter())
+            .filter(|p| seen.insert(crate::discovery::normalize_path(p)))
+            .cloned()
+            .collect()
+    }
+
+    /// 更新自动识别到的关联程序；若当前处于阻断状态，新程序立即被阻断。
+    pub fn set_extra(&mut self, extra: Vec<PathBuf>) -> Result<()> {
+        if extra == self.extra {
+            return Ok(());
+        }
+        self.extra = extra;
+        self.fw.set_apps(self.effective_apps(), self.cfg.behavior.kill_existing_tcp)
+    }
+
     /// 应用新配置。受控应用变化会立即反映到防火墙规则上。
     pub fn reconfigure(&mut self, cfg: Config) -> Result<()> {
-        if cfg.apps != self.cfg.apps || cfg.behavior.kill_existing_tcp != self.cfg.behavior.kill_existing_tcp {
-            self.fw.set_apps(cfg.apps.clone(), cfg.behavior.kill_existing_tcp)?;
-        }
+        let changed = cfg.apps != self.cfg.apps
+            || cfg.behavior.kill_existing_tcp != self.cfg.behavior.kill_existing_tcp;
         self.cfg = cfg;
+        if changed {
+            self.fw.set_apps(self.effective_apps(), self.cfg.behavior.kill_existing_tcp)?;
+        }
         // 白名单可能已变化：用最近一次的出口 IP 立即重新决策
         if let Some(ip) = self.last_ip {
             let want_block = !self.cfg.is_whitelisted(ip);

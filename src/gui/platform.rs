@@ -27,9 +27,7 @@ pub mod procs {
         pub name: String,
         pub path: String,
     }
-    pub fn normalize_path(p: &str) -> String {
-        p.replace('/', "\\").to_lowercase()
-    }
+    pub use crate::discovery::normalize as normalize_path;
     pub fn list_processes() -> Vec<ProcInfo> {
         vec![ProcInfo { pid: 1234, name: "chrome.exe".into(), path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into() }]
     }

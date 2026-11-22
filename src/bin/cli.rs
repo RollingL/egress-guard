@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use egress_guard::config::Config;
 use egress_guard::egress::EgressDetector;
-use egress_guard::{engine, exe_dir, logbuf};
+use egress_guard::{engine, exe_dir, learned_file, logbuf};
 
 #[derive(Parser)]
 #[command(version, about = "根据出口 IP 白名单，用 WFP 阻断/放行选中应用的网络")]
@@ -55,7 +55,7 @@ fn real_main(cli: Cli) -> Result<()> {
     log::debug!("使用配置文件 {}", config_path.display());
 
     match cli.command.unwrap_or(Command::Run { dry_run: false }) {
-        Command::Run { dry_run } => run(cfg, dry_run),
+        Command::Run { dry_run } => run(cfg, dry_run, learned_file(&config_path)),
         Command::Ip => {
             let det = EgressDetector::new(
                 cfg.detect.services.clone(),
@@ -94,11 +94,11 @@ fn resolve_config_path(arg: Option<PathBuf>) -> Result<PathBuf> {
     Ok(exe_dir().context("无法确定 exe 所在目录")?.join("config.toml"))
 }
 
-fn run(cfg: Config, dry_run: bool) -> Result<()> {
+fn run(cfg: Config, dry_run: bool, learned_file: PathBuf) -> Result<()> {
     if cfg.apps.is_empty() {
         log::warn!("配置中没有受控应用，不会阻断任何程序");
     }
-    let handle = Arc::new(engine::spawn(cfg, dry_run, true, Arc::new(|_| {})));
+    let handle = Arc::new(engine::spawn(cfg, dry_run, true, Some(learned_file), Arc::new(|_| {})));
     {
         let tx = handle.sender();
         ctrlc::set_handler(move || {

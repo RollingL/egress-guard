@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText};
 
-use crate::config::{parse_net, Appearance, Config, FailMode, RawConfig};
+use crate::config::{parse_net, Appearance, ChildMode, Config, FailMode, RawConfig};
+use crate::discovery::Source;
 use crate::engine::{self, EngineHandle, Event, Status};
-use crate::logbuf;
+use crate::{learned_file, logbuf};
 use icons::Shade;
 use platform::{autostart, procs};
 use theme::{Glyph, Palette};
@@ -123,7 +124,7 @@ pub fn run(opts: Options) -> Result<()> {
                     ctx.request_repaint();
                 })
             };
-            let engine = Arc::new(engine::spawn(cfg.clone(), false, false, reporter));
+            let engine = Arc::new(engine::spawn(cfg.clone(), false, false, Some(learned_file(&opts.config_path)), reporter));
             let show_requested = Arc::new(AtomicBool::new(false));
             tray::spawn(
                 tray::TrayCtx {
@@ -409,7 +410,9 @@ impl App {
                 }
             });
             theme::hairline(ui, p);
-            theme::row(ui, p, "受控应用", None, |ui| {
+            let extra_n = s.extra_apps.len();
+            let sub = (extra_n > 0).then(|| format!("另有 {extra_n} 个自动识别的关联程序"));
+            theme::row(ui, p, "受控应用", sub.as_deref(), |ui| {
                 if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
                     goto = Some(Page::Apps);
                 }
@@ -551,11 +554,125 @@ impl App {
         if let Some(i) = remove {
             self.draft.apps.remove(i);
         }
+        theme::footnote(ui, p, "同一个 exe 的所有进程都会被阻断；它启动的其他程序见下方「自动识别」。");
+
+        // ---- 自动识别关联程序 ----
+        theme::section(ui, p, "自动识别");
+        theme::card(ui, p, |ui| {
+            let c = &mut self.draft.children;
+            let mut tree = c.mode == ChildMode::Tree;
+            theme::row(
+                ui,
+                p,
+                "一并阻断子进程",
+                Some("受控应用启动的其他程序（即使是不同的 exe）自动加入阻断"),
+                |ui| {
+                    if theme::toggle(ui, p, &mut tree).changed() {
+                        c.mode = if tree { ChildMode::Tree } else { ChildMode::Off };
+                    }
+                },
+            );
+            theme::hairline(ui, p);
+            theme::row(
+                ui,
+                p,
+                "阻断所在目录的全部程序",
+                Some("受控应用 exe 所在目录（含子目录）下的所有 exe，未运行的也提前阻断"),
+                |ui| {
+                    theme::toggle(ui, p, &mut c.include_app_dir);
+                },
+            );
+        });
         theme::footnote(
             ui,
             p,
-            "浏览器等多进程程序通常只需添加主程序；若有独立的更新器或辅助程序（不同的 exe），也需要一并添加。",
+            "Windows 系统目录下的程序（cmd、PowerShell、conhost 等）不会被自动加入。识别到的子进程会被记住，下次启动立即生效。",
         );
+
+        // 刚点了"忽略"、尚未保存的项先隐藏
+        let pending: Vec<String> =
+            self.draft.children.exclude.iter().map(|p| crate::discovery::normalize_path(p)).collect();
+        let extra: Vec<_> = self
+            .status
+            .lock()
+            .unwrap()
+            .extra_apps
+            .iter()
+            .filter(|x| !pending.contains(&crate::discovery::normalize_path(&x.path)))
+            .cloned()
+            .collect();
+        theme::section(ui, p, &format!("已自动识别 {} 个", extra.len()));
+        let mut ignore = None;
+        theme::card(ui, p, |ui| {
+            if extra.is_empty() {
+                empty_state(ui, p, "暂无", "受控应用运行并启动其他程序后，会出现在这里。");
+                return;
+            }
+            let n = extra.len();
+            for (i, x) in extra.iter().enumerate() {
+                let path = x.path.display().to_string();
+                let name = exe_name(&path);
+                ui.horizontal(|ui| {
+                    ui.set_min_height(40.0);
+                    letter_icon(ui, p, &name);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(&name).color(p.label));
+                        ui.add_space(-6.0);
+                        ui.label(RichText::new(shorten(&path, 70)).size(12.0).color(p.secondary))
+                            .on_hover_text(&path);
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::gray_button(ui, p, "忽略").on_hover_text("不再自动阻断这个程序").clicked() {
+                            ignore = Some(x.path.clone());
+                        }
+                        match x.source {
+                            Source::Child => theme::chip(ui, p.indigo, "子进程"),
+                            Source::AppDir => theme::chip(ui, p.teal, "同目录"),
+                        };
+                    });
+                });
+                if i + 1 < n {
+                    theme::hairline(ui, p);
+                }
+            }
+        });
+        if let Some(path) = ignore {
+            self.draft.children.exclude.push(path);
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if theme::text_button(ui, p.accent, "清空子进程识别记录").clicked() {
+                self.engine.send(Event::ClearLearned);
+                self.notify(true, "已清空子进程识别记录");
+            }
+        });
+
+        if !self.draft.children.exclude.is_empty() {
+            theme::section(ui, p, &format!("已忽略 {} 个", self.draft.children.exclude.len()));
+            let mut restore = None;
+            theme::card(ui, p, |ui| {
+                let n = self.draft.children.exclude.len();
+                for (i, path) in self.draft.children.exclude.iter().enumerate() {
+                    let s = path.display().to_string();
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(32.0);
+                        ui.label(RichText::new(shorten(&s, 80)).size(13.0).color(p.secondary)).on_hover_text(&s);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::text_button(ui, p.accent, "恢复").clicked() {
+                                restore = Some(i);
+                            }
+                        });
+                    });
+                    if i + 1 < n {
+                        theme::hairline(ui, p);
+                    }
+                }
+            });
+            if let Some(i) = restore {
+                self.draft.children.exclude.remove(i);
+            }
+        }
     }
 
     fn picker_window(&mut self, ctx: &egui::Context, p: &Palette) {
