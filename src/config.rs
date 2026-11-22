@@ -192,12 +192,12 @@ impl Config {
             .map(|s| parse_net(s))
             .collect::<Result<Vec<_>>>()?;
         for app in &raw.apps {
-            if !is_windows_absolute(&app.to_string_lossy()) {
+            if !is_absolute_app_path(&app.to_string_lossy()) {
                 bail!("应用路径必须是完整路径: {}", app.display());
             }
         }
         for app in &raw.block_all.allow_apps {
-            if !is_windows_absolute(&app.to_string_lossy()) {
+            if !is_absolute_app_path(&app.to_string_lossy()) {
                 bail!("例外程序路径必须是完整路径: {}", app.display());
             }
         }
@@ -291,6 +291,12 @@ pub fn format_net(net: &IpNet) -> String {
     }
 }
 
+/// 程序路径是否为完整路径：Windows 形式（C:\... 或 \\server\...）在任何平台都接受，
+/// 便于在其他平台上开发测试；非 Windows 平台还接受 `/` 开头的路径（macOS 上可以是 .app 包）。
+pub fn is_absolute_app_path(p: &str) -> bool {
+    is_windows_absolute(p) || (cfg!(not(windows)) && p.starts_with('/'))
+}
+
 /// 判断是否为 Windows 完整路径（C:\... 或 \\server\share\...），与运行平台无关。
 pub fn is_windows_absolute(p: &str) -> bool {
     let b = p.as_bytes();
@@ -340,6 +346,8 @@ apps = ['C:\Program Files\App\app.exe']
         assert!(Config::parse("whitelist=[]\napps=[]").is_ok());
         assert!(Config::parse("whitelist=[]\napps=['a.exe']").is_err());
         assert!(Config::parse("whitelist=[]\napps=['C:\\a.exe']\nbogus=1").is_err());
+        // Unix 完整路径只在非 Windows 平台接受
+        assert_eq!(Config::parse("whitelist=[]\napps=['/Applications/Foo.app']").is_ok(), cfg!(not(windows)));
     }
 
     #[test]

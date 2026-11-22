@@ -1,24 +1,37 @@
 [package]
 name = "egress-guard"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
-description = "根据本机公网出口 IP 判断是否用 WFP 阻断选中应用的网络连接"
+description = "根据本机公网出口 IP 判断是否阻断选中应用（Windows：WFP）或全部网络（macOS：pf）的连接"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 ipnet = { version = "2", features = ["serde"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.9"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
-# 界面在 Windows 上发布；非 Windows 平台仅用于开发时预览界面
+# 界面在 Windows、macOS 上发布；Linux 仅用于开发时预览界面
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = "0.26"
+rfd = "0.18"
+dispatch2 = "0.3"
+winit = { version = "0.30", default-features = false }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSWorkspace"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26"

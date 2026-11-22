@@ -92,7 +92,8 @@ impl Palette {
 
 static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 
-/// 系统关闭了动画（Windows“设置 → 辅助功能 → 视觉效果 → 动画效果”）时不播放动效。
+/// 系统关闭了动画（Windows“设置 → 辅助功能 → 视觉效果 → 动画效果”，
+/// macOS“辅助功能 → 显示 → 减弱动态效果”）时不播放动效。
 pub fn reduced_motion() -> bool {
     REDUCED_MOTION.load(Ordering::Relaxed)
 }
@@ -115,7 +116,13 @@ fn system_animations_enabled() -> bool {
     !ok || on != 0
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn system_animations_enabled() -> bool {
+    let reduce = objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+    !reduce && std::env::var_os("EGRESS_GUARD_REDUCED_MOTION").is_none()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn system_animations_enabled() -> bool {
     std::env::var_os("EGRESS_GUARD_REDUCED_MOTION").is_none()
 }
@@ -128,35 +135,67 @@ pub fn ease(ctx: &egui::Context, id: egui::Id, on: bool, secs: f32) -> f32 {
     ctx.animate_bool_with_time_and_easing(id, on, secs, egui::emath::easing::cubic_out)
 }
 
-/// 粗体字体族名称（Windows 上为微软雅黑 Bold）。
+/// 粗体字体族名称（Windows 上为微软雅黑 Bold，macOS 上为冬青黑体 W6）。
 pub const BOLD: &str = "bold";
 
 pub fn bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(BOLD.into()))
 }
 
-/// 加载中文字体（常规 + 粗体）。egui 自带字体不含中文。
-pub fn setup_fonts(ctx: &egui::Context) {
+/// 系统字体：(字体文件内容, 字形序号)。
+type Face = (Vec<u8>, u32);
+
+struct SystemFonts {
+    regular: Option<Face>,
+    bold: Option<Face>,
+    mono: Option<Face>,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_fonts() -> SystemFonts {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
     let fonts_dir = std::path::Path::new(&windir).join("Fonts");
     let read = |names: &[&str]| names.iter().find_map(|n| std::fs::read(fonts_dir.join(n)).ok());
+    // msyh.ttc 的第 2 个字形是 Microsoft YaHei UI：行距更紧凑，专为界面设计
+    let ui = if cfg!(windows) { 1 } else { 0 };
+    SystemFonts {
+        regular: read(&["msyh.ttc", "msyh.ttf", "Deng.ttf", "simhei.ttf", "simsun.ttc"]).map(|b| (b, ui)),
+        bold: read(&["msyhbd.ttc", "msyhbd.ttf", "Dengb.ttf"]).map(|b| (b, ui)),
+        mono: read(&["consola.ttf"]).map(|b| (b, 0)),
+    }
+}
 
+/// macOS：冬青黑体简体中文（Hiragino Sans GB，W3 / W6 两个字重在同一个 ttc 里），
+/// 找不到时退回华文黑体；等宽字体用 Menlo。
+#[cfg(target_os = "macos")]
+fn system_fonts() -> SystemFonts {
+    let read = |cands: &[(&str, u32)]| cands.iter().find_map(|(p, i)| std::fs::read(p).ok().map(|b| (b, *i)));
+    SystemFonts {
+        regular: read(&[
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+            ("/System/Library/Fonts/STHeiti Light.ttc", 0),
+        ]),
+        bold: read(&[
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 1),
+            ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
+        ]),
+        mono: read(&[("/System/Library/Fonts/Menlo.ttc", 0)]),
+    }
+}
+
+/// 加载中文字体（常规 + 粗体）。egui 自带字体不含中文。
+pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let defaults = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
 
-    let regular = read(&["msyh.ttc", "msyh.ttf", "Deng.ttf", "simhei.ttf", "simsun.ttc"]);
-    let bold_font = read(&["msyhbd.ttc", "msyhbd.ttf", "Dengb.ttf"]);
-
-    // msyh.ttc 的第 2 个字形是 Microsoft YaHei UI：行距更紧凑，专为界面设计
-    let ui_face = |bytes: Vec<u8>| {
+    let SystemFonts { regular, bold: bold_font, mono } = system_fonts();
+    let ui_face = |(bytes, index): Face| {
         let mut d = egui::FontData::from_owned(bytes);
-        if cfg!(windows) {
-            d.index = 1;
-        }
+        d.index = index;
         d
     };
-    if let Some(bytes) = read(&["consola.ttf"]) {
-        fonts.font_data.insert("consolas".into(), egui::FontData::from_owned(bytes).into());
+    if let Some(face) = mono {
+        fonts.font_data.insert("consolas".into(), ui_face(face).into());
         fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "consolas".into());
     }
     if let Some(bytes) = regular {

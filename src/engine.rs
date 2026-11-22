@@ -27,7 +27,7 @@ pub enum Event {
     CheckNow,
     /// 应用新配置。
     Reconfigure(Config),
-    /// 退出（关闭 WFP 会话，规则随之移除）。
+    /// 退出（移除全部阻断规则）。
     Shutdown,
     /// 内部：检测线程返回结果。
     Detected { generation: u64, result: Result<IpAddr> },
@@ -37,8 +37,9 @@ pub enum Event {
     ClearLearned,
 }
 
-/// 引擎对外报告的状态快照。
-#[derive(Debug, Clone, Default)]
+/// 引擎对外报告的状态快照。macOS 上由后台服务通过本地套接字发给界面。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Status {
     /// 最近一次检测到的出口 IP。
     pub egress_ip: Option<IpAddr>,
@@ -58,8 +59,10 @@ pub struct Status {
     pub failures: u32,
     /// 拦截后端不可用的原因（此时为模拟模式，规则未真正生效）。
     pub backend_error: Option<String>,
-    /// 模拟模式（--dry-run 或 WFP 打开失败）。
+    /// 模拟模式（--dry-run 或拦截后端打开失败）。
     pub simulated: bool,
+    /// 拦截后端能否按应用阻断（macOS 的 pf 后端不能，只能全局断网）。
+    pub per_app: bool,
     /// 引擎是否在运行。
     pub running: bool,
     /// 自动识别到、一并阻断的关联程序。
@@ -127,19 +130,10 @@ fn run(
     rx: Receiver<Event>,
     reporter: Reporter,
 ) -> Result<()> {
-    let mut status = Status { running: true, ..Default::default() };
+    let mut status = Status { running: true, per_app: true, ..Default::default() };
 
-    // 网卡变化监听（仅 Windows），需在整个循环期间保持存活
-    #[cfg(windows)]
-    let _watcher = match crate::win::netwatch::NetWatcher::start(tx.clone()) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            log::warn!("网卡变化监听启动失败，仅使用定时检测: {e:#}");
-            None
-        }
-    };
-    #[cfg(not(windows))]
-    log::warn!("非 Windows 平台：不监听网卡变化，仅定时检测");
+    // 网卡变化监听，需在整个循环期间保持存活
+    let _watcher = start_netwatch(tx.clone());
 
     let fw: Box<dyn Firewall> = if dry_run {
         status.simulated = true;
@@ -184,10 +178,10 @@ fn run(
     }
 
     // 关联程序识别：先同步载入已知的，再启动后台线程持续识别
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    let system_dirs = discovery::default_system_dirs();
     let mut watch_version = 0u64;
     let watch = Arc::new(Mutex::new(WatchSettings::from_config(&cfg, watch_version)));
-    let initial = discovery::initial_extra(&watch.lock().unwrap(), learned_file.clone(), &windir);
+    let initial = discovery::initial_extra(&watch.lock().unwrap(), learned_file.clone(), &system_dirs);
     if !initial.is_empty() {
         log::info!("载入 {} 个已识别的关联程序", initial.len());
     }
@@ -195,7 +189,7 @@ fn run(
         log::error!("{e:#}");
     }
     status.extra_apps = initial;
-    discovery::spawn(watch.clone(), learned_file, snapshot_fn(), windir, tx.clone());
+    discovery::spawn(watch.clone(), learned_file, snapshot_fn(), system_dirs, tx.clone());
 
     let mut detector = Arc::new(make_detector(&cfg));
     let mut generation: u64 = 0;
@@ -329,8 +323,8 @@ fn run(
         reporter(&status);
     }
 
-    log::info!("引擎退出，阻断规则随 WFP 动态会话自动移除");
-    drop(ctrl); // 关闭 WFP 会话
+    log::info!("引擎退出，移除阻断规则");
+    drop(ctrl); // 关闭 WFP 会话 / 清空 pf 规则
     status.running = false;
     status.checking = false;
     status.blocked = false;
@@ -342,6 +336,7 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.egress_ip = ctrl.last_ip();
     s.whitelisted = ctrl.last_ip().map(|ip| ctrl.config().is_whitelisted(ip));
     s.blocked = ctrl.is_blocked();
+    s.per_app = ctrl.per_app();
     s.block_all = ctrl.config().block_all.enabled;
     s.checking = checking;
     s.detect_error = ctrl.last_error().map(str::to_owned);
@@ -352,12 +347,37 @@ fn make_detector(cfg: &Config) -> EgressDetector {
     EgressDetector::new(cfg.detect.services.clone(), Duration::from_secs(cfg.detect.timeout_secs))
 }
 
+/// 网卡/地址/路由变化监听；返回值需保持存活。
+fn start_netwatch(tx: Sender<Event>) -> Option<Box<dyn std::any::Any>> {
+    #[cfg(windows)]
+    let r = crate::win::netwatch::NetWatcher::start(tx).map(|w| Box::new(w) as Box<dyn std::any::Any>);
+    #[cfg(target_os = "macos")]
+    let r = crate::mac::netwatch::start(tx).map(|w| Box::new(w) as Box<dyn std::any::Any>);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let r: Result<Box<dyn std::any::Any>> = {
+        let _ = tx;
+        Err(anyhow!("此平台不支持"))
+    };
+    match r {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("网卡变化监听启动失败，仅使用定时检测: {e:#}");
+            None
+        }
+    }
+}
+
 #[cfg(windows)]
 fn snapshot_fn() -> discovery::SnapshotFn {
     crate::win::procs::snapshot
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn snapshot_fn() -> discovery::SnapshotFn {
+    crate::mac::procs::snapshot
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn snapshot_fn() -> discovery::SnapshotFn {
     Vec::new
 }
@@ -368,7 +388,13 @@ fn open_backend(cfg: &Config) -> Result<Box<dyn Firewall>> {
     Ok(Box::new(crate::win::wfp::WfpFirewall::open()?))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_backend(cfg: &Config) -> Result<Box<dyn Firewall>> {
+    let _ = cfg;
+    Ok(Box::new(crate::mac::pf::PfFirewall::open()?))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_backend(_cfg: &Config) -> Result<Box<dyn Firewall>> {
-    anyhow::bail!("WFP 只在 Windows 上可用；在其他平台请使用 --dry-run")
+    anyhow::bail!("只支持 Windows（WFP）和 macOS（pf）；在其他平台请使用 --dry-run")
 }

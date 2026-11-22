@@ -1,12 +1,16 @@
 //! 图形界面（eframe/egui），苹果风格：侧边栏导航、大标题、分组圆角卡片、开关控件，
-//! 浅色/深色跟随系统。另有系统托盘。
+//! 浅色/深色跟随系统。另有系统托盘（Windows）/ 菜单栏图标（macOS）。
 
-mod icons;
+pub mod backend;
+pub mod icons;
 mod platform;
 mod theme;
 #[cfg(windows)]
 mod tray;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[path = "tray_mac.rs"]
+mod tray;
+#[cfg(not(any(windows, target_os = "macos")))]
 #[path = "tray_stub.rs"]
 mod tray;
 
@@ -21,24 +25,52 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText}
 
 use crate::config::{parse_net, Appearance, ChildMode, Config, FailMode, RawConfig};
 use crate::discovery::Source;
-use crate::engine::{self, EngineHandle, Event, Status};
-use crate::{learned_file, logbuf};
+use crate::engine::{self, Status};
+use backend::{Backend, ServiceState};
 use icons::Shade;
-use platform::{autostart, procs};
+use platform::procs;
 use theme::{Glyph, Palette};
 
 pub const WINDOW_TITLE: &str = "出口 IP 网络控制 - egress-guard";
 
-/// 退出程序：关闭引擎（WFP 会话随之关闭、规则移除）后结束进程。
-pub fn quit(engine: &EngineHandle) -> ! {
-    log::info!("用户选择退出");
-    let _ = engine.shutdown();
-    std::process::exit(0);
+/// 拦截后端能否按应用阻断（macOS 免签名版本用 pf，只能全局断网）。
+const PER_APP: bool = !cfg!(target_os = "macos");
+
+/// 与平台相关的界面文字。
+#[cfg(not(target_os = "macos"))]
+mod text {
+    pub const ENGINE_RUNNING: &str = "WFP 运行中";
+    pub const BACKEND_UNAVAILABLE: &str = "WFP 不可用，当前为模拟模式。请以管理员身份运行。";
+    pub const CLOSE_HINT: &str = "点窗口右上角的 × 会隐藏到托盘，程序继续运行。要退出，请右键托盘图标选择「退出程序」，退出后所有阻断随之解除。";
+    pub const PROGRAM: &str = "exe";
+    pub const SYSTEM_DIRS_HINT: &str = "Windows 系统目录下的程序（cmd、PowerShell、conhost 等）不会被自动加入。识别到的子进程会被记住，下次启动立即生效。";
+    pub const AUTOSTART_TITLE: &str = "登录时自动启动";
+    pub const AUTOSTART_SUB: &str = "以管理员权限在托盘中运行，不弹出 UAC";
+    pub const SELF_SUB: &str = "用于在断网期间继续检测出口 IP，以便自动恢复";
+    pub const VPN_HINT: &str = "部分 VPN（如 WireGuard）由系统内核发送流量，按程序放行无效，请在这里填写 VPN 服务器的 IP。";
 }
+
+#[cfg(target_os = "macos")]
+mod text {
+    pub const ENGINE_RUNNING: &str = "pf 运行中";
+    pub const BACKEND_UNAVAILABLE: &str = "pf 不可用，当前为模拟模式。";
+    pub const CLOSE_HINT: &str = "点窗口左上角的关闭按钮会隐藏到菜单栏，程序继续运行。要退出，请点菜单栏图标选择「退出」，退出后所有阻断随之解除。";
+    pub const PROGRAM: &str = "应用";
+    pub const SYSTEM_DIRS_HINT: &str = "系统目录（/System、/usr、/bin 等）下的程序不会被自动加入。识别到的子进程会被记住。";
+    pub const AUTOSTART_TITLE: &str = "开机自动启动";
+    pub const AUTOSTART_SUB: &str = "开机即由后台服务保护，登录后在菜单栏显示图标";
+    pub const SELF_SUB: &str = "检测出口 IP 的请求（以 nobody 身份发出），以便断网期间自动恢复";
+    pub const VPN_HINT: &str = "VPN 断开、正在重连时也会被断网。请在这里填写 VPN 服务器的 IP，让它能重新连上。";
+}
+
+/// 后台的安装/卸载任务（会弹出系统密码对话框，放在线程里运行）。
+type Job = Arc<Mutex<Option<Result<(), String>>>>;
 
 pub struct Options {
     pub config_path: PathBuf,
     pub start_minimized: bool,
+    /// 打开时显示的页面（overview / whitelist / apps / network / settings / log），用于截图。
+    pub start_page: Option<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -52,6 +84,18 @@ enum Page {
 }
 
 impl Page {
+    fn from_name(name: &str) -> Option<Page> {
+        Some(match name {
+            "overview" => Page::Overview,
+            "whitelist" => Page::Whitelist,
+            "apps" => Page::Apps,
+            "network" => Page::Network,
+            "settings" => Page::Settings,
+            "log" => Page::Log,
+            _ => return None,
+        })
+    }
+
     fn editable(self) -> bool {
         matches!(self, Page::Whitelist | Page::Apps | Page::Network | Page::Settings)
     }
@@ -73,10 +117,9 @@ struct ProcPicker {
 }
 
 struct App {
-    engine: Arc<EngineHandle>,
+    backend: Arc<dyn Backend>,
     status: Arc<Mutex<Status>>,
     show_requested: Arc<AtomicBool>,
-    config_path: PathBuf,
     /// 已保存/已应用的配置。
     applied: RawConfig,
     /// 正在编辑的配置。
@@ -94,11 +137,16 @@ struct App {
     picker: Option<ProcPicker>,
     autostart: bool,
     hide_on_first_frame: bool,
+    /// 已经处理过第一帧。
+    started: bool,
     /// 当前已应用到界面的外观。
     shown_appearance: Option<Appearance>,
     /// 页面切换动效：上一帧显示的页面及切换时刻。
     shown_page: Page,
     page_since: f64,
+    /// 正在进行的后台服务安装/卸载及其说明。
+    service_job: Option<(Job, &'static str)>,
+    service_error: Option<String>,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -120,7 +168,17 @@ pub fn run(opts: Options) -> Result<()> {
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([720.0, 480.0])
         .with_icon(egui::IconData { rgba: icons::shield_rgba(64, Shade::Green), width: 64, height: 64 });
-    let native = eframe::NativeOptions { viewport, ..Default::default() };
+    #[allow(unused_mut)]
+    let mut native = eframe::NativeOptions { viewport, ..Default::default() };
+    // macOS：菜单栏应用，不在程序坞显示图标（与 Info.plist 的 LSUIElement 一致）
+    #[cfg(target_os = "macos")]
+    {
+        native.event_loop_builder = Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Accessory);
+        }));
+    }
+    let start_page = opts.start_page.as_deref().and_then(Page::from_name).unwrap_or(Page::Overview);
 
     eframe::run_native(
         "egress-guard",
@@ -141,13 +199,13 @@ pub fn run(opts: Options) -> Result<()> {
                     ctx.request_repaint();
                 })
             };
-            let engine = Arc::new(engine::spawn(cfg.clone(), false, false, Some(learned_file(&opts.config_path)), reporter));
+            let (backend, cfg) = start_backend(cfg, &opts.config_path, reporter);
             let show_requested = Arc::new(AtomicBool::new(false));
             tray::spawn(
                 tray::TrayCtx {
                     egui_ctx: ctx.clone(),
                     show_requested: show_requested.clone(),
-                    engine: engine.clone(),
+                    backend: backend.clone(),
                     window_title: WINDOW_TITLE.into(),
                 },
                 tray_rx,
@@ -155,14 +213,14 @@ pub fn run(opts: Options) -> Result<()> {
 
             let raw = cfg.to_raw();
             Ok(Box::new(App {
-                engine,
+                autostart: backend.autostart_enabled(),
+                backend,
                 status,
                 show_requested,
-                config_path: opts.config_path,
                 services_text: raw.detect.services.join("\n"),
                 applied: raw.clone(),
                 draft: raw,
-                page: Page::Overview,
+                page: start_page,
                 new_entry: String::new(),
                 entry_error: None,
                 new_remote: String::new(),
@@ -170,20 +228,37 @@ pub fn run(opts: Options) -> Result<()> {
                 message: None,
                 load_error,
                 picker: None,
-                autostart: autostart::is_enabled(),
                 hide_on_first_frame: opts.start_minimized,
+                started: false,
                 shown_appearance: None,
-                shown_page: Page::Overview,
+                shown_page: start_page,
                 page_since: f64::NEG_INFINITY,
+                service_job: None,
+                service_error: None,
             }))
         }),
     )
     .map_err(|e| anyhow::anyhow!("界面启动失败: {e}"))
 }
 
+/// 启动引擎。Windows/Linux：在本进程中运行；macOS：连接 root 后台服务，并以服务的配置为准。
+#[cfg(not(target_os = "macos"))]
+fn start_backend(cfg: Config, config_path: &std::path::Path, reporter: engine::Reporter) -> (Arc<dyn Backend>, Config) {
+    let learned = crate::learned_file(config_path);
+    let engine = Arc::new(engine::spawn(cfg.clone(), false, false, Some(learned), reporter));
+    (Arc::new(backend::Local { engine, config_path: config_path.to_path_buf() }), cfg)
+}
+
+#[cfg(target_os = "macos")]
+fn start_backend(cfg: Config, _config_path: &std::path::Path, reporter: engine::Reporter) -> (Arc<dyn Backend>, Config) {
+    let remote = backend::Remote::start(reporter);
+    let cfg = remote.take_new_config().and_then(|raw| Config::from_raw(raw).ok()).unwrap_or(cfg);
+    (remote, cfg)
+}
+
 fn tray_state(s: &Status) -> tray::TrayState {
     let (shade, what) = if !s.running {
-        (Shade::Gray, "已停止".to_string())
+        (Shade::Gray, if s.backend_error.is_some() { "未连接后台服务" } else { "已停止" }.to_string())
     } else if s.blocked {
         (Shade::Red, "已阻断".to_string())
     } else if s.egress_ip.is_some() {
@@ -210,7 +285,10 @@ fn scope_name(s: &Status) -> &'static str {
 /// 状态的展示信息：标题、说明（说的是接下来会发生什么）、颜色。
 fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
     if !s.running {
-        ("已停止", "后台引擎没有运行。".into(), p.gray)
+        match &s.backend_error {
+            Some(e) => ("未连接", format!("{e}。"), p.gray),
+            None => ("已停止", "后台引擎没有运行。".into(), p.gray),
+        }
     } else if s.blocked {
         let why = match (s.egress_ip, &s.detect_error) {
             (Some(_), _) => "出口 IP 不在白名单内。出口回到白名单后会自动恢复。",
@@ -239,13 +317,12 @@ impl App {
     fn save_and_apply(&mut self) {
         self.sync_services();
         match Config::from_raw(self.draft.clone()).and_then(|cfg| {
-            cfg.save(&self.config_path)?;
+            self.backend.apply(&cfg)?;
             Ok(cfg)
         }) {
             Ok(cfg) => {
                 self.applied = cfg.to_raw();
                 self.draft = self.applied.clone();
-                self.engine.send(Event::Reconfigure(cfg));
                 self.load_error = None;
                 self.notify(true, "已保存并生效");
             }
@@ -319,6 +396,103 @@ impl App {
         }
     }
 
+    // ---------------- 后台服务（macOS） ----------------
+
+    /// 在线程中安装/卸载后台服务（期间系统会弹出管理员密码对话框）。
+    fn start_service_job(&mut self, ctx: &egui::Context, install: bool) {
+        let job: Job = Arc::new(Mutex::new(None));
+        let (b, j, ctx) = (self.backend.clone(), job.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = if install { b.install_service() } else { b.uninstall_service() };
+            *j.lock().unwrap() = Some(r.map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.service_error = None;
+        self.service_job = Some((job, if install { "后台服务已安装" } else { "后台服务已卸载" }));
+    }
+
+    fn poll_service_job(&mut self) {
+        let done = self.service_job.as_ref().and_then(|(j, msg)| j.lock().unwrap().take().map(|r| (r, *msg)));
+        if let Some((r, msg)) = done {
+            self.service_job = None;
+            match r {
+                Ok(()) => self.notify(true, msg),
+                Err(e) if e == "已取消" => {}
+                Err(e) => {
+                    self.notify(false, e.clone());
+                    self.service_error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// 概览顶部：后台服务未安装、连不上或版本不一致时的提示。
+    fn service_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let ours = env!("CARGO_PKG_VERSION");
+        let (title, body, button) = match self.backend.service() {
+            ServiceState::NotApplicable => return,
+            ServiceState::Running { version } if version == ours => return,
+            ServiceState::Running { version } => (
+                "后台服务需要更新",
+                format!("后台服务是 {version} 版，界面是 {ours} 版。更新时需要输入管理员密码。"),
+                "更新后台服务…",
+            ),
+            ServiceState::NotInstalled => (
+                "需要安装后台服务",
+                "macOS 上由一个以 root 运行的后台服务负责检测出口 IP、设置 pf 防火墙。安装时需要输入一次管理员密码，之后日常使用不再需要。".to_owned(),
+                "安装后台服务…",
+            ),
+            ServiceState::Unreachable(e) => ("正在连接后台服务", format!("{e}。如果一直连不上，可以重新安装。"), "重新安装…"),
+        };
+        let body = match &self.service_error {
+            Some(e) => format!("{body}\n上次操作失败：{e}"),
+            None => body,
+        };
+        let busy = self.service_job.is_some();
+        let mut clicked = false;
+        warning_card_with(ui, p, title, &body, |ui| {
+            if busy {
+                ui.label(RichText::new("等待管理员授权…").size(12.5).color(p.secondary));
+                ui.add(egui::Spinner::new().size(14.0));
+            } else {
+                clicked = theme::accent_button(ui, p, button, true).clicked();
+            }
+        });
+        if clicked {
+            self.start_service_job(ui.ctx(), true);
+        }
+        ui.add_space(4.0);
+    }
+
+    /// 设置页「启动」分组里的后台服务一行（仅 macOS）。
+    fn service_rows(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let state = self.backend.service();
+        let (color, label) = match &state {
+            ServiceState::NotApplicable => return,
+            ServiceState::Running { version } => (p.green, format!("运行中 · {version}")),
+            ServiceState::NotInstalled => (p.gray, "未安装".to_owned()),
+            ServiceState::Unreachable(_) => (p.orange, "未连接".to_owned()),
+        };
+        theme::hairline(ui, p);
+        let mut action = None;
+        let busy = self.service_job.is_some();
+        theme::row(ui, p, "后台服务", Some("以 root 运行，负责检测出口 IP、设置 pf 防火墙"), |ui| {
+            if busy {
+                ui.add(egui::Spinner::new().size(14.0));
+            } else if state == ServiceState::NotInstalled {
+                if theme::text_button(ui, p.accent, "安装…").clicked() {
+                    action = Some(true);
+                }
+            } else if theme::text_button(ui, p.red, "卸载…").on_hover_text("停止后台服务并移除全部 pf 规则").clicked() {
+                action = Some(false);
+            }
+            theme::chip(ui, color, &label);
+        });
+        if let Some(install) = action {
+            self.start_service_job(ui.ctx(), install);
+        }
+    }
+
     // ---------------- 侧边栏 ----------------
 
     fn sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -389,8 +563,19 @@ impl App {
             warning_card(ui, p, "配置文件读取失败", &format!("当前使用默认设置，保存会覆盖原文件。{e}"));
             ui.add_space(4.0);
         }
-        if let Some(e) = &s.backend_error {
-            warning_card(ui, p, "拦截规则未生效", &format!("WFP 不可用，当前为模拟模式。请以管理员身份运行。{e}"));
+        self.service_card(ui, p);
+        if let (true, Some(e)) = (s.running, &s.backend_error) {
+            warning_card(ui, p, "拦截规则未生效", &format!("{}{e}", text::BACKEND_UNAVAILABLE));
+            ui.add_space(4.0);
+        }
+        if !PER_APP && s.running && !self.applied.block_all.enabled {
+            let mut go = false;
+            warning_card_with(ui, p, "全局断网未开启", "macOS 版只能切断全部网络，不能按应用断网。现在出口 IP 不在白名单时不会拦截任何连接。", |ui| {
+                go = theme::text_button(ui, p.accent, "去开启  ›").clicked();
+            });
+            if go {
+                self.page = Page::Network;
+            }
             ui.add_space(4.0);
         }
 
@@ -403,7 +588,7 @@ impl App {
         } else {
             theme::Route::Checking
         };
-        let scope = if s.block_all { "全部网络".to_owned() } else { format!("{} 个受控应用", self.applied.apps.len()) };
+        let scope = if s.block_all || !PER_APP { "全部网络".to_owned() } else { format!("{} 个受控应用", self.applied.apps.len()) };
         let gate = match (s.whitelisted, s.blocked) {
             (Some(true), _) => "命中，放行",
             (Some(false), _) => "未命中，阻断",
@@ -425,7 +610,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.add(egui::Spinner::new().size(18.0));
                     } else if theme::gray_button(ui, p, "立即检测").clicked() {
-                        self.engine.send(Event::CheckNow);
+                        self.backend.check_now();
                     }
                 });
             });
@@ -458,7 +643,7 @@ impl App {
                 if s.backend_error.is_some() {
                     theme::chip(ui, p.orange, "模拟模式");
                 } else if s.running {
-                    theme::chip(ui, p.green, "WFP 运行中");
+                    theme::chip(ui, p.green, text::ENGINE_RUNNING);
                 } else {
                     theme::chip(ui, p.gray, "未运行");
                 }
@@ -488,7 +673,7 @@ impl App {
         if let Some(pg) = goto {
             self.page = pg;
         }
-        theme::footnote(ui, p, "点窗口右上角的 × 会隐藏到托盘，程序继续运行。要退出，请右键托盘图标选择「退出程序」，退出后所有阻断随之解除。");
+        theme::footnote(ui, p, text::CLOSE_HINT);
     }
 
     fn whitelist(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -573,6 +758,15 @@ impl App {
 
     fn apps(&mut self, ui: &mut egui::Ui, p: &Palette) {
         theme::page_title(ui, p, "受控应用", "出口 IP 不在白名单内时，以下程序的全部网络连接会被阻断。");
+        if !PER_APP {
+            info_card(
+                ui,
+                p,
+                "macOS 版暂不支持按应用断网",
+                "按应用拦截需要 Apple 的网络扩展（Network Extension），必须用付费开发者账号签名、公证后才能启用。当前版本请使用「全局断网」；这里的列表会保留，供以后的签名版本使用。",
+            );
+            ui.add_space(4.0);
+        }
 
         ui.horizontal(|ui| {
             if theme::gray_button(ui, p, "浏览选择程序…").clicked() {
@@ -624,7 +818,7 @@ impl App {
         if let Some(i) = remove {
             self.draft.apps.remove(i);
         }
-        theme::footnote(ui, p, "同一个 exe 的所有进程都会被阻断；它启动的其他程序见下方「自动识别」。");
+        theme::footnote(ui, p, &format!("同一个{}的所有进程都会被阻断；它启动的其他程序见下方「自动识别」。", text::PROGRAM));
 
         // ---- 自动识别关联程序 ----
         theme::section(ui, p, "自动识别");
@@ -647,17 +841,17 @@ impl App {
                 ui,
                 p,
                 "阻断所在目录的全部程序",
-                Some("受控应用 exe 所在目录（含子目录）下的所有 exe，未运行的也提前阻断"),
+                Some(if cfg!(target_os = "macos") {
+                    "受控应用所在 .app 包里的所有程序，未运行的也提前阻断"
+                } else {
+                    "受控应用 exe 所在目录（含子目录）下的所有 exe，未运行的也提前阻断"
+                }),
                 |ui| {
                     theme::toggle(ui, p, &mut c.include_app_dir);
                 },
             );
         });
-        theme::footnote(
-            ui,
-            p,
-            "Windows 系统目录下的程序（cmd、PowerShell、conhost 等）不会被自动加入。识别到的子进程会被记住，下次启动立即生效。",
-        );
+        theme::footnote(ui, p, text::SYSTEM_DIRS_HINT);
 
         // 刚点了"忽略"、尚未保存的项先隐藏
         let pending: Vec<String> =
@@ -713,7 +907,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             if theme::text_button(ui, p.accent, "清空子进程识别记录").clicked() {
-                self.engine.send(Event::ClearLearned);
+                self.backend.clear_learned();
                 self.notify(true, "已清空子进程识别记录");
             }
         });
@@ -838,11 +1032,14 @@ impl App {
         let b = &mut self.draft.block_all;
         theme::section(ui, p, "始终放行");
         theme::card(ui, p, |ui| {
-            let fixed = [
-                ("Egress Guard 本身", "用于在断网期间继续检测出口 IP，以便自动恢复"),
+            let mut fixed = vec![
+                ("Egress Guard 本身", text::SELF_SUB),
                 ("本机回环", "127.0.0.1、::1 等本机内部通信"),
                 ("DHCP", "自动获取 IP 地址，否则网卡可能拿不到地址"),
             ];
+            if cfg!(target_os = "macos") {
+                fixed.push(("IPv6 邻居发现", "同一网段内的地址解析与路由通告，否则 IPv6 无法工作"));
+            }
             for (i, (title, sub)) in fixed.iter().enumerate() {
                 if i > 0 {
                     theme::hairline(ui, p);
@@ -871,6 +1068,11 @@ impl App {
         });
 
         theme::section(ui, p, &format!("例外程序 {} 个", self.draft.block_all.allow_apps.len()));
+        if !PER_APP {
+            info_card(ui, p, "macOS 版不支持按程序放行", "pf 防火墙不能区分程序。VPN 客户端请改为把 VPN 服务器地址填到下面的「例外地址」。");
+            ui.add_space(4.0);
+        }
+        if PER_APP {
         ui.horizontal(|ui| {
             if theme::gray_button(ui, p, "浏览选择程序…").clicked() {
                 for f in platform::pick_exe_files() {
@@ -886,7 +1088,9 @@ impl App {
             }
         });
         ui.add_space(4.0);
+        }
         let mut remove = None;
+        if PER_APP || !self.draft.block_all.allow_apps.is_empty() {
         theme::card(ui, p, |ui| {
             let list = &self.draft.block_all.allow_apps;
             if list.is_empty() {
@@ -920,6 +1124,7 @@ impl App {
                 }
             }
         });
+        }
         if let Some(i) = remove {
             self.draft.block_all.allow_apps.remove(i);
         }
@@ -960,11 +1165,7 @@ impl App {
         if let Some(i) = remove {
             self.draft.block_all.allow_remote.remove(i);
         }
-        theme::footnote(
-            ui,
-            p,
-            "部分 VPN（如 WireGuard）由系统内核发送流量，按程序放行无效，请在这里填写 VPN 服务器的 IP。",
-        );
+        theme::footnote(ui, p, text::VPN_HINT);
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1035,10 +1236,13 @@ impl App {
             theme::row(ui, p, "网络变化时先阻断", Some("防止切换网络的瞬间泄漏"), |ui| {
                 theme::toggle(ui, p, &mut b.block_on_network_change);
             });
-            theme::hairline(ui, p);
-            theme::row(ui, p, "断开已有连接", Some("切换为阻断时，主动断开受控应用的 TCP 连接"), |ui| {
-                theme::toggle(ui, p, &mut b.kill_existing_tcp);
-            });
+            // pf 规则不建立状态，已有连接在下一个数据包就会被拦截，不需要这个选项
+            if PER_APP {
+                theme::hairline(ui, p);
+                theme::row(ui, p, "断开已有连接", Some("切换为阻断时，主动断开受控应用的 TCP 连接"), |ui| {
+                    theme::toggle(ui, p, &mut b.kill_existing_tcp);
+                });
+            }
             theme::hairline(ui, p);
             theme::row(ui, p, "网络变化防抖", None, |ui| {
                 ui.add(egui::DragValue::new(&mut b.debounce_ms).range(0..=30000).suffix(" 毫秒"));
@@ -1049,23 +1253,19 @@ impl App {
         let mut auto = self.autostart;
         let mut changed = false;
         theme::card(ui, p, |ui| {
-            theme::row(ui, p, "登录时自动启动", Some("以管理员权限在托盘中运行，不弹出 UAC"), |ui| {
+            theme::row(ui, p, text::AUTOSTART_TITLE, Some(text::AUTOSTART_SUB), |ui| {
                 changed = theme::toggle(ui, p, &mut auto).changed();
             });
+            self.service_rows(ui, p);
         });
         if changed {
-            let res = match std::env::current_exe() {
-                Ok(exe) if auto => autostart::enable(&exe),
-                Ok(_) => autostart::disable(),
-                Err(e) => Err(e.into()),
-            };
-            match res {
+            match self.backend.set_autostart(auto) {
                 Ok(()) => self.notify(true, if auto { "已开启开机自启" } else { "已关闭开机自启" }),
                 Err(e) => self.notify(false, format!("{e:#}")),
             }
-            self.autostart = autostart::is_enabled();
+            self.autostart = self.backend.autostart_enabled();
         }
-        theme::footnote(ui, p, &format!("配置文件：{}", self.config_path.display()));
+        theme::footnote(ui, p, &format!("配置文件：{}", self.backend.config_location()));
     }
 
     fn log(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1073,17 +1273,17 @@ impl App {
             ui.label(RichText::new("日志").font(theme::bold(26.0)).color(p.label));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::gray_button(ui, p, "清空").clicked() {
-                    logbuf::clear();
+                    self.backend.clear_logs();
                 }
             });
         });
-        if let Some(dir) = crate::exe_dir() {
-            ui.label(RichText::new(format!("完整日志：{}", dir.join("egress-guard.log").display())).color(p.secondary));
+        if let Some(path) = self.backend.log_location() {
+            ui.label(RichText::new(format!("完整日志：{path}")).color(p.secondary));
         }
         ui.add_space(8.0);
         theme::card(ui, p, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                for line in logbuf::recent_lines() {
+                for line in self.backend.logs() {
                     let c = if line.contains(" ERROR ") {
                         p.red
                     } else if line.contains(" WARN ") {
@@ -1171,6 +1371,43 @@ fn warning_card(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
         });
 }
 
+/// 带右侧操作的警告卡片。
+fn warning_card_with(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str, action: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(p.orange.gamma_multiply(0.12))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 8.0, p.orange);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "!", theme::bold(12.0), Color32::WHITE);
+                ui.label(RichText::new(title).font(theme::bold(14.0)).color(p.orange));
+                ui.with_layout(Layout::right_to_left(Align::Center), action);
+            });
+            ui.label(RichText::new(text).size(12.5).color(p.label));
+        });
+}
+
+/// 说明性的提示卡片（蓝色，不表示出错）。
+fn info_card(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
+    egui::Frame::new()
+        .fill(p.accent.gamma_multiply(if p.dark { 0.16 } else { 0.08 }))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 8.0, p.accent);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "i", theme::bold(12.0), Color32::WHITE);
+                ui.label(RichText::new(title).font(theme::bold(14.0)).color(p.accent));
+            });
+            ui.label(RichText::new(text).size(12.5).color(p.label));
+        });
+}
+
 fn empty_state(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(14.0);
@@ -1193,9 +1430,24 @@ fn letter_icon(ui: &mut egui::Ui, p: &Palette, name: &str) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.hide_on_first_frame {
-            self.hide_on_first_frame = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.poll_service_job();
+        // macOS：连上后台服务后以服务里的配置为准（没有未保存的修改时）
+        if let Some(raw) = self.backend.take_new_config() {
+            if !self.dirty() && raw != self.applied {
+                self.applied = raw.clone();
+                self.draft = raw;
+                self.services_text = self.draft.detect.services.join("\n");
+            }
+        }
+        if !self.started {
+            self.started = true;
+            if self.hide_on_first_frame {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                // macOS 菜单栏应用启动时不会自动成为前台应用
+                #[cfg(target_os = "macos")]
+                tray::bring_to_front();
+            }
         }
         if self.show_requested.swap(false, Ordering::SeqCst) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1278,19 +1530,31 @@ impl eframe::App for App {
     }
 }
 
-/// 从 Windows 路径中取出不带扩展名的程序名（与运行平台无关）。
+/// 从路径中取出不带扩展名（.exe / .app）的程序名（与运行平台无关）。
 fn exe_name(path: &str) -> String {
-    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let file = path.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().unwrap_or(path);
     match file.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem.to_owned(),
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("app") => stem.to_owned(),
         _ => file.to_owned(),
     }
 }
+
 
 fn shorten(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_owned()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn exe_names() {
+        assert_eq!(super::exe_name(r"C:\Program Files\App\app.EXE"), "app");
+        assert_eq!(super::exe_name("/Applications/Google Chrome.app"), "Google Chrome");
+        assert_eq!(super::exe_name("/Applications/Foo.app/"), "Foo");
+        assert_eq!(super::exe_name("/usr/local/bin/curl"), "curl");
     }
 }

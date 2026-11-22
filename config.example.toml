@@ -2,6 +2,10 @@
 #
 # 规则：本机公网出口 IP 命中 whitelist 中任一条目 → 放行 apps；
 #       否则（或检测失败达到阈值）→ 用 WFP 阻断 apps 的全部网络连接。
+#
+# macOS 版：pf 防火墙不能按应用区分，apps 不生效，请开启 [block_all] 全局断网。
+# macOS 上配置由后台服务保存在 /Library/Application Support/EgressGuard/config.toml，
+# 用界面修改，或执行 egress-guard apply <文件>。
 
 # 出口 IP 白名单：支持单个 IPv4/IPv6 地址和 CIDR 网段
 whitelist = [

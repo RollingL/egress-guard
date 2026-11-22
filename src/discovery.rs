@@ -4,8 +4,8 @@
 //!   也会被记录并加入阻断。识别结果写入 `learned-apps.txt`，下次启动时立即生效。
 //! - **同目录**（可选）：受控应用 exe 所在目录（含子目录）下的全部 exe。
 //!
-//! Windows 系统目录（%WINDIR%）下的程序永远不会被自动加入，以免误伤系统组件
-//! （例如应用调用 cmd.exe、powershell.exe、conhost.exe）。
+//! 系统目录（Windows 的 %WINDIR%，macOS 的 /System、/usr/bin 等）下的程序永远不会被自动加入，
+//! 以免误伤系统组件（例如应用调用 cmd.exe、powershell.exe、conhost.exe 或 /bin/sh）。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,14 +32,30 @@ fn parent_dir(norm: &str) -> Option<&str> {
     norm.rsplit_once('\\').map(|(d, _)| d)
 }
 
-/// 是否位于 Windows 系统目录下。
-pub fn is_system_path(norm: &str, windir_norm: &str) -> bool {
-    !windir_norm.is_empty() && (norm == windir_norm || norm.starts_with(&format!("{windir_norm}\\")))
+/// 本平台的系统目录（规范形式）。
+pub fn default_system_dirs() -> Vec<String> {
+    let dirs: Vec<String> = if cfg!(windows) {
+        vec![std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())]
+    } else if cfg!(target_os = "macos") {
+        ["/System", "/usr/bin", "/usr/sbin", "/usr/libexec", "/bin", "/sbin", "/Library/Apple"]
+            .map(String::from)
+            .to_vec()
+    } else {
+        ["/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec", "/bin", "/sbin"].map(String::from).to_vec()
+    };
+    dirs.iter().map(|d| normalize(d)).collect()
 }
 
-/// 目录是否太宽泛，不能整体扫描（盘符根目录及一级目录、Program Files、Common Files、AppData 等）。
-pub fn is_too_broad_dir(dir_norm: &str, windir_norm: &str) -> bool {
-    if is_system_path(dir_norm, windir_norm) {
+/// 是否位于系统目录下。
+pub fn is_system_path(norm: &str, system_dirs: &[String]) -> bool {
+    system_dirs
+        .iter()
+        .any(|d| !d.is_empty() && (norm == d || norm.starts_with(&format!("{d}\\"))))
+}
+
+/// Windows 目录是否太宽泛，不能整体扫描（盘符根目录及一级目录、Program Files、Common Files、AppData 等）。
+pub fn is_too_broad_dir(dir_norm: &str, system_dirs: &[String]) -> bool {
+    if is_system_path(dir_norm, system_dirs) {
         return true;
     }
     // parts[0] 为盘符（或 UNC 主机名）。根目录和一级目录（如 C:\Tools）都可能装着许多无关程序。
@@ -131,7 +147,45 @@ pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Str
     out
 }
 
-/// 递归列出目录下的 exe（限制深度和数量）。
+/// 受控应用"所在目录"模式要扫描的目录。
+///
+/// - Windows 路径：exe 所在目录（太宽泛的目录除外）。
+/// - Unix 路径（macOS）：应用所在的最外层 `.app` 包，例如
+///   `/Applications/Foo.app/Contents/MacOS/foo` 扫描 `/Applications/Foo.app`；不在 `.app` 包里的程序不整体扫描。
+pub fn app_scan_root(app: &Path, system_dirs: &[String]) -> Option<PathBuf> {
+    let text = app.to_string_lossy();
+    if crate::config::is_windows_absolute(&text) {
+        let norm = normalize(&text);
+        let dir_norm = parent_dir(&norm)?;
+        if is_too_broad_dir(dir_norm, system_dirs) {
+            return None;
+        }
+        return app.parent().map(Path::to_path_buf);
+    }
+    let bundle = app
+        .ancestors()
+        .filter(|a| a.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
+        .last()?;
+    (!is_system_path(&normalize_path(bundle), system_dirs)).then(|| bundle.to_path_buf())
+}
+
+/// 是否为可执行程序：Windows 上看扩展名 .exe；Unix 上还看可执行权限位。
+fn is_program(path: &Path, meta: &std::fs::Metadata) -> bool {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            return true;
+        }
+    }
+    let _ = meta;
+    false
+}
+
+/// 递归列出目录下的程序（限制深度和数量）。
 pub fn scan_dir_exes(dir: &Path, max_depth: usize, max_count: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
@@ -144,9 +198,7 @@ pub fn scan_dir_exes(dir: &Path, max_depth: usize, max_count: usize) -> Vec<Path
                 if depth < max_depth {
                     stack.push((path, depth + 1));
                 }
-            } else if ft.is_file()
-                && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-            {
+            } else if ft.is_file() && entry.metadata().is_ok_and(|m| is_program(&path, &m)) {
                 out.push(path);
                 if out.len() >= max_count {
                     return out;
@@ -166,7 +218,7 @@ pub enum Source {
     AppDir,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtraApp {
     pub path: PathBuf,
     pub source: Source,
@@ -264,17 +316,17 @@ pub fn spawn(
     settings: Arc<Mutex<WatchSettings>>,
     learned_file: Option<PathBuf>,
     snapshot: SnapshotFn,
-    windir: String,
+    system_dirs: Vec<String>,
     tx: Sender<Event>,
 ) {
     std::thread::Builder::new()
         .name("child-watch".into())
-        .spawn(move || run(settings, learned_file, snapshot, normalize(&windir), tx))
+        .spawn(move || run(settings, learned_file, snapshot, system_dirs, tx))
         .expect("无法创建子进程识别线程");
 }
 
 /// 扫描受控应用所在目录（include_app_dir 开启时）。返回 (exe, 所属受控应用规范路径)。
-fn scan_app_dirs(s: &WatchSettings, windir: &str) -> Vec<(PathBuf, String)> {
+fn scan_app_dirs(s: &WatchSettings, system_dirs: &[String]) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     if !s.include_app_dir {
         return out;
@@ -282,18 +334,16 @@ fn scan_app_dirs(s: &WatchSettings, windir: &str) -> Vec<(PathBuf, String)> {
     let mut seen = HashSet::new();
     for app in &s.apps {
         let norm = normalize_path(app);
-        let Some(dir_norm) = parent_dir(&norm) else { continue };
-        if is_too_broad_dir(dir_norm, windir) {
+        let Some(root) = app_scan_root(app, system_dirs) else {
             log::warn!(
                 "目录太宽泛，不整体阻断: {}",
                 app.parent().map(|d| d.display().to_string()).unwrap_or_default()
             );
             continue;
-        }
-        if seen.insert(dir_norm.to_owned()) {
-            if let Some(dir) = app.parent() {
-                out.extend(scan_dir_exes(dir, 8, 1000).into_iter().map(|p| (p, norm.clone())));
-            }
+        };
+        if seen.insert(normalize_path(&root)) {
+            // macOS 应用包的辅助程序可能嵌套较深（Frameworks/…/Helpers/…app/Contents/MacOS）
+            out.extend(scan_dir_exes(&root, 12, 1000).into_iter().map(|p| (p, norm.clone())));
         }
     }
     out
@@ -343,16 +393,16 @@ fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, String)])
 }
 
 /// 启动时同步计算一次（读取历史记录 + 目录扫描）。
-pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, windir: &str) -> Vec<ExtraApp> {
+pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, system_dirs: &[String]) -> Vec<ExtraApp> {
     let learned = Learned::load(learned_file);
-    collect(s, &learned, &scan_app_dirs(s, &normalize(windir)))
+    collect(s, &learned, &scan_app_dirs(s, system_dirs))
 }
 
 fn run(
     settings: Arc<Mutex<WatchSettings>>,
     learned_file: Option<PathBuf>,
     snapshot: SnapshotFn,
-    windir: String,
+    system_dirs: Vec<String>,
     tx: Sender<Event>,
 ) {
     let mut learned = Learned::load(learned_file);
@@ -379,7 +429,7 @@ fn run(
             Some((t, v)) => v != s.version || t.elapsed() >= DIR_RESCAN,
         };
         if rescan {
-            dir_exes = scan_app_dirs(&s, &windir);
+            dir_exes = scan_app_dirs(&s, &system_dirs);
             last_scan = Some((Instant::now(), s.version));
         }
 
@@ -394,7 +444,7 @@ fn run(
                     continue;
                 }
                 let norm = normalize(&p.path);
-                if is_system_path(&norm, &windir) || excluded.contains(&norm) || t.contains_key(&norm) {
+                if is_system_path(&norm, &system_dirs) || excluded.contains(&norm) || t.contains_key(&norm) {
                     continue;
                 }
                 if learned.add(Path::new(&p.path), &root) {
@@ -457,7 +507,7 @@ mod tests {
 
     #[test]
     fn system_and_broad_dirs() {
-        let win = normalize(r"C:\Windows");
+        let win = vec![normalize(r"C:\Windows")];
         assert!(is_system_path(&normalize(r"C:\Windows\System32\cmd.exe"), &win));
         assert!(!is_system_path(&normalize(r"C:\WindowsApps\x.exe"), &win));
         assert!(is_too_broad_dir(&normalize(r"C:\"), &win));
@@ -470,6 +520,27 @@ mod tests {
         assert!(!is_too_broad_dir(&normalize(r"C:\Program Files\Common Files\Vendor"), &win));
         assert!(!is_too_broad_dir(&normalize(r"C:\Program Files\Google\Chrome\Application"), &win));
         assert!(!is_too_broad_dir(&normalize(r"C:\Users\me\AppData\Local\Programs\Telegram"), &win));
+    }
+
+    #[test]
+    fn mac_bundle_scan_root() {
+        let sys: Vec<String> = ["/System", "/usr/bin"].iter().map(|d| normalize(d)).collect();
+        let root = |p: &str| app_scan_root(Path::new(p), &sys);
+        assert_eq!(
+            root("/Applications/Foo.app/Contents/MacOS/foo"),
+            Some(PathBuf::from("/Applications/Foo.app"))
+        );
+        // 嵌套的辅助程序包：取最外层的 .app
+        assert_eq!(
+            root("/Applications/Foo.app/Contents/Frameworks/H.app/Contents/MacOS/h"),
+            Some(PathBuf::from("/Applications/Foo.app"))
+        );
+        assert_eq!(root("/Applications/Foo.app"), Some(PathBuf::from("/Applications/Foo.app")));
+        assert_eq!(root("/usr/local/bin/tool"), None);
+        assert_eq!(root("/System/Applications/Safari.app/Contents/MacOS/Safari"), None);
+        // Windows 路径仍按目录规则
+        assert_eq!(root(r"C:\Tools\x.exe"), None);
+        assert!(root(r"C:\Program Files\Vendor\App\app.exe").is_some());
     }
 
     #[test]
@@ -526,7 +597,7 @@ mod tests {
         let learned = dir.join("learned-apps.txt");
 
         // 应用目录：用于测试 include_app_dir
-        let app_dir = dir.join("Vendor").join("App");
+        let app_dir = dir.join("Vendor").join("App.app"); // macOS/Linux 上按 .app 包扫描
         std::fs::create_dir_all(app_dir.join("bin")).unwrap();
         std::fs::write(app_dir.join("app.exe"), b"").unwrap();
         std::fs::write(app_dir.join("bin").join("updater.exe"), b"").unwrap();
@@ -537,7 +608,7 @@ mod tests {
             ..Default::default()
         }));
         let (tx, rx) = std::sync::mpsc::channel();
-        spawn(settings.clone(), Some(learned.clone()), fake_snapshot, r"C:\Windows".into(), tx);
+        spawn(settings.clone(), Some(learned.clone()), fake_snapshot, vec![normalize(r"C:\Windows")], tx);
 
         // 首次结果：子进程识别（系统目录下的 cmd/conhost 被排除，无关进程不受影响）
         let mut x = recv_extra(&rx);

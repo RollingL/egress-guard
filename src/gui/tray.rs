@@ -14,8 +14,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, ShowWindow, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, SW_RESTORE,
 };
 
+use super::backend::Backend;
 use super::icons::{shield_rgba, Shade};
-use crate::engine::{EngineHandle, Event};
 
 /// 托盘需要显示的状态。
 pub struct TrayState {
@@ -26,7 +26,7 @@ pub struct TrayState {
 pub struct TrayCtx {
     pub egui_ctx: eframe::egui::Context,
     pub show_requested: Arc<AtomicBool>,
-    pub engine: Arc<EngineHandle>,
+    pub backend: Arc<dyn Backend>,
     pub window_title: String,
 }
 
@@ -95,9 +95,9 @@ fn run(t: TrayCtx, state_rx: Receiver<TrayState>) -> anyhow::Result<()> {
             if ev.id == show.id() {
                 request_show(&t, &mut fallback_at);
             } else if ev.id == check.id() {
-                t.engine.send(Event::CheckNow);
+                t.backend.check_now();
             } else if ev.id == quit.id() {
-                super::quit(&t.engine);
+                t.backend.quit();
             }
         }
 

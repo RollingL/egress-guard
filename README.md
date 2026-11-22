@@ -8,7 +8,9 @@
 
 Rust 编写，只用 WFP 用户态 API（`fwpuclnt.dll`），**不需要安装驱动**。
 
-提供两个程序：
+另有 **macOS 版**（用系统自带的 pf 防火墙，目前只支持全局断网），见下文 [macOS 版](#macos-版)。
+
+Windows 版提供两个程序：
 
 | 程序 | 用途 |
 | --- | --- |
@@ -101,6 +103,70 @@ Register-ScheduledTask -TaskName "egress-guard-cli" -Action $action -Trigger $tr
 - 子进程识别靠每秒一次的进程快照：新出现的子进程在被识别前（约 1 秒内）可能已发出少量连接。识别结果会被记住，之后再启动就从第一刻起被阻断；对安全要求高的应用可以再开启"阻断所在目录的全部程序"，提前覆盖尚未运行的辅助程序。
 - 如果受控应用调起了浏览器等本不想阻断的程序，它也会被识别为子进程，在"受控应用"页点"忽略"即可。
 
+## macOS 版
+
+macOS 版与 Windows 版共用同一套检测、决策逻辑和界面（苹果风格侧边栏、浅色/深色、克制动效），配置格式相同。差别在拦截方式：
+
+| | Windows | macOS |
+| --- | --- | --- |
+| 拦截机制 | WFP（按应用 ID） | pf 防火墙（系统自带，按地址/端口） |
+| 按应用断网 | ✅ | ❌（见下方说明） |
+| 全局断网 | ✅ | ✅ 局域网、DNS、DHCP、IPv6 邻居发现、例外地址照常放行 |
+| 例外程序（如 VPN 客户端） | ✅ | ❌ 请把 VPN 服务器 IP 填到「例外地址」 |
+| 权限 | 界面以管理员身份运行 | 界面以普通用户运行；拦截由 root 后台服务（launchd）负责 |
+| 托盘 | 系统托盘 | 菜单栏图标（不占程序坞） |
+| 开机自启 | 任务计划程序 | 后台服务开机即保护 + 登录后在菜单栏显示 |
+| 需要签名吗 | 不需要 | 不需要（ad-hoc 签名即可运行） |
+
+### 为什么 macOS 版不能按应用断网
+
+macOS 上唯一能按应用拦截出站连接的官方机制是 **Network Extension 内容过滤（NEFilterDataProvider 系统扩展）**，Little Snitch、LuLu 都用它。它要求：
+
+- 付费的 Apple Developer Program 账号（每年 99 美元）；
+- 申请 Network Extension 能力，用 Developer ID 签名并通过 Apple 公证；
+- 用户首次运行时在「系统设置 → 隐私与安全性」中手动允许系统扩展和内容过滤。
+
+没有签名的扩展系统根本不会加载，所以免签名版本只能用 pf。pf 只认地址、端口和用户，分不清是哪个应用发出的连接。界面里「受控应用」「例外程序」的列表会保留在配置中，供以后的签名版本使用。
+
+### 安装与使用
+
+1. 下载 `egress-guard-<版本>-macos.zip`，解压后把 **Egress Guard.app** 拖到「应用程序」文件夹（Apple 芯片和 Intel 都可以用）。
+2. 第一次打开：因为没有 Apple 公证，系统会提示"无法验证开发者"。在 Finder 里右键 → 打开；macOS 15 起需要到「系统设置 → 隐私与安全性」底部点"仍要打开"。也可以在终端执行 `xattr -dr com.apple.quarantine "/Applications/Egress Guard.app"`。
+3. 概览页点 **安装后台服务…**，输入一次管理员密码。之后修改设置、开机自启都不再需要密码（修改设置要求当前用户是管理员）。
+4. **出口 IP 白名单** 页添加当前出口 IP；**全局断网** 页打开"不在白名单时切断全部网络"，按需保留局域网、DNS，并把 VPN 服务器地址加入例外地址。底部点"保存并应用"。
+
+菜单栏图标颜色与 Windows 托盘相同：绿色放行，红色阻断，灰色检测中/未连接，黄色模拟模式。点关闭按钮只是隐藏窗口；菜单栏图标里选「退出（解除所有阻断）」会让后台服务移除全部规则并停止，下次打开界面时服务会自动重新启动。
+
+### macOS 工作原理
+
+| 部分 | 实现 |
+| --- | --- |
+| 后台服务 | `/Library/LaunchDaemons/com.egressguard.daemon.plist`，以 root 运行 `/Library/Application Support/EgressGuard/bin/egress-guard daemon`（安装时从 .app 里复制，移动或删除 .app 不影响已安装的服务）。配置在同目录的 `config.toml`，日志在 `/Library/Logs/egress-guard.log`。 |
+| 界面通信 | launchd 创建的本地套接字 `/var/run/egress-guard.sock`，每行一个 JSON。界面连接时服务按需启动；只读请求所有用户可用，修改设置只接受 root 和管理员组。 |
+| 拦截 | 规则装入 `com.apple/egress-guard` 子锚点（系统默认的 `/etc/pf.conf` 已经引用 `com.apple/*`，不修改系统文件）。阻断时用 `pfctl -E` 取得启用令牌，放行时 `pfctl -X` 归还，不影响 pf 原本是否开启。 |
+| 断网期间检测出口 IP | 检测在以 `nobody` 身份运行的子进程里进行，pf 规则按套接字所属用户（`user nobody`）放行它，而不是放行全部 root 进程。 |
+| 已有连接 | 例外规则不建立状态，兜底规则直接丢弃，所以开始阻断前已经建立的连接在下一个数据包就会被拦截，同时局域网等例外连接不受影响。 |
+| 网络变化 | 监听路由套接字（地址增删、网卡状态、非主机路由变化），忽略 AirDrop 等频繁开关的 awdl/llw 接口；变化后与 Windows 一样先阻断、防抖后重新检测。 |
+| 异常退出 | pf 规则不会随进程消失：服务崩溃时 launchd 会重启它，启动时先清空残留规则。紧急情况下可以执行 `sudo "/Applications/Egress Guard.app/Contents/MacOS/egress-guard" unblock`。 |
+
+命令行（在 `Egress Guard.app/Contents/MacOS/` 里）：
+
+```bash
+egress-guard status              # 后台服务状态（JSON）
+egress-guard apply my.toml       # 把配置交给后台服务，立即生效
+egress-guard check-now           # 立即检测出口 IP
+egress-guard stop                # 移除全部规则并停止服务
+sudo egress-guard service install    # 安装 / 更新后台服务
+sudo egress-guard service uninstall  # 卸载（保留配置）
+sudo egress-guard unblock        # 紧急恢复：清空 pf 规则
+```
+
+卸载：设置页"后台服务 → 卸载…"，然后删除 .app；如需彻底清理，再删除 `/Library/Application Support/EgressGuard` 和 `~/Library/LaunchAgents/com.egressguard.gui.plist`。
+
+### 以后要做按应用断网需要什么
+
+拿到 Apple Developer 账号后，可以在现有结构上增加一个 Network Extension 后端：Swift 写的内容过滤系统扩展负责逐个连接放行/丢弃，Rust 后台服务通过 XPC 把"是否阻断 + 受控应用列表"发给它，子进程识别（`src/mac/procs.rs` 已能枚举进程树）和界面可以直接复用。打包脚本已支持 `SIGN_IDENTITY` 环境变量，用 Developer ID 签名并开启 hardened runtime。
+
 ## 从源码构建
 
 ```powershell
@@ -117,15 +183,27 @@ sudo apt install gcc-mingw-w64-x86-64
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-单元测试（白名单匹配、IP 解析、决策逻辑）可在任意平台运行：`cargo test`。
+macOS（需要 Xcode 命令行工具和 Rust）：
+
+```bash
+scripts/macos/bundle.sh              # 本机架构，生成 target/macos/Egress Guard.app 和 zip
+scripts/macos/bundle.sh --universal  # Apple 芯片 + Intel 通用版本
+```
+
+单元测试（白名单匹配、IP 解析、决策逻辑、pf 规则生成、本地通信协议）可在任意平台运行：`cargo test`。
+
+CI（`.github/workflows/ci.yml`）在 Linux、Windows、macOS 上测试和构建；macOS 任务还会在 GitHub 的 Mac 虚拟机上安装后台服务，实际验证全局断网、例外地址、白名单放行和退出恢复（`scripts/macos/ci-e2e.sh`）。
 
 ## 代码结构
 
 ```
 src/
-  bin/cli.rs        命令行入口
+  bin/cli.rs        命令行入口（macOS 上也是后台服务和管理工具）
   bin/gui.rs        界面入口（单实例、--minimized）
   engine.rs         后台引擎线程：定时检测、网络变化、配置热更新、退出
+  daemon.rs         后台服务：运行引擎 + 本地套接字（macOS）
+  ipc.rs            界面与后台服务的通信协议（JSON 行）
+  pfrules.rs        pf 规则文本生成（与平台无关，可测试）
   config.rs         TOML 配置解析/保存、白名单（IP/CIDR）匹配
   egress.rs         公网出口 IP 查询（ureq + 系统 TLS）
   controller.rs     阻断/放行决策逻辑，Firewall 抽象，dry-run 后端
@@ -133,15 +211,22 @@ src/
   discovery.rs      子进程 / 同目录关联程序识别
   logbuf.rs         日志（stderr / 文件 / 界面）
   gui/mod.rs        界面页面（eframe/egui）
+  gui/backend.rs    界面背后的引擎：本进程（Windows）或后台服务（macOS）
   gui/theme.rs      苹果风格配色、样式和自绘控件（开关、分段控件、卡片、图标）
   gui/tray.rs       系统托盘（独立消息循环线程）
+  gui/tray_mac.rs   macOS 菜单栏图标
   gui/icons.rs      运行时绘制的状态图标
   win/wfp.rs        WFP 动态会话、子层、按应用 ID 的阻断过滤器、全局断网规则
   win/netwatch.rs   网卡/地址/路由变化监听
   win/tcpkill.rs    断开已有的 IPv4 TCP 连接
   win/procs.rs      进程枚举
   win/autostart.rs  任务计划程序开机自启
+  mac/pf.rs         pf 锚点规则、启用令牌
+  mac/service.rs    launchd 后台服务安装/卸载、登录项、管理员授权
+  mac/netwatch.rs   路由套接字监听网络变化
+  mac/procs.rs      进程枚举（libproc）
 assets/             exe 图标、界面程序清单（requireAdministrator）
+scripts/macos/      .app 打包、Info.plist、CI 端到端测试
 ```
 
 在 Linux 上可以预览界面布局（没有托盘和 WFP，会进入模拟模式）：`cargo run --bin egress-guard-gui -- config.toml`。
