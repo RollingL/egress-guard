@@ -65,7 +65,7 @@ jobs:
           $out = Join-Path $env:RUNNER_TEMP 'clipboard.json'
           Set-Clipboard -Value 'before'
           $err = Join-Path $env:RUNNER_TEMP 'clipboard.err'
-          $p = Start-Process (Join-Path $env:RUNNER_TEMP 'gui\egress-guard-gui.exe') -ArgumentList '--clipboard-selftest', $out, '10' -PassThru -RedirectStandardError $err
+          $p = Start-Process (Join-Path $env:RUNNER_TEMP 'gui\egress-guard-gui.exe') -ArgumentList '--clipboard-selftest', $out, '16' -PassThru -RedirectStandardError $err
           Start-Sleep 8
           if ($p.HasExited) { Get-Content $err -ErrorAction SilentlyContinue; Write-Error "自检窗口启动失败（退出码 $($p.ExitCode)）" }
           $copied = Get-Clipboard -Raw
