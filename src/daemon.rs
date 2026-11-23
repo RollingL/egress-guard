@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use crate::config::{Config, RawConfig};
+use crate::config::{Config, Loaded, RawConfig};
 use crate::engine::{self, Event};
 use crate::ipc::{self, Handler, HelloInfo, StatusHub};
 
@@ -94,10 +94,18 @@ fn autostart_enabled() -> bool {
 }
 
 /// 读取配置；不存在时创建默认配置（与 Windows 相同，默认不开启全局断网，安装后不会立刻断网）。
-fn load_or_create(path: &Path) -> Result<Config> {
+/// 配置文件有误时改用最近一次有效的配置（第二项说明恢复情况）。
+fn load_or_create(path: &Path) -> Loaded {
     if path.exists() {
-        return Config::load(path);
+        return Config::load_recovering(path);
     }
+    match create_default(path) {
+        Ok(cfg) => Loaded::Ok(cfg),
+        Err(e) => Loaded::Failed { error: format!("{e:#}"), broken: None },
+    }
+}
+
+fn create_default(path: &Path) -> Result<Config> {
     let cfg = Config::from_raw(RawConfig::default())?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("无法创建 {}", dir.display()))?;
@@ -117,19 +125,32 @@ fn listener(socket: &Path) -> Result<std::os::unix::net::UnixListener> {
 
 /// 运行后台服务，直到收到 SIGTERM/SIGINT 或界面请求退出。
 pub fn run(opts: Options) -> Result<()> {
+    let saved_as = |broken: &Option<std::path::PathBuf>| match broken {
+        Some(b) => format!("原文件已另存为 {}。", b.display()),
+        None => String::new(),
+    };
     let (cfg, load_error) = match load_or_create(&opts.config_path) {
-        Ok(c) => (c, None),
-        Err(e) => {
-            // 配置损坏时仍然启动，并按最安全的方式（全局断网）运行，界面可以重新保存
-            log::error!("{e:#}");
+        Loaded::Ok(c) => (c, None),
+        Loaded::LastGood { cfg: c, error, broken } => {
+            let msg = format!(
+                "后台服务已改用最近一次有效的配置运行（保护设置与上次成功保存时相同）。{}检查各项设置后点「保存并应用」，会覆盖有误的文件。{error}",
+                saved_as(&broken)
+            );
+            (c, Some(msg))
+        }
+        Loaded::Failed { error: e, broken } => {
+            // 配置损坏、也没有最近有效的配置时仍然启动，并按最安全的方式（全局断网）运行，界面可以重新保存
+            log::error!("{e}");
+            log::warn!("配置文件有误，按默认设置并开启全局断网运行；在界面里保存设置会覆盖损坏的配置文件");
             let mut raw = RawConfig::default();
             raw.block_all.enabled = true;
-            (Config::from_raw(raw)?, Some(e))
+            let msg = format!(
+                "为安全起见，后台服务正按默认设置运行并开启了全局断网。{}检查各项设置后点「保存并应用」，会覆盖损坏的文件。{e}",
+                saved_as(&broken)
+            );
+            (Config::from_raw(raw)?, Some(msg))
         }
     };
-    if load_error.is_some() {
-        log::warn!("配置文件有误，按默认设置并开启全局断网运行；在界面里保存设置会覆盖损坏的配置文件");
-    }
     let listener = listener(&opts.socket)?;
     let hub = Arc::new(StatusHub::default());
     let reporter: engine::Reporter = {
@@ -144,7 +165,7 @@ pub fn run(opts: Options) -> Result<()> {
         config_path: opts.config_path.clone(),
         log_path: opts.log_path.clone(),
         raw: Mutex::new(cfg.to_raw()),
-        config_error: Mutex::new(load_error.map(|e| format!("{e:#}"))),
+        config_error: Mutex::new(load_error),
     });
     ipc::serve(listener, daemon, hub);
     // 告诉网络扩展服务在运行。扩展只在这个文件存在时才连接套接字，

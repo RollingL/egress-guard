@@ -166,7 +166,8 @@ impl EgressDetector {
             .map_err(|e| anyhow!("无法启动检测子进程: {e}"))?;
         // 每个服务最多 timeout（IPv6 同时请求，总共最多 timeout），再留一些余量
         let n = if self.family == Family::V6 { 1 } else { (self.services.len() as u32).max(1) };
-        let deadline = Instant::now() + self.timeout * n + Duration::from_secs(5);
+        let wait = self.timeout.saturating_mul(n).saturating_add(Duration::from_secs(5));
+        let deadline = Instant::now().checked_add(wait).unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
         loop {
             if child.try_wait()?.is_some() {
                 break;
@@ -202,9 +203,14 @@ impl EgressDetector {
                 }
             }
         };
-        // 走代理时本机路由无关：要验证的是代理的出口，连不上代理、代理没有这个地址族的出口都算失败
-        if !self.via_proxy() && !has_route(v6) {
-            return Probe::NoRoute;
+        // 走代理时本机路由无关：要验证的是代理的出口，连不上代理、代理没有这个地址族的出口都算失败。
+        // 判断不了有没有路由时照常检测：测不到就是 Failed，而不是当作没有路由跳过验证
+        if !self.via_proxy() {
+            match has_route(v6) {
+                Route::Yes => {}
+                Route::No => return Probe::NoRoute,
+                Route::Unknown => log::debug!("无法判断本机有没有{}路由，按有路由检测", if v6 { " IPv6 " } else { " IPv4 " }),
+            }
         }
         match self.detect() {
             Ok(ip) => Probe::Verified(ip),
@@ -286,25 +292,63 @@ pub enum Probe {
     Failed(String),
 }
 
+/// 本机有没有某个地址族通往公网的路由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// 系统为公网地址选出了可用的源地址。
+    Yes,
+    /// 确认没有：系统不支持这个地址族、没有通往公网的路由，或只能选出链路本地 / 未指定的源地址。
+    No,
+    /// 无法判断（权限、资源不足等临时错误）：不能当作「没有路由」而跳过验证，要按配置的服务实际检测。
+    Unknown,
+}
+
 /// 本机有没有通往公网的 IPv4 / IPv6 路由。
 ///
-/// 用 UDP 套接字 connect 一个公网地址：只查路由表、不发任何数据包；没有路由时 connect 失败，
-/// 或者系统只能选出未指定 / 链路本地的源地址。
-pub fn has_route(v6: bool) -> bool {
+/// 用 UDP 套接字 connect 一个公网地址：只查路由表、不发任何数据包。只有系统明确报告「不支持这个地址族 /
+/// 网络不可达」，或者只能选出未指定 / 链路本地的源地址时才算没有路由；其他错误一律是 [`Route::Unknown`]。
+pub fn has_route(v6: bool) -> Route {
     use std::net::UdpSocket;
     let (bind, target) =
         if v6 { ("[::]:0", "[2001:4860:4860::8888]:443") } else { ("0.0.0.0:0", "8.8.8.8:443") };
-    let Ok(s) = UdpSocket::bind(bind) else { return false };
-    if s.connect(target).is_err() {
-        return false;
+    let s = match UdpSocket::bind(bind) {
+        Ok(s) => s,
+        Err(e) => return route_error(&e),
+    };
+    if let Err(e) = s.connect(target) {
+        return route_error(&e);
     }
-    match s.local_addr().map(|a| a.ip()) {
-        Ok(IpAddr::V4(a)) => !v6 && !a.is_unspecified() && !a.is_loopback() && !a.is_link_local(),
-        Ok(IpAddr::V6(a)) => {
-            // fe80::/10
-            v6 && !a.is_unspecified() && !a.is_loopback() && (a.segments()[0] & 0xffc0) != 0xfe80
-        }
-        Err(_) => false,
+    match s.local_addr() {
+        Ok(a) => route_from_source(v6, a.ip()),
+        Err(e) => route_error(&e),
+    }
+}
+
+/// 按系统为公网目的地选出的源地址判断。
+pub fn route_from_source(v6: bool, src: IpAddr) -> Route {
+    let usable = match src {
+        IpAddr::V4(a) => !v6 && !a.is_unspecified() && !a.is_loopback() && !a.is_link_local(),
+        // fe80::/10
+        IpAddr::V6(a) => v6 && !a.is_unspecified() && !a.is_loopback() && (a.segments()[0] & 0xffc0) != 0xfe80,
+    };
+    if usable { Route::Yes } else { Route::No }
+}
+
+/// 只有「地址族不受支持」和「网络 / 主机不可达、没有可用的源地址」才确认没有路由。
+pub fn route_error(e: &std::io::Error) -> Route {
+    use std::io::ErrorKind::*;
+    if matches!(e.kind(), NetworkUnreachable | HostUnreachable | AddrNotAvailable) {
+        return Route::No;
+    }
+    #[cfg(unix)]
+    const AF_NOT_SUPPORTED: [i32; 2] = [libc::EAFNOSUPPORT, libc::EPROTONOSUPPORT];
+    #[cfg(windows)]
+    const AF_NOT_SUPPORTED: [i32; 2] = [10047 /* WSAEAFNOSUPPORT */, 10043 /* WSAEPROTONOSUPPORT */];
+    #[cfg(not(any(unix, windows)))]
+    const AF_NOT_SUPPORTED: [i32; 0] = [];
+    match e.raw_os_error() {
+        Some(code) if AF_NOT_SUPPORTED.contains(&code) => Route::No,
+        _ => Route::Unknown,
     }
 }
 
@@ -316,11 +360,12 @@ pub fn has_route(v6: bool) -> bool {
 pub fn combine(v4: Probe, v6: Probe, whitelisted: impl Fn(IpAddr) -> bool) -> Result<Egress> {
     use Probe::*;
     match (v4, v6) {
-        (Verified(a), Verified(b)) => Ok(Egress { ip: a, v6: Some(b) }),
-        (Verified(a), NoRoute) => Ok(Egress { ip: a, v6: None }),
-        (NoRoute, Verified(b)) => Ok(Egress { ip: b, v6: None }),
-        (Verified(a), Failed(_)) if !whitelisted(a) => Ok(Egress { ip: a, v6: None }),
-        (Failed(_), Verified(b)) if !whitelisted(b) => Ok(Egress { ip: b, v6: None }),
+        (Verified(a), Verified(b)) => Ok(Egress::dual(a, Some(b))),
+        (Verified(a), NoRoute) => Ok(Egress::dual(a, None)),
+        (NoRoute, Verified(b)) => Ok(Egress::dual(b, None)),
+        // 另一个地址族没测到：结果只够用来阻断，标记出来，之后改白名单时不能据此放行
+        (Verified(a), Failed(_)) if !whitelisted(a) => Ok(Egress { ip: a, v6: None, v6_unverified: true }),
+        (Failed(_), Verified(b)) if !whitelisted(b) => Ok(Egress { ip: b, v6: None, v6_unverified: true }),
         (Verified(_), Failed(e)) => Err(anyhow!(
             "IPv6 出口检测失败，无法确认 IPv6 流量从哪里出去：{e}。\
              如果 VPN 或代理不支持 IPv6，可以在设置里把 IPv6 改为「始终阻断」"
@@ -366,9 +411,9 @@ impl Detectors {
     /// 检测一次。「检测 IPv6 出口」时 IPv4、IPv6 同时检测。
     pub fn detect(&self) -> Result<Egress> {
         match self.mode {
-            Ipv6Mode::Off => Ok(Egress { ip: self.main.detect()?, v6: None }),
+            Ipv6Mode::Off => Ok(Egress::v4(self.main.detect()?)),
             Ipv6Mode::Block => match self.main.probe() {
-                Probe::Verified(ip) => Ok(Egress { ip, v6: None }),
+                Probe::Verified(ip) => Ok(Egress::v4(ip)),
                 Probe::NoRoute => Err(anyhow!("本机没有可用的 IPv4 网络（IPv6 已设为始终阻断）")),
                 Probe::Failed(e) => Err(anyhow!("{e}")),
             },
@@ -398,7 +443,26 @@ fn query(agent: &Agent, url: &str) -> Result<IpAddr> {
 pub fn extract_ip(body: &str) -> Option<IpAddr> {
     body.split(|c: char| !(c.is_ascii_hexdigit() || c == '.' || c == ':'))
         .filter(|t| !t.is_empty())
-        .find_map(|t| t.trim_matches(|c| c == '.' || c == ':').parse().ok())
+        .find_map(parse_candidate)
+}
+
+/// 解析一个候选片段：先按完整地址解析（保留 `::`、末尾压缩和 IPv4 映射地址），
+/// 不行时再去掉说明文字带来的外层标点（句尾的 `.`、「IP:」后面的 `:`）。
+fn parse_candidate(t: &str) -> Option<IpAddr> {
+    let ok = |ip: IpAddr| (!ip.is_unspecified()).then_some(ip);
+    if let Ok(ip) = t.parse() {
+        return ok(ip);
+    }
+    // 句尾的点：「…是 203.0.113.9.」「…是 2001:db8::.」
+    let t = t.trim_end_matches('.');
+    if let Ok(ip) = t.parse() {
+        return ok(ip);
+    }
+    // 前面的点、单个冒号（「IP:2001:db8::1」）；`::` 开头 / 结尾是地址本身的一部分，不能去掉
+    let t = t.trim_start_matches('.');
+    let t = if t.starts_with("::") { t } else { t.strip_prefix(':').unwrap_or(t) };
+    let t = if t.ends_with("::") { t } else { t.strip_suffix(':').unwrap_or(t) };
+    t.parse().ok().and_then(ok)
 }
 
 fn truncate(s: &str) -> String {
@@ -421,6 +485,52 @@ mod tests {
         assert_eq!(extract_ip("<html>error</html>"), None);
     }
 
+    #[test]
+    fn extracts_compressed_and_mapped_ipv6() {
+        // 末尾压缩、IPv4 映射地址：以前会被去掉首尾的冒号而解析失败
+        assert_eq!(extract_ip("2001:db8:1234::"), Some(ip("2001:db8:1234::")));
+        assert_eq!(extract_ip("2001:db8:1234::\n"), Some(ip("2001:db8:1234::")));
+        assert_eq!(extract_ip("::ffff:192.0.2.8"), Some(ip("::ffff:192.0.2.8")));
+        // 映射地址规范化后按 IPv4 分类
+        assert_eq!(crate::config::normalize(extract_ip("::ffff:192.0.2.8").unwrap()), ip("192.0.2.8"));
+        let v4 = EgressDetector::with_family(vec![], Duration::from_secs(1), Family::V4);
+        assert_eq!(v4.check_family(ip("::ffff:192.0.2.8")).unwrap(), ip("192.0.2.8"));
+        let v6 = EgressDetector::with_family(vec![], Duration::from_secs(1), Family::V6);
+        assert!(v6.check_family(ip("::ffff:192.0.2.8")).is_err());
+        // 普通双栈地址、括号、句尾标点、前缀说明
+        assert_eq!(extract_ip("2001:db8::9"), Some(ip("2001:db8::9")));
+        assert_eq!(extract_ip("[2001:db8::9]:443"), Some(ip("2001:db8::9")));
+        assert_eq!(extract_ip("你的地址是 2001:db8:1234::。"), Some(ip("2001:db8:1234::")));
+        assert_eq!(extract_ip("addr 2001:db8:1234::."), Some(ip("2001:db8:1234::")));
+        assert_eq!(extract_ip("IP:2001:db8::1"), Some(ip("2001:db8::1")));
+        assert_eq!(extract_ip("ip: 203.0.113.7."), Some(ip("203.0.113.7")));
+        // 错误文本、孤立的 `::` 不是出口地址
+        assert_eq!(extract_ip("error: bad gateway"), None);
+        assert_eq!(extract_ip("a :: b"), None);
+    }
+
+    #[test]
+    fn route_errors_are_not_all_no_route() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(route_error(&Error::from(ErrorKind::NetworkUnreachable)), Route::No);
+        assert_eq!(route_error(&Error::from(ErrorKind::HostUnreachable)), Route::No);
+        assert_eq!(route_error(&Error::from(ErrorKind::AddrNotAvailable)), Route::No);
+        // 权限、资源不足等临时错误：不知道，不能跳过验证
+        assert_eq!(route_error(&Error::from(ErrorKind::PermissionDenied)), Route::Unknown);
+        assert_eq!(route_error(&Error::other("资源不足")), Route::Unknown);
+        #[cfg(unix)]
+        {
+            assert_eq!(route_error(&Error::from_raw_os_error(libc::EAFNOSUPPORT)), Route::No);
+            assert_eq!(route_error(&Error::from_raw_os_error(libc::EMFILE)), Route::Unknown);
+        }
+        assert_eq!(route_from_source(false, ip("192.168.1.5")), Route::Yes);
+        assert_eq!(route_from_source(false, ip("0.0.0.0")), Route::No);
+        assert_eq!(route_from_source(false, ip("169.254.1.1")), Route::No);
+        assert_eq!(route_from_source(true, ip("2001:db8::5")), Route::Yes);
+        assert_eq!(route_from_source(true, ip("fe80::1")), Route::No);
+        assert_eq!(route_from_source(true, ip("::")), Route::No);
+    }
+
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
@@ -434,16 +544,19 @@ mod tests {
         let bad4 = || Verified(ip("198.51.100.1"));
         let fail = || Failed("超时".into());
         // 双栈：两个都测到
-        assert_eq!(combine(v4(), v6(), wl).unwrap(), Egress { ip: ip("203.0.113.9"), v6: Some(ip("2001:db8::9")) });
+        assert_eq!(combine(v4(), v6(), wl).unwrap(), Egress::dual(ip("203.0.113.9"), Some(ip("2001:db8::9"))));
         // 单栈
-        assert_eq!(combine(v4(), NoRoute, wl).unwrap(), Egress { ip: ip("203.0.113.9"), v6: None });
-        assert_eq!(combine(NoRoute, v6(), wl).unwrap(), Egress { ip: ip("2001:db8::9"), v6: None });
+        assert_eq!(combine(v4(), NoRoute, wl).unwrap(), Egress::v4(ip("203.0.113.9")));
+        assert_eq!(combine(NoRoute, v6(), wl).unwrap(), Egress::v4(ip("2001:db8::9")));
         // IPv4 在白名单，但有 IPv6 路由却测不到：不能放行
         let e = combine(v4(), fail(), wl).unwrap_err().to_string();
         assert!(e.contains("IPv6 出口检测失败"), "{e}");
         assert!(combine(fail(), v6(), wl).is_err());
         // 另一个地址族已经不在白名单：直接给出结果（反正要阻断）
         assert_eq!(combine(bad4(), fail(), wl).unwrap().ip, ip("198.51.100.1"));
+        // 这样的结果标记为 IPv6 未验证：之后改白名单时不能据此放行
+        assert!(combine(bad4(), fail(), wl).unwrap().v6_unverified);
+        assert!(!combine(v4(), v6(), wl).unwrap().v6_unverified);
         // 双栈出口相反：IPv4 在白名单、IPv6 不在
         let r = combine(v4(), Verified(ip("2001:db8:ffff::1")), wl).unwrap();
         assert_eq!(r.v6, Some(ip("2001:db8:ffff::1")));

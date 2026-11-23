@@ -142,10 +142,12 @@ impl LeakScheduler {
             }
             // 定时测试：距上次测试（手动或自动）满间隔；从没测过时放行后稍等就测
             let interval_at = (lt.interval_mins > 0).then(|| {
-                let every = Duration::from_secs(lt.interval_mins * 60);
+                let every = Duration::from_secs(lt.interval_mins.saturating_mul(60));
+                let settled = allowed_since + SETTLE;
                 match self.job.meta.lock().unwrap().finished {
-                    Some(t) => (t + every).max(allowed_since + SETTLE),
-                    None => allowed_since + SETTLE,
+                    // 间隔大到超出时钟范围时等同于不定时测试
+                    Some(t) => t.checked_add(every).map_or(settled.max(now + Duration::from_secs(86400)), |at| at.max(settled)),
+                    None => settled,
                 }
             });
             let next = [change_at, interval_at].into_iter().flatten().min();

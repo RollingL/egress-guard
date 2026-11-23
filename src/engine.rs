@@ -273,7 +273,7 @@ fn run(
 
     loop {
         if ctrl.needs_retry() {
-            next_retry.get_or_insert_with(|| Instant::now() + RETRY_INTERVAL);
+            next_retry.get_or_insert_with(|| later(RETRY_INTERVAL));
         } else {
             next_retry = None;
         }
@@ -292,15 +292,16 @@ fn run(
                     adapters = a;
                 }
                 let vpn_blocked = check_vpn!();
-                if debounce_until.is_none() && !vpn_blocked {
+                // 每次网络变化都作废之前的出口（包括还没生效的放行），并按设置先行阻断；
+                // 防抖只合并之后的检测。防抖期间手动检测或改配置已经放行时，新的变化同样先阻断
+                if !vpn_blocked {
                     if let Err(e) = ctrl.on_network_change() {
                         log::error!("{e:#}");
                     }
                 }
                 // 正在进行的检测结果作废；等网络安静下来再检测
                 generation += 1;
-                debounce_until =
-                    Some(Instant::now() + Duration::from_millis(ctrl.config().behavior.debounce_ms));
+                debounce_until = Some(later(Duration::from_millis(ctrl.config().behavior.debounce_ms)));
                 next_check = None;
             }
             Ok(Event::CheckNow) => {
@@ -353,9 +354,7 @@ fn run(
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
-                    debounce_until.get_or_insert_with(|| {
-                        Instant::now() + Duration::from_millis(ctrl.config().behavior.debounce_ms)
-                    });
+                    debounce_until.get_or_insert_with(|| later(Duration::from_millis(ctrl.config().behavior.debounce_ms)));
                 }
             }
             Ok(Event::Refresh) => {}
@@ -381,7 +380,7 @@ fn run(
                     let wait = if after_change { interval.min(Duration::from_secs(15)) } else { interval };
                     after_change = false;
                     if debounce_until.is_none() {
-                        next_check = Some(Instant::now() + wait);
+                        next_check = Some(later(wait));
                     }
                 } else if debounce_until.is_none() {
                     // 检测期间网络或配置变了，结果作废，立刻重测
@@ -403,8 +402,21 @@ fn run(
                 }
                 if next_retry.is_some_and(|d| d <= now) {
                     next_retry = None;
+                    let was_blocked = ctrl.is_blocked();
                     if let Err(e) = ctrl.retry_pending() {
                         log::warn!("重试同步阻断规则失败，稍后再试: {e:#}");
+                    }
+                    // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
+                    if was_blocked && !ctrl.is_blocked() {
+                        let vcfg = &ctrl.config().vpn;
+                        guarded = if vcfg.guard { vpn::connected(&adapters, vcfg) } else { Vec::new() };
+                        if !guarded.is_empty() {
+                            log::info!("VPN 守护：{}", guarded.join("、"));
+                            if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
+                                let soon = later(Duration::from_secs(vcfg.check_interval_secs));
+                                next_check = Some(next_check.map_or(soon, |n| n.min(soon)));
+                            }
+                        }
                     }
                 }
             }
@@ -427,6 +439,13 @@ fn run(
     status.blocked = false;
     reporter(&status);
     Ok(())
+}
+
+/// 从现在起过 `d` 之后的时刻；`d` 大到超出时钟范围时取一个很远的时刻，而不是让引擎线程 panic
+/// （引擎退出会移除全部阻断规则）。
+fn later(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
 }
 
 fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {

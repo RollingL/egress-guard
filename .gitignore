@@ -2,3 +2,5 @@
 config.toml
 learned-apps.txt
 egress-guard.log
+config.toml.last-good
+config.toml.broken
