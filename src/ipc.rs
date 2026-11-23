@@ -144,6 +144,16 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
 }
 
 /// root、与服务相同的用户，以及（macOS）管理员组成员可以修改设置。
+/// 读配置的回复：GitHub 令牌、代理地址里的用户名密码只给能修改设置的账户（管理员）。
+/// 其他账户读到的配置里没有令牌，代理显示为 `***`（他们也不能保存设置，不会把 *** 写回去）。
+fn config_for(mut raw: RawConfig, admin: bool) -> RawConfig {
+    if !admin {
+        raw.update.token.clear();
+        raw.detect.proxy = crate::config::redact_proxy(&raw.detect.proxy);
+    }
+    raw
+}
+
 fn may_modify(uid: u32) -> bool {
     uid == 0 || uid == unsafe { libc::geteuid() } || is_admin(uid)
 }
@@ -224,14 +234,7 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
         let reply = match req {
             Request::Hello => Reply::Hello(handler.hello()),
             Request::GetStatus => Reply::Status(Box::new(hub.state.lock().unwrap().1.clone())),
-            Request::GetConfig => {
-                let mut raw = handler.get_config();
-                // GitHub 令牌只给能修改设置的账户（管理员）；其他账户读到的配置里没有令牌
-                if !uid.is_some_and(may_modify) {
-                    raw.update.token.clear();
-                }
-                Reply::Config(Box::new(raw))
-            }
+            Request::GetConfig => Reply::Config(Box::new(config_for(handler.get_config(), uid.is_some_and(may_modify)))),
             Request::SetConfig(raw) => match handler.set_config(*raw) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Err(format!("{e:#}")),
@@ -501,6 +504,20 @@ impl Client {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn non_admin_config_hides_credentials() {
+        let mut raw = RawConfig::default();
+        raw.update.token = "ghp_secret".into();
+        raw.detect.proxy = "http://alice:s3cret@127.0.0.1:8080".into();
+        let shown = config_for(raw.clone(), false);
+        assert!(shown.update.token.is_empty());
+        assert_eq!(shown.detect.proxy, "http://***@127.0.0.1:8080");
+        // 管理员原样拿到，编辑后保存不会丢掉凭据
+        let admin = config_for(raw.clone(), true);
+        assert_eq!(admin.update.token, raw.update.token);
+        assert_eq!(admin.detect.proxy, raw.detect.proxy);
+    }
 
     struct TestHandler {
         cfg: Mutex<RawConfig>,

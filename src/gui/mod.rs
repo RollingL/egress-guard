@@ -1276,7 +1276,8 @@ impl App {
             ui.add_space(4.0);
         }
         if let (true, Some(e)) = (s.running, &s.degraded) {
-            warning_card(ui, p, "网络扩展需要更新", e);
+            let title = if cfg!(windows) { "部分拦截规则没能加上" } else { "网络扩展需要更新" };
+            warning_card(ui, p, title, e);
             ui.add_space(4.0);
         }
         // macOS：网络扩展没连上时只有 pf 全局断网有效

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use ureq::config::IpFamily;
 
-use crate::config::{Config, Ipv6Mode};
+use crate::config::{redact_proxy, scrub_proxy, Config, Ipv6Mode};
 use crate::controller::Egress;
 use ureq::tls::{TlsConfig, TlsProvider};
 use ureq::Agent;
@@ -78,7 +78,10 @@ impl EgressDetector {
         let (parsed, proxy_error) = match proxy.as_deref().map(ureq::Proxy::new) {
             None => (None, None),
             Some(Ok(p)) => (Some(p), None),
-            Some(Err(e)) => (None, Some(format!("代理地址有误（{}）：{e}", proxy.as_deref().unwrap_or_default()))),
+            Some(Err(e)) => {
+                let p = proxy.as_deref().unwrap_or_default();
+                (None, Some(format!("代理地址有误（{}）：{}", redact_proxy(p), scrub_proxy(&e.to_string(), p))))
+            }
         };
         let agent: Agent = Agent::config_builder()
             // 使用系统 TLS（Windows 上为 SChannel，macOS 上为 Security.framework），无需额外证书
@@ -123,11 +126,20 @@ impl EgressDetector {
         self.detect_direct().map_err(|e| self.label(e))
     }
 
-    /// 走代理时在错误前注明代理，便于用户分辨是代理的问题。
+    /// 走代理时在错误前注明代理（用户名密码换成 ***），便于用户分辨是代理的问题。
+    /// 错误会进入状态、日志和连接记录，第三方库的错误里可能带着代理凭据，一并遮掉。
     fn label(&self, e: anyhow::Error) -> anyhow::Error {
         match &self.proxy {
-            Some(p) => anyhow!("通过代理 {p} 检测：{e:#}"),
+            Some(p) => anyhow!("通过代理 {} 检测：{}", redact_proxy(p), scrub_proxy(&format!("{e:#}"), p)),
             None => e,
+        }
+    }
+
+    /// 遮掉文本里的代理凭据。
+    fn scrub(&self, text: &str) -> String {
+        match &self.proxy {
+            Some(p) => scrub_proxy(text, p),
+            None => text.to_owned(),
         }
     }
 
@@ -152,18 +164,28 @@ impl EgressDetector {
             .arg(self.timeout.as_secs().max(1).to_string())
             .arg("--family")
             .arg(self.family.name())
-            .args(self.proxy.iter().flat_map(|p| ["--proxy", p.as_str()]))
+            // 代理地址可能带密码：通过管道传给子进程，不放在命令行（其他账户能看到进程参数）
+            .args(self.proxy.iter().map(|_| "--proxy-stdin"))
             .arg("--")
             .args(&self.services)
             .uid(uid)
             .gid(gid)
             .env("HOME", "/var/empty")
             .current_dir("/")
-            .stdin(Stdio::null())
+            .stdin(if self.proxy.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("无法启动检测子进程: {e}"))?;
+        if let (Some(p), Some(mut stdin)) = (&self.proxy, child.stdin.take()) {
+            use std::io::Write;
+            // 一行，写完关闭；子进程只读这一行
+            if let Err(e) = stdin.write_all(format!("{p}\n").as_bytes()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("无法把代理设置传给检测子进程: {e}"));
+            }
+        }
         // 每个服务最多 timeout（IPv6 同时请求，总共最多 timeout），再留一些余量
         let n = if self.family == Family::V6 { 1 } else { (self.services.len() as u32).max(1) };
         let wait = self.timeout.saturating_mul(n).saturating_add(Duration::from_secs(5));
@@ -234,7 +256,7 @@ impl EgressDetector {
                     return Ok(ip);
                 }
                 Err(e) => {
-                    log::debug!("{url} 查询失败: {e:#}");
+                    log::debug!("{url} 查询失败: {}", self.scrub(&format!("{e:#}")));
                     errors.push(format!("{url}: {e}"));
                 }
             }

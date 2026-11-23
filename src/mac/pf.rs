@@ -3,7 +3,9 @@
 //! - 规则装入 `com.apple/egress-guard` 子锚点（主规则集默认就会评估 `com.apple/*`），不改 `/etc/pf.conf`。
 //! - 阻断时用 `pfctl -E` 取得启用令牌，放行时用 `pfctl -X` 归还；pf 原本是否开启都不受影响。
 //! - pf 规则不随进程退出自动消失：正常退出、收到 SIGTERM 时会清空；异常退出后由 launchd 重启服务，
-//!   启动时先清空残留规则。也可以手动执行 `sudo egress-guard unblock`。
+//!   启动后第一次同步时用目标规则原子替换残留规则。也可以手动执行 `sudo egress-guard unblock`。
+//! - 同一时间只有一个进程拥有锚点：打开时取得 [`PF_LOCK`] 的独占锁（进程退出时系统自动释放），
+//!   第二个实例（例如后台服务运行时又用 sudo 运行命令行版本）打不开，不会清掉正在工作的保护。
 //! - 「始终阻断 IPv6」且开启了全局断网时，放行期间也装着只针对 IPv6 的规则（见 `pfrules::render_v6`）。
 //! - pf 只能按地址/端口/用户过滤，**不能按应用**区分：受控应用由网络扩展负责（见 `mac::firewall`），
 //!   例外程序在这里不生效。
@@ -13,6 +15,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
+use super::paths::PF_LOCK;
 use crate::controller::{Firewall, Rules};
 use crate::pfrules::{self, ANCHOR};
 
@@ -29,6 +32,37 @@ pub struct PfFirewall {
     synced_once: bool,
     /// 上次同步 pf 规则失败：引擎会定时重试（见 has_pending），直到规则真正装上。
     dirty: bool,
+    /// 锚点的所有权锁，随本对象（进程）存在。
+    _lock: std::fs::File,
+}
+
+/// 取得锚点的独占锁；已被其他进程持有时返回 Ok(None)。
+fn try_lock() -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        // /var/run 只有 root 能写；仍然不跟随符号链接
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(PF_LOCK)
+        .with_context(|| format!("无法打开 {PF_LOCK}"))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(f));
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(anyhow::Error::new(e).context(format!("无法锁定 {PF_LOCK}")))
+    }
+}
+
+/// 是否有其他进程（通常是后台服务）正在管理本工具的 pf 锚点。
+pub fn anchor_in_use() -> bool {
+    matches!(try_lock(), Ok(None))
 }
 
 fn pfctl(args: &[&str], stdin: Option<&str>) -> Result<String> {
@@ -53,11 +87,18 @@ pub fn flush_anchor() -> Result<()> {
     pfctl(&["-a", ANCHOR, "-F", "rules"], None).map(|_| ())
 }
 
-/// 确保主规则集会评估 `com.apple/*` 子锚点；没有加载时按 /etc/pf.conf 加载。
+/// 确保主规则集会评估 `com.apple/*` 子锚点；主规则集还没加载（为空）时按 /etc/pf.conf 加载。
+/// 已经加载了不含这个锚点的自定义规则集时报告原因，而不是用 /etc/pf.conf 把它整个替换掉。
 fn ensure_main_anchor() -> Result<()> {
     let main = pfctl(&["-s", "rules"], None)?;
     if pfrules::has_apple_anchor(&main) {
         return Ok(());
+    }
+    if pfrules::has_loaded_rules(&main) {
+        bail!(
+            "当前加载的 pf 主规则集不包含 anchor \"com.apple/*\"（可能是其他防火墙软件或自定义的规则），\
+             无法装入本工具的规则。为避免覆盖它，本工具不会重新加载 /etc/pf.conf；请在该规则集中加入这个锚点"
+        );
     }
     let conf = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
     if !pfrules::has_apple_anchor(&conf) {
@@ -69,20 +110,34 @@ fn ensure_main_anchor() -> Result<()> {
 }
 
 impl PfFirewall {
-    pub fn open() -> Result<Self> {
+    /// 打开 pf 后端。`start_blocked`：启动时先阻断，第一次同步直接装入阻断规则，
+    /// 不会先按「放行」同步一次再阻断。
+    pub fn open(start_blocked: bool) -> Result<Self> {
         if unsafe { libc::geteuid() } != 0 {
             bail!("pf 需要 root 权限：请安装后台服务，或用 sudo 运行命令行版本");
         }
+        // 先取得锚点的所有权，再做任何 pfctl 操作。更新后台服务时旧进程可能还在清理退出，稍等几秒
+        let mut lock = try_lock()?;
+        for _ in 0..50 {
+            if lock.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            lock = try_lock()?;
+        }
+        let Some(lock) = lock else {
+            bail!("另一个 egress-guard 实例（通常是后台服务）正在管理 pf 规则；同一时间只能运行一个实例");
+        };
         ensure_main_anchor()?;
-        // 上次异常退出可能留下规则
-        flush_anchor()?;
+        // 上次异常退出可能留下规则：不先清空，第一次同步时用目标规则原子替换（失败时保留原规则）
         Ok(Self {
-            blocked: false,
+            blocked: start_blocked,
             rules: Rules::default(),
             token: None,
             warned_allow_apps: false,
             synced_once: false,
             dirty: false,
+            _lock: lock,
         })
     }
 
@@ -154,6 +209,11 @@ impl PfFirewall {
     /// 切换阻断状态。规则装上之后才改 `blocked`：失败时仍报告原来的状态（控制器会重试这次切换），
     /// 不会让界面先显示目标状态。
     fn set_blocked(&mut self, blocked: bool) -> Result<()> {
+        // 还没收到规则：只记下状态，第一次 set_rules 按它装入（避免用空规则同步一次）
+        if !self.synced_once {
+            self.blocked = blocked;
+            return Ok(());
+        }
         let before = self.blocked;
         self.blocked = blocked;
         let r = self.sync();

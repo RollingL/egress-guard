@@ -407,7 +407,7 @@ impl Config {
 
     /// 配置里有凭据（GitHub 令牌、代理地址里的用户名密码）：文件只让所有者读写。
     pub fn has_secrets(&self) -> bool {
-        !self.update.token.is_empty() || self.detect.proxy.contains('@')
+        !self.update.token.is_empty() || proxy_has_credentials(&self.detect.proxy)
     }
 
     /// 读取配置文件用：泄露测试、IPv6 查询服务、检查更新这几项与断网保护无关，写错时改用默认值并记日志，
@@ -415,7 +415,7 @@ impl Config {
     ///
     /// 各节分别校验：只把写错的那一节改回默认值，其余各节（包括同样可容错的节）保留用户的设置。
     pub fn parse_lenient(text: &str) -> Result<Self> {
-        let mut raw: RawConfig = toml::from_str(text)?;
+        let mut raw: RawConfig = parse_toml(text)?;
         let err = match Self::from_raw(raw.clone()) {
             Ok(c) => return Ok(c),
             Err(e) => e,
@@ -458,7 +458,7 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let raw: RawConfig = toml::from_str(text)?;
+        let raw: RawConfig = parse_toml(text)?;
         Self::from_raw(raw)
     }
 
@@ -505,7 +505,9 @@ impl Config {
         detect.services.retain(|s| !s.trim().is_empty());
         detect.proxy = detect.proxy.trim().to_owned();
         if !detect.proxy.is_empty() {
-            ureq::Proxy::new(&detect.proxy).with_context(|| format!("检测代理地址有误: {:?}", detect.proxy))?;
+            if let Err(e) = ureq::Proxy::new(&detect.proxy) {
+                bail!("检测代理地址有误（{}）: {}", redact_proxy(&detect.proxy), scrub_proxy(&e.to_string(), &detect.proxy));
+            }
         }
         let mut leak_test = raw.leak_test;
         leak_test.interval_mins = clamp_field("[leak_test] interval_mins", leak_test.interval_mins, MAX_LEAK_INTERVAL_MINS);
@@ -626,10 +628,110 @@ impl Config {
     }
 }
 
+/// 解析 TOML。出错时的说明会带上出错的那几行原文，里面可能有令牌或代理密码，先遮掉。
+fn parse_toml(text: &str) -> Result<RawConfig> {
+    toml::from_str(text).map_err(|e| anyhow::anyhow!("{}", redact_text(&e.to_string())))
+}
+
+/// URL 中 `scheme://` 之后、主机之前的用户名密码部分（不含 `@`）的范围。
+fn userinfo_range(url: &str, start: usize) -> Option<(usize, usize)> {
+    let rest = &url[start..];
+    let end = rest.find(['/', '?', '#', '"', '\'', ' ', '\t', '\n', '\r']).unwrap_or(rest.len());
+    let at = rest[..end].rfind('@')?;
+    Some((start, start + at))
+}
+
+/// 代理地址是否带用户名或密码。
+pub fn proxy_has_credentials(proxy: &str) -> bool {
+    let p = proxy.trim();
+    let start = p.find("://").map_or(0, |i| i + 3);
+    userinfo_range(p, start).is_some()
+}
+
+/// 把代理地址里的用户名和密码换成 `***`，用于显示、日志和错误信息。
+pub fn redact_proxy(proxy: &str) -> String {
+    let p = proxy.trim();
+    let start = p.find("://").map_or(0, |i| i + 3);
+    match userinfo_range(p, start) {
+        Some((a, b)) => format!("{}***{}", &p[..a], &p[b..]),
+        None => p.to_owned(),
+    }
+}
+
+/// 遮掉文本里所有 URL 的用户名密码，以及 `token = ...` 这样的行（TOML 出错时的原文片段）。
+pub fn redact_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let start = i + 3;
+        match userinfo_range(rest, start) {
+            Some((a, b)) => {
+                out.push_str(&rest[..a]);
+                out.push_str("***");
+                rest = &rest[b..];
+            }
+            None => {
+                out.push_str(&rest[..start]);
+                rest = &rest[start..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.lines()
+        .map(|line| match line.find("token") {
+            Some(i) if line[i..].contains('=') => {
+                let eq = i + line[i..].find('=').unwrap_or(0);
+                format!("{} ***", &line[..=eq])
+            }
+            _ => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 遮掉文本里出现的这个代理的用户名密码（包括第三方库只打印出密码、或解码后的形式）。
+pub fn scrub_proxy(text: &str, proxy: &str) -> String {
+    let mut out = redact_text(text);
+    let p = proxy.trim();
+    let start = p.find("://").map_or(0, |i| i + 3);
+    let Some((a, b)) = userinfo_range(p, start) else { return out };
+    let userinfo = &p[a..b];
+    let password = userinfo.split_once(':').map(|(_, pw)| pw).unwrap_or("");
+    let mut secrets = vec![userinfo.to_owned(), percent_decode(userinfo)];
+    if !password.is_empty() {
+        secrets.push(password.to_owned());
+        secrets.push(percent_decode(password));
+    }
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for s in secrets.iter().filter(|s| !s.is_empty()) {
+        out = out.replace(s.as_str(), "***");
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// 原子地写入文件：在同一目录用 `create_new` 创建临时文件，写完并同步到磁盘后替换原文件。
 /// 任何一步失败时删除临时文件，原文件保持不变。
 ///
-/// `private = Some(true)`：只让所有者读写（Unix 上临时文件创建时就是 0600；Windows 上设置受保护的 ACL）。
+/// `private = Some(true)`：只让所有者读写（Unix 上临时文件创建时就是 0600；Windows 上创建时就带受保护的 ACL）。
 /// 否则 Unix 上沿用原文件的权限（显式设置，不受进程 umask 影响）；没有原文件时按 0644 创建，受 umask 约束。
 pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<()> {
     use std::io::Write;
@@ -654,7 +756,12 @@ pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<(
             let mode = if private { 0o600 } else { keep_mode.unwrap_or(0o644) };
             opts.mode(mode);
         }
-        match opts.open(&candidate) {
+        // Windows：含凭据的文件在创建时就只给 SYSTEM、管理员组和所有者访问
+        #[cfg(windows)]
+        let opened = if private { create_new_private(&candidate) } else { opts.open(&candidate) };
+        #[cfg(not(windows))]
+        let opened = opts.open(&candidate);
+        match opened {
             Ok(f) => {
                 tmp = Some((candidate, f));
                 break;
@@ -676,10 +783,6 @@ pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<(
                 f.set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
         }
-        #[cfg(windows)]
-        if private {
-            restrict_acl(&tmp_path)?;
-        }
         f.write_all(data)?;
         f.sync_all()?;
         drop(f);
@@ -693,33 +796,40 @@ pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<(
     Ok(())
 }
 
-/// Windows：只让 SYSTEM、管理员组和文件所有者访问（不继承目录的权限）。
+/// Windows：创建新文件，创建时就只让 SYSTEM、管理员组和文件所有者访问（不继承目录的权限）。
 #[cfg(windows)]
-fn restrict_acl(path: &Path) -> Result<()> {
+fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows::Win32::Security::{
-        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     };
+    let to_io = |e: windows::core::Error| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF);
     let sddl = HSTRING::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)");
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut sd, None)
-            .context("无法生成文件权限")?;
-        let file = HSTRING::from(path.as_os_str());
-        let ok = SetFileSecurityW(
-            PCWSTR(file.as_ptr()),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            sd,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut sd, None).map_err(to_io)?;
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        };
+        let name = HSTRING::from(path.as_os_str());
+        let h = CreateFileW(
+            PCWSTR(name.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_READ,
+            Some(&sa),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
         );
-        let err = std::io::Error::last_os_error();
         LocalFree(Some(HLOCAL(sd.0)));
-        if !ok.as_bool() {
-            bail!("无法设置 {} 的权限: {err}", path.display());
-        }
+        Ok(std::fs::File::from_raw_handle(h.map_err(to_io)?.0))
     }
-    Ok(())
 }
 
 /// 解析单个 IP 或 CIDR。
@@ -770,6 +880,38 @@ pub fn normalize(ip: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_credentials_are_redacted() {
+        assert!(proxy_has_credentials("http://u:p@127.0.0.1:8080"));
+        assert!(proxy_has_credentials("socks5://u@h:1"));
+        assert!(proxy_has_credentials("u:p@h:1"));
+        assert!(!proxy_has_credentials("http://127.0.0.1:8080"));
+        assert!(!proxy_has_credentials("http://127.0.0.1:8080/a@b"));
+        assert_eq!(redact_proxy("http://alice:pa@ss@127.0.0.1:8080"), "http://***@127.0.0.1:8080");
+        assert_eq!(redact_proxy(" u:p@h:1 "), "***@h:1");
+        assert_eq!(redact_proxy("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+        let text = "connect http://alice:s3cret@proxy:1/x failed; also https://ok.example/a@b";
+        assert_eq!(redact_text(text), "connect http://***@proxy:1/x failed; also https://ok.example/a@b");
+        // 第三方库只打印密码或解码后的用户名密码
+        let p = "http://alice:p%40ss@proxy:1";
+        let msg = scrub_proxy("auth failed for alice:p@ss (p%40ss)", p);
+        assert!(!msg.contains("p@ss") && !msg.contains("p%40ss"), "{msg}");
+        assert_eq!(scrub_proxy("plain error", "http://proxy:1"), "plain error");
+    }
+
+    #[test]
+    fn config_errors_hide_credentials() {
+        // 代理地址写错时不回显密码
+        let err = Config::parse(&format!("{SAMPLE}\n[detect]\nproxy=\"ftp://alice:s3cret@x\"")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ftp://***@x") && !msg.contains("s3cret"), "{msg}");
+        // TOML 语法错误时的原文片段里不带令牌、代理密码
+        for bad in ["[update]\ntoken = \"ghp_abcdef", "[detect]\nproxy = \"http://alice:s3cret@h:1\" x"] {
+            let msg = format!("{:#}", Config::parse_lenient(&format!("{SAMPLE}\n{bad}")).unwrap_err());
+            assert!(!msg.contains("ghp_abcdef") && !msg.contains("s3cret"), "{msg}");
+        }
+    }
 
     const SAMPLE: &str = r#"
 whitelist = ["203.0.113.10", "198.51.100.0/24", "2001:db8::/32", "192.0.2.77/16"]

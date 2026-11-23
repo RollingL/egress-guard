@@ -118,7 +118,7 @@ impl Backend for Local {
 
     fn set_autostart(&self, on: bool) -> Result<()> {
         if on {
-            super::platform::autostart::enable(&std::env::current_exe()?)
+            super::platform::autostart::enable(&std::env::current_exe()?, &self.config_path)
         } else {
             super::platform::autostart::disable()
         }

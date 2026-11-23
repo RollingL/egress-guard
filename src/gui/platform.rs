@@ -54,7 +54,7 @@ pub mod autostart {
     pub fn is_enabled() -> bool {
         false
     }
-    pub fn enable(_exe: &Path) -> anyhow::Result<()> {
+    pub fn enable(_exe: &Path, _config: &Path) -> anyhow::Result<()> {
         anyhow::bail!("此平台不支持")
     }
     pub fn disable() -> anyhow::Result<()> {

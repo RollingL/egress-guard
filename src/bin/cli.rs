@@ -100,9 +100,9 @@ enum Command {
         /// any / v6
         #[arg(long, default_value = "any")]
         family: String,
-        /// 设置里填写的检测代理
+        /// 从标准输入读取一行作为检测代理（代理地址可能带密码，不放在命令行）
         #[arg(long)]
-        proxy: Option<String>,
+        proxy_stdin: bool,
         services: Vec<String>,
     },
 }
@@ -119,10 +119,24 @@ enum ServiceAction {
 fn main() {
     let cli = Cli::parse();
     #[cfg(unix)]
-    if let Some(Command::Probe { timeout, family, proxy, services }) = &cli.command {
+    if let Some(Command::Probe { timeout, family, proxy_stdin, services }) = &cli.command {
         // 检测子进程：结果打印到 stdout，错误打印到 stderr 最后一行
         logbuf::init("error", true, None);
         let family = egress_guard::egress::Family::from_name(family).unwrap_or(egress_guard::egress::Family::Any);
+        let mut proxy = None;
+        if *proxy_stdin {
+            let mut line = String::new();
+            if let Err(e) = std::io::stdin().read_line(&mut line) {
+                eprintln!("无法读取代理设置: {e}");
+                std::process::exit(1);
+            }
+            // 要求走代理却没读到：明确失败，不能改成直连检测
+            if line.trim().is_empty() {
+                eprintln!("没有收到代理设置");
+                std::process::exit(1);
+            }
+            proxy = Some(line.trim().to_owned());
+        }
         let det = EgressDetector::with_proxy(services.clone(), Duration::from_secs(*timeout), family, proxy.as_deref());
         match det.detect_direct() {
             Ok(ip) => println!("{ip}"),
@@ -207,8 +221,14 @@ fn real_main(cli: Cli) -> Result<()> {
             Some(Command::Stop) => return client.command(&Request::Stop, t),
             #[cfg(target_os = "macos")]
             Some(Command::Unblock) => {
+                let active = egress_guard::mac::pf::anchor_in_use();
                 egress_guard::mac::pf::flush_anchor()?;
                 println!("已清空 pf 锚点 {} 中的规则", egress_guard::pfrules::ANCHOR);
+                if active {
+                    println!(
+                        "注意：后台服务正在运行，它下次切换或同步规则时会重新装上。要持续解除，请在界面里停止服务，或执行 service uninstall"
+                    );
+                }
                 return Ok(());
             }
             #[cfg(target_os = "macos")]
