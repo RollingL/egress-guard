@@ -171,7 +171,9 @@ fn run(
     // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
     let mut adapters: Vec<Adapter> = vpn::scan().unwrap_or_default();
-    let mut guarded: Vec<String> = Vec::new();
+    // 守护中的 VPN 网卡（名称 + 稳定标识）与上一次看到的 VPN 网卡（含地址，用来发现同名换址）
+    let mut guarded: Vec<vpn::Link> = Vec::new();
+    let mut vpn_links: Vec<vpn::Link> = vpn::links(&adapters, &cfg.vpn);
 
     let fw: Box<dyn Firewall> = if dry_run {
         status.simulated = true;
@@ -260,13 +262,13 @@ fn run(
     macro_rules! check_vpn {
         () => {{
             let cfg_vpn = &ctrl.config().vpn;
-            let connected = vpn::connected(&adapters, cfg_vpn);
-            status.vpn_connected = connected.clone();
+            vpn_links = vpn::links(&adapters, cfg_vpn);
+            status.vpn_connected = vpn::names(&vpn_links);
             let mut blocked_now = false;
             if ctrl.wants_block() || !cfg_vpn.guard {
                 guarded.clear();
             } else {
-                let lost = vpn::lost(&guarded, &connected);
+                let lost = vpn::lost(&guarded, &vpn_links);
                 if !lost.is_empty() {
                     let reason = format!("VPN 断开（{}）", lost.join("、"));
                     // 阻断失败时控制器记着目标和原因，每 5 秒重试，直到生效或被新的检测结果取代
@@ -282,7 +284,7 @@ fn run(
     }
 
     update_status(&mut status, &ctrl, checking);
-    status.vpn_connected = vpn::connected(&adapters, &ctrl.config().vpn);
+    status.vpn_connected = vpn::names(&vpn_links);
     reporter(&status);
 
     loop {
@@ -347,11 +349,12 @@ fn run(
                     }
                 };
                 // 守护的网卡设置可能变了：不再算 VPN 的网卡不再守护（而不是当作断开）
-                status.vpn_connected = vpn::connected(&adapters, &ctrl.config().vpn);
+                vpn_links = vpn::links(&adapters, &ctrl.config().vpn);
+                status.vpn_connected = vpn::names(&vpn_links);
                 if !ctrl.config().vpn.guard {
                     guarded.clear();
                 }
-                guarded.retain(|g| status.vpn_connected.contains(g));
+                guarded.retain(|g| vpn_links.iter().any(|l| l.same(g)));
                 generation += 1;
                 next_check = None;
                 start_check(&mut checking, &detector, generation);
@@ -368,9 +371,9 @@ fn run(
             }
             Ok(Event::Adapters(a)) => {
                 adapters = a;
-                let before = status.vpn_connected.clone();
-                // VPN 网卡有增减时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废
-                if check_vpn!() || status.vpn_connected != before {
+                let before = vpn_links.clone();
+                // VPN 网卡有增减、被重建或换了地址时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废
+                if check_vpn!() || vpn_links != before {
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
@@ -387,9 +390,9 @@ fn run(
                     status.last_check = Some(logbuf::now_hms());
                     // 放行时记下正在使用的 VPN 网卡，之后它一断开就立即阻断
                     let vcfg = &ctrl.config().vpn;
-                    guarded = if !ctrl.is_blocked() && vcfg.guard { vpn::connected(&adapters, vcfg) } else { Vec::new() };
-                    if !guarded.is_empty() && status.vpn_guarded != guarded {
-                        log::info!("VPN 守护：{}", guarded.join("、"));
+                    guarded = if !ctrl.is_blocked() && vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    if !guarded.is_empty() && status.vpn_guarded != vpn::names(&guarded) {
+                        log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                     }
                     let mut interval = Duration::from_secs(ctrl.config().detect.interval_secs);
                     // 通过 VPN 放行期间检测得更勤：VPN 服务器那一侧换了出口、本机网卡又没有变化时也能尽快发现
@@ -462,9 +465,9 @@ fn run(
                     // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
                     if was_blocked && !ctrl.is_blocked() {
                         let vcfg = &ctrl.config().vpn;
-                        guarded = if vcfg.guard { vpn::connected(&adapters, vcfg) } else { Vec::new() };
+                        guarded = if vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
                         if !guarded.is_empty() {
-                            log::info!("VPN 守护：{}", guarded.join("、"));
+                            log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                             if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
                                 let soon = later(Duration::from_secs(vcfg.check_interval_secs));
                                 next_check = Some(next_check.map_or(soon, |n| n.min(soon)));
@@ -478,7 +481,7 @@ fn run(
         if ctrl.wants_block() {
             guarded.clear();
         }
-        status.vpn_guarded = guarded.clone();
+        status.vpn_guarded = vpn::names(&guarded);
         status.generation = generation;
         vpn_watch.set_active(!guarded.is_empty());
         update_status(&mut status, &ctrl, checking);
