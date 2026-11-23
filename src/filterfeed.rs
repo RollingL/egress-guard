@@ -68,6 +68,8 @@ pub struct ExtInfo {
     pub caps: Vec<String>,
     /// 扩展确认已应用的规则版本（不支持确认时为 0）。
     pub applied: u64,
+    /// 这个连接实际发出过的最新规则版本：只接受不超过它的确认。
+    pub sent: u64,
 }
 
 impl ExtInfo {
@@ -173,18 +175,26 @@ impl FilterHub {
 
     pub fn register(&self, hello: FilterHello) -> Registration<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let info = ExtInfo { version: hello.version, caps: hello.caps, applied: 0 };
+        let info = ExtInfo { version: hello.version, caps: hello.caps, applied: 0, sent: 0 };
         self.clients.lock().unwrap().insert(id, info);
         self.fire();
         Registration { hub: self, id }
     }
 
-    /// 扩展确认已应用版本 `rev` 的规则。
+    /// 版本 `rev` 的规则已经写给这个连接。
+    pub fn sent(&self, reg: &Registration<'_>, rev: u64) {
+        if let Some(c) = self.clients.lock().unwrap().get_mut(&reg.id) {
+            c.sent = c.sent.max(rev);
+        }
+    }
+
+    /// 扩展确认已应用版本 `rev` 的规则。只接受这个连接确实收到过的版本
+    /// （不能确认还没发给它的版本，也不能借别的连接的版本）。
     pub fn applied(&self, reg: &Registration<'_>, rev: u64) {
         let changed = {
             let mut g = self.clients.lock().unwrap();
             match g.get_mut(&reg.id) {
-                Some(c) if rev > c.applied => {
+                Some(c) if rev > c.applied && rev <= c.sent => {
                     c.applied = rev;
                     true
                 }
@@ -286,8 +296,22 @@ impl Firewall for FeedFirewall {
         !self.decided
     }
 
+    /// 按实际规则报告缺了什么：网络扩展没有连接时，需要它的规则（阻断受控应用、受控应用的「始终阻断 IPv6」）
+    /// 都不生效；全局断网（pf）开着时这两项都由 pf 覆盖（阻断时断全部网络，IPv6 整机阻断）。
     fn degraded(&self) -> Option<String> {
-        let ext = self.hub.connected_hello()?;
+        let Some(ext) = self.hub.connected_hello() else {
+            if self.rules.apps.is_empty() || self.rules.block_all.is_some() {
+                return None;
+            }
+            let mut lost = Vec::new();
+            if self.blocked {
+                lost.push("受控应用不会被断网");
+            }
+            if self.rules.block_ipv6 {
+                lost.push("受控应用的 IPv6 连接不会被阻断（「始终阻断 IPv6」）");
+            }
+            return (!lost.is_empty()).then(|| format!("网络扩展没有连接：{}", lost.join("，")));
+        };
         if self.rules.block_ipv6 && !ext.supports(CAP_BLOCK_IPV6) {
             return Some(format!(
                 "网络扩展 {} 不支持「始终阻断 IPv6」，受控应用的 IPv6 连接不会被阻断。请更新网络扩展（重新打开界面会自动更新）",
@@ -326,10 +350,9 @@ impl Firewall for FeedFirewall {
 
 impl Drop for FeedFirewall {
     fn drop(&mut self) {
-        // 退出时让扩展放行；inner 随后自己清理（pf 清空锚点）
-        self.blocked = false;
-        self.decided = true;
-        self.publish();
+        // 退出时让扩展完全放行：发一份空规则（没有受控应用，也不再常驻阻断 IPv6），
+        // 与 pf 清空锚点一致；inner 随后自己清理
+        self.hub.set(FilterState::default());
     }
 }
 
@@ -481,7 +504,11 @@ mod tests {
         let mut fw = FeedFirewall::new(Box::new(crate::controller::DryRunFirewall::default()), hub);
         fw.set_rules(Rules { apps: vec!["/Applications/A.app".into()], block_ipv6: true, ..Default::default() }).unwrap();
         fw.unblock().unwrap();
-        assert_eq!(fw.degraded(), None, "没有扩展连接时由 per_app 提示");
+        let d = fw.degraded().unwrap();
+        assert!(d.contains("没有连接") && d.contains("IPv6") && !d.contains("断网"), "{d}");
+        fw.block().unwrap();
+        assert!(fw.degraded().unwrap().contains("受控应用不会被断网"));
+        fw.unblock().unwrap();
         let old = hub.register(FilterHello { version: "0.8.0".into(), ..Default::default() });
         assert!(fw.degraded().unwrap().contains("不支持「始终阻断 IPv6」"));
         drop(old);
@@ -496,8 +523,17 @@ mod tests {
         });
         assert_eq!(fw.degraded(), None, "宽限时间内不提示");
         hub.applied(&new, hub.version());
+        assert_eq!(hub.connected_hello().unwrap().applied, 0, "还没发给这个扩展的版本不能被确认");
+        hub.sent(&new, hub.version());
+        hub.applied(&new, hub.version());
         assert_eq!(hub.connected_hello().unwrap().applied, hub.version());
         assert_eq!(fw.degraded(), None);
+        hub.applied(&new, hub.version() + 5);
+        assert_eq!(hub.connected_hello().unwrap().applied, hub.version(), "超前的确认被忽略");
+        drop(new);
+        drop(fw);
+        let s = hub.current();
+        assert!(!s.blocked && s.apps.is_empty() && !s.block_ipv6, "退出时清空规则");
     }
 
     #[test]

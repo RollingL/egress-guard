@@ -63,36 +63,87 @@ struct FilterRules: Equatable {
         return p
     }
 
-    /// 解析后台服务的一行回复；不是规则（例如错误）时返回 nil。
-    static func parse(line: Data) -> FilterRules? {
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              obj["kind"] as? String == "filter",
-              let data = obj["data"] as? [String: Any]
-        else { return nil }
-        return FilterRules(
-            blocked: data["blocked"] as? Bool ?? false,
-            inspectExisting: data["inspect_existing"] as? Bool ?? false,
-            apps: data["apps"] as? [String] ?? [],
-            blockIPv6: data["block_ipv6"] as? Bool ?? false
-        )
+    /// 后台服务的一行回复。
+    enum Message: Equatable {
+        /// 规则；rev 是版本号（0.9.1 起），旧服务不带。
+        case rules(FilterRules, rev: UInt64?)
+        /// 服务报错（{"kind":"err","data":"..."}）。
+        case error(String)
+        /// 规则消息格式不对：保留上一份规则，不确认。
+        case invalid(String)
+        /// 其他回复，忽略。
+        case other
     }
 
-    /// 规则的版本号（data.rev，0.9.1 起）；没有时为 nil。扩展应用规则后回复 filter_applied。
+    /// 严格解析一行回复：规则消息必须带 blocked、inspect_existing（布尔）和 apps（字符串数组），
+    /// block_ipv6 可选（布尔），rev 可选（非负整数）。缺字段或类型不对时返回 .invalid，
+    /// 不会把坏消息当成「放行、没有受控应用」。
+    static func decode(line: Data) -> Message {
+        guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+            return .invalid("无法解析的消息")
+        }
+        switch obj["kind"] as? String {
+        case "filter"?:
+            break
+        case "err"?:
+            return .error(obj["data"] as? String ?? "未知错误")
+        default:
+            return .other
+        }
+        guard let data = obj["data"] as? [String: Any] else { return .invalid("规则消息缺少 data") }
+        func flag(_ key: String, required: Bool) -> Result<Bool, DecodeError> {
+            guard let v = data[key] else { return required ? .failure(.missing(key)) : .success(false) }
+            guard let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { return .failure(.type(key)) }
+            return .success(n.boolValue)
+        }
+        do {
+            let blocked = try flag("blocked", required: true).get()
+            let inspect = try flag("inspect_existing", required: true).get()
+            let v6 = try flag("block_ipv6", required: false).get()
+            guard let rawApps = data["apps"] else { throw DecodeError.missing("apps") }
+            guard let apps = rawApps as? [String] else { throw DecodeError.type("apps") }
+            var rev: UInt64?
+            if let v = data["rev"] {
+                guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { throw DecodeError.type("rev") }
+                let d = n.doubleValue
+                guard d >= 0, d == d.rounded(), d < 1.8e19 else { throw DecodeError.type("rev") }
+                rev = n.uint64Value
+            }
+            return .rules(FilterRules(blocked: blocked, inspectExisting: inspect, apps: apps, blockIPv6: v6), rev: rev)
+        } catch let e as DecodeError {
+            return .invalid(e.description)
+        } catch {
+            return .invalid("\(error)")
+        }
+    }
+
+    enum DecodeError: Error, CustomStringConvertible {
+        case missing(String)
+        case type(String)
+        var description: String {
+            switch self {
+            case .missing(let k): return "规则消息缺少 \(k)"
+            case .type(let k): return "规则消息的 \(k) 类型不对"
+            }
+        }
+    }
+
+    /// 解析后台服务的一行规则；不是规则、或者格式不对时返回 nil。
+    static func parse(line: Data) -> FilterRules? {
+        if case .rules(let r, _) = decode(line: line) { return r }
+        return nil
+    }
+
+    /// 规则的版本号（data.rev，0.9.1 起）；没有时、或者规则格式不对时为 nil。扩展应用规则后回复 filter_applied。
     static func parseRev(line: Data) -> UInt64? {
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              obj["kind"] as? String == "filter",
-              let data = obj["data"] as? [String: Any],
-              let rev = data["rev"] as? NSNumber
-        else { return nil }
-        return rev.uint64Value
+        if case .rules(_, let rev) = decode(line: line) { return rev }
+        return nil
     }
 
     /// 后台服务回复的错误文字（{"kind":"err","data":"..."}）。
     static func parseError(line: Data) -> String? {
-        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              obj["kind"] as? String == "err"
-        else { return nil }
-        return obj["data"] as? String ?? "未知错误"
+        if case .error(let e) = decode(line: line) { return e }
+        return nil
     }
 
     /// 这个程序（可执行文件完整路径）是否受控。

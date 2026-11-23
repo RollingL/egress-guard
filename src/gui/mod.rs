@@ -1304,20 +1304,26 @@ impl App {
             warning_card(ui, p, "切换没有生效，正在重试", &format!("{e}。每 5 秒自动重试一次，生效后这条提示会消失。"));
             ui.add_space(4.0);
         }
-        if let (true, Some(e)) = (s.running, &s.degraded) {
-            let title = if cfg!(windows) { "部分拦截规则没能加上" } else { "网络扩展需要更新" };
+        // macOS：网络扩展没连上时只有 pf 全局断网有效（这时由下面的卡片说明，不再重复提示）
+        let no_ext = !s.per_app && s.running && !s.simulated && !self.applied.block_all.enabled;
+        if let (true, Some(e)) = (s.running && (cfg!(windows) || !no_ext), &s.degraded) {
+            let title = if cfg!(windows) { "部分拦截规则没能加上" } else { "网络扩展的规则没有完全生效" };
             warning_card(ui, p, title, e);
             ui.add_space(4.0);
         }
-        // macOS：网络扩展没连上时只有 pf 全局断网有效
-        if !s.per_app && s.running && !s.simulated && !self.applied.block_all.enabled {
+        if no_ext {
             let mut go = None;
             let body = if self.applied.apps.is_empty() {
-                "还没有添加受控应用，全局断网也没有开启：出口 IP 不在白名单时不会拦截任何连接。"
+                "还没有添加受控应用，全局断网也没有开启：出口 IP 不在白名单时不会拦截任何连接。".to_owned()
             } else {
-                "网络扩展没有启用，出口 IP 不在白名单时受控应用不会被断网。可以启用网络扩展，或者开启全局断网。"
+                let v6 = if self.applied.ipv6.mode == Ipv6Mode::Block {
+                    "「始终阻断 IPv6」对受控应用也不会生效。"
+                } else {
+                    ""
+                };
+                format!("网络扩展没有启用，出口 IP 不在白名单时受控应用不会被断网。{v6}可以启用网络扩展，或者开启全局断网。")
             };
-            warning_card_with(ui, p, "按应用断网未生效", body, |ui| {
+            warning_card_with(ui, p, "按应用断网未生效", &body, |ui| {
                 if theme::text_button(ui, p.accent, "全局断网  ›").clicked() {
                     go = Some(Page::Network);
                 }

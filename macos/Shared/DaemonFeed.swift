@@ -186,7 +186,8 @@ final class DaemonFeed {
             while let nl = buf.firstIndex(of: 0x0A) {
                 let line = Data(buf[buf.startIndex..<nl])
                 buf.removeSubrange(buf.startIndex...nl)
-                if let r = FilterRules.parse(line: line) {
+                switch FilterRules.decode(line: line) {
+                case .rules(let r, let rev):
                     if first {
                         first = false
                         locked { _connected = true }
@@ -195,12 +196,17 @@ final class DaemonFeed {
                     set(r)
                     // 规则已经生效（之后的连接都按它判断）：确认版本。心跳重发的同一版本不再确认；
                     // 0.9.0 及以前的服务不带版本号，也就不会收到确认（它们不读这些回复）
-                    if let rev = FilterRules.parseRev(line: line), rev > acked {
+                    if let rev = rev, rev > acked {
                         acked = rev
                         try sendLine(s, "{\"cmd\":\"filter_applied\",\"arg\":\(rev)}")
                     }
-                } else if let e = FilterRules.parseError(line: line) {
+                case .invalid(let why):
+                    // 保留上一份规则、不确认：后台服务会因为没收到确认而提示规则没有生效
+                    log("忽略格式不对的规则：\(why)")
+                case .error(let e):
                     throw FeedError.msg("后台服务拒绝：\(e)")
+                case .other:
+                    break
                 }
             }
             if buf.count > 4 << 20 { throw FeedError.msg("回复过长") }

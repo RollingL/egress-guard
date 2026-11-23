@@ -341,6 +341,7 @@ fn filter_watch(mut w: UnixStream, reader: BufReader<UnixStream>, hello: FilterH
             if let Err(e) = write_reply(&mut w, &Reply::Filter(s)) {
                 break Err(e);
             }
+            hub.sent(reg, v);
         };
         // 让读取线程结束
         let _ = w.shutdown(std::net::Shutdown::Both);
