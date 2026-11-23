@@ -190,6 +190,28 @@ impl Controller {
         }
     }
 
+    /// 真正的拦截后端恢复可用（之前打开失败、一直在模拟）：换上它并重新提交规则。
+    /// 模拟期间的检测没有真正拦截过，按网络变化处理：原来要阻断的继续阻断；
+    /// 原来放行的，开启「启动时先阻断」时先阻断，等新的检测结果再决定。
+    pub fn replace_firewall(&mut self, fw: Box<dyn Firewall>) -> Result<()> {
+        let block = self.wants_block();
+        let reason = self.reason.clone();
+        self.fw = fw;
+        self.pending_switch = None;
+        self.apply_error = None;
+        self.apps_dirty = true;
+        self.stale = true;
+        let pushed = self.push_apps();
+        let switched = if block {
+            self.switch(true, reason.unwrap_or_else(|| "拦截引擎恢复，继续阻断".into()))
+        } else if self.cfg.behavior.start_blocked {
+            self.switch(true, "拦截引擎恢复，等待重新检测出口 IP".into())
+        } else {
+            Ok(())
+        };
+        pushed.and(switched)
+    }
+
     pub fn firewall(&mut self) -> &mut dyn Firewall {
         self.fw.as_mut()
     }
@@ -738,6 +760,36 @@ mod tests {
     fn rec(blocked: bool) -> (std::rc::Rc<std::cell::RefCell<Rec>>, Box<RecFirewall>) {
         let r = std::rc::Rc::new(std::cell::RefCell::new(Rec { blocked, ..Default::default() }));
         (r.clone(), Box::new(RecFirewall(r)))
+    }
+
+    #[test]
+    fn recovered_backend_keeps_block_and_rechecks() {
+        // 模拟期间要阻断：换上真正的后端后立即阻断，规则也提交上去
+        let mut c = Controller::new(cfg(""), Box::new(DryRunFirewall { blocked: false }));
+        c.on_detection(Ok(eg("198.51.100.1", None))).unwrap();
+        assert!(c.is_blocked());
+        let (r, fw) = rec(false);
+        c.replace_firewall(fw).unwrap();
+        assert!(r.borrow().blocked);
+        assert!(r.borrow().calls.iter().any(|x| x.starts_with("rules")));
+
+        // 模拟期间放行了：默认（启动时先阻断）先阻断，等新的检测结果再放行
+        let mut c = Controller::new(cfg(""), Box::new(DryRunFirewall { blocked: true }));
+        c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+        assert!(!c.is_blocked());
+        let (r, fw) = rec(false);
+        c.replace_firewall(fw).unwrap();
+        assert!(r.borrow().blocked);
+        c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+        assert!(!r.borrow().blocked);
+
+        // 关闭了「启动时先阻断」：保持放行，下一次检测再决定
+        let mut c = Controller::new(cfg("[behavior]\nstart_blocked=false"), Box::new(DryRunFirewall { blocked: true }));
+        c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+        let (r, fw) = rec(false);
+        c.replace_firewall(fw).unwrap();
+        assert!(!r.borrow().blocked);
+        assert!(r.borrow().calls.iter().all(|x| x != "block"));
     }
 
     #[test]

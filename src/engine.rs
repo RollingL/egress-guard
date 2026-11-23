@@ -165,8 +165,8 @@ fn run(
 ) -> Result<()> {
     let mut status = Status { running: true, per_app: true, ..Default::default() };
 
-    // 网卡变化监听，需在整个循环期间保持存活
-    let _watcher = start_netwatch(tx.clone());
+    // 网卡变化监听，需在整个循环期间保持存活；注册失败时稍后重试（见下面的 recover）
+    let mut watcher = start_netwatch(tx.clone());
     // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
     // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
@@ -185,9 +185,10 @@ fn run(
                 return Err(e);
             }
             Err(e) => {
-                log::error!("拦截引擎不可用，进入模拟模式: {e:#}");
+                log::error!("拦截引擎不可用，暂时进入模拟模式，稍后重试: {e:#}");
                 status.simulated = true;
                 status.backend_error = Some(format!("{e:#}"));
+                // 启动时先阻断的设置照样记下，后端恢复时按它提交
                 Box::new(DryRunFirewall::default())
             }
         }
@@ -236,6 +237,9 @@ fn run(
     let mut after_change = false;
     // 规则同步失败或有程序暂未加上规则时，定时重试
     let mut next_retry: Option<Instant> = None;
+    // 拦截后端打开失败（不是用户要求的模拟）、网卡变化监听注册失败时，按退避间隔重新尝试
+    let mut backend_retry = Backoff::new(!dry_run && status.simulated && cfg!(any(windows, target_os = "macos")));
+    let mut watch_retry = Backoff::new(watcher.is_none() && cfg!(any(windows, target_os = "macos")));
 
     let start_check = |checking: &mut bool, detector: &Arc<Detectors>, generation: u64| {
         if *checking {
@@ -287,7 +291,8 @@ fn run(
         } else {
             next_retry = None;
         }
-        let deadline = [next_check, debounce_until, next_retry].into_iter().flatten().min();
+        let deadline =
+            [next_check, debounce_until, next_retry, backend_retry.at, watch_retry.at].into_iter().flatten().min();
         let event = match deadline {
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -415,6 +420,39 @@ fn run(
                     next_check = None;
                     start_check(&mut checking, &detector, generation);
                 }
+                if backend_retry.due(now) {
+                    match open_backend(ctrl.config(), tx.clone()) {
+                        Ok(fw) => {
+                            backend_retry.done();
+                            log::info!("拦截引擎已恢复，退出模拟模式");
+                            status.simulated = false;
+                            status.backend_error = None;
+                            if let Err(e) = ctrl.replace_firewall(fw) {
+                                log::error!("{e:#}");
+                            }
+                            // 模拟期间的检测不算数：重新检测
+                            generation += 1;
+                            next_check = None;
+                            start_check(&mut checking, &detector, generation);
+                        }
+                        Err(e) => {
+                            let wait = backend_retry.failed();
+                            log::warn!("拦截引擎仍不可用，{} 秒后再试: {e:#}", wait.as_secs());
+                            status.backend_error = Some(format!("{e:#}"));
+                        }
+                    }
+                }
+                if watch_retry.due(now) {
+                    watcher = start_netwatch(tx.clone());
+                    if watcher.is_some() {
+                        watch_retry.done();
+                        log::info!("网卡变化监听已恢复");
+                        // 监听中断期间可能错过了变化：按网络变化处理
+                        let _ = tx.send(Event::NetworkChanged);
+                    } else {
+                        watch_retry.failed();
+                    }
+                }
                 if next_retry.is_some_and(|d| d <= now) {
                     next_retry = None;
                     let was_blocked = ctrl.is_blocked();
@@ -461,6 +499,37 @@ fn run(
 fn later(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
+}
+
+/// 有上限的指数退避：5 秒起，每次失败加倍，最多 5 分钟。
+struct Backoff {
+    at: Option<Instant>,
+    delay: Duration,
+}
+
+impl Backoff {
+    const FIRST: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(300);
+
+    fn new(active: bool) -> Self {
+        Self { at: active.then(|| later(Self::FIRST)), delay: Self::FIRST }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.at.is_some_and(|t| t <= now)
+    }
+
+    /// 又失败了一次：返回下次重试前等待的时间。
+    fn failed(&mut self) -> Duration {
+        self.delay = (self.delay * 2).min(Self::MAX);
+        self.at = Some(later(self.delay));
+        self.delay
+    }
+
+    fn done(&mut self) {
+        self.at = None;
+        self.delay = Self::FIRST;
+    }
 }
 
 fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
