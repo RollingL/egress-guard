@@ -26,7 +26,7 @@ pub enum Request {
     /// 持续推送状态，直到连接断开。
     Watch,
     GetConfig,
-    /// 校验、保存并应用配置，回复 `Ok`（0.9.5 之前的界面只认这个回复）。
+    /// 校验、保存并应用配置，回复 `Ok`（0.9.2 及更早的界面只认这个回复）。
     SetConfig(Box<RawConfig>),
     /// 同上，回复 `Saved(配置版本)`。服务在 Hello 里声明支持 [`FEATURE_SAVE_CONFIG`] 时才发送。
     SaveConfig(Box<RawConfig>),
