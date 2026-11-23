@@ -413,6 +413,7 @@ mod tests {
             block_all: None,
             kill_existing_tcp: true,
             block_ipv6: false,
+            v6_probe: false,
         })
         .unwrap();
         assert_eq!(hub.wait_newer(0, Duration::from_millis(1)).0, 0, "做出第一次决定之前不推送");
