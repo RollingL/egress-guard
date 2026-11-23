@@ -58,7 +58,7 @@ enum Command {
         /// 以 JSON 输出
         #[arg(long)]
         json: bool,
-        /// 发现泄露时以退出码 2 结束
+        /// 发现泄露（直接观察到白名单以外的地址）时以退出码 2 结束；证据不足、需要留意不算
         #[arg(long)]
         fail_on_leak: bool,
     },

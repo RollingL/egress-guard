@@ -88,7 +88,12 @@ pub enum Verdict {
     Local,
     /// 网卡上的公网地址：网页获得摄像头/麦克风权限时可以读到。
     Exposed,
-    /// 不在白名单：可能泄露。
+    /// 不在白名单、不可信、与出口不同网络的递归解析器。权威服务器看到的是解析器而不是本机，
+    /// 它本身不证明泄露（VPN 也可能使用公共解析器），只说明「不认识它」。
+    Unknown,
+    /// 客户端网段（ECS）比白名单条目宽、只有一部分重叠：不能确定查询来自白名单出口。
+    Inconclusive,
+    /// 直接观察到白名单以外的地址（STUN 映射地址、ECS 客户端网段）：泄露。
     Leak,
     /// STUN 无响应（这条路发不出去，也就不会泄露）。
     NoResponse,
@@ -111,7 +116,9 @@ impl Verdict {
             Verdict::SameNetwork => "与出口同网络",
             Verdict::Local => "局域网",
             Verdict::Exposed => "公网地址",
-            Verdict::Leak => "可能泄露",
+            Verdict::Unknown => "未知解析器",
+            Verdict::Inconclusive => "证据不足",
+            Verdict::Leak => "泄露",
             Verdict::NoResponse => "无响应",
         }
     }
@@ -123,36 +130,56 @@ impl Verdict {
 pub enum Level {
     /// 未发现泄露。
     Ok,
-    /// 没有直接泄露，但有需要留意的地方。
+    /// 证据不足，无法下结论（没有观察到解析器、STUN 全部无响应、ECS 与白名单只部分重叠）。
+    Inconclusive,
+    /// 没有直接泄露，但有需要留意的地方（未知解析器、网卡上的公网地址）。
     Warn,
     /// 发现泄露。
     Leak,
 }
 
-/// DNS 测试的一句话结论。
+/// DNS 测试的一句话结论。级别只按直接证据定：
 ///
-/// 权威服务器看到的是递归解析器，不是本机：解析器不在白名单、也不可信，只说明「不认识它」
-/// （可能是本地网络的解析器绕过了出口，也可能是 VPN 合法使用的公共解析器），记为「需要留意」。
-/// 解析器转发的客户端网段（ECS）不在白名单，才是直接观察到的白名单以外的地址，记为泄露。
+/// - 泄露：解析器转发的客户端网段（ECS）与白名单完全不重叠，这是直接观察到的白名单以外的地址；
+/// - 需要留意：有未知的递归解析器。权威服务器看到的是解析器不是本机，它只说明「不认识它」
+///   （可能是本地网络的解析器绕过了出口，也可能是 VPN 合法使用的公共解析器）；
+/// - 证据不足：没有观察到任何解析器，或者 ECS 网段与白名单只部分重叠；
+/// - 未发现泄露：其余情况。同一自治系统推断、部分检测源失败写在说明里。
 pub fn dns_summary(r: &dns::DnsReport) -> (Level, String) {
-    let unknown = r.resolvers.iter().filter(|x| x.verdict.is_leak()).count();
-    let ecs = r.client_subnets.iter().filter(|x| x.verdict.is_leak()).count();
+    let unknown = r.resolvers.iter().filter(|x| x.verdict == Verdict::Unknown).count();
+    let same_net = r.resolvers.iter().filter(|x| x.verdict == Verdict::SameNetwork).count();
+    let ecs_leak = r.client_subnets.iter().filter(|x| x.verdict.is_leak()).count();
+    let ecs_partial = r.client_subnets.iter().filter(|x| x.verdict == Verdict::Inconclusive).count();
     let failed = r.sources.iter().filter(|x| !x.ok).count();
-    let coverage = if failed > 0 && failed == r.sources.len() {
-        "（所有检测源都失败，结论不完整）"
+    let mut notes = Vec::new();
+    if failed > 0 && failed == r.sources.len() {
+        notes.push("所有检测源都失败，结论不完整".to_owned());
     } else if failed > 0 {
-        "（部分检测源失败）"
-    } else {
-        ""
-    };
-    match (unknown, ecs) {
-        (_, m) if m > 0 => (Level::Leak, format!("解析器向外透露了 {m} 个白名单以外的客户端网段（ECS）：域名查询来自白名单以外的出口{coverage}")),
-        (0, _) if r.resolvers.is_empty() => (Level::Warn, format!("没有观察到任何解析器，无法判断{coverage}")),
-        (0, _) => (Level::Ok, format!("未发现泄露：{} 个解析器都经白名单出口或可信{coverage}", r.resolvers.len())),
-        (n, _) => (
+        notes.push(format!("{failed} 个检测源失败，覆盖不完整"));
+    }
+    if same_net > 0 {
+        notes.push(format!("{same_net} 个解析器只是按自治系统推断与出口同网络"));
+    }
+    if ecs_partial > 0 && (ecs_leak > 0 || unknown > 0) {
+        notes.push(format!("另有 {ecs_partial} 个客户端网段与白名单只部分重叠"));
+    }
+    let coverage = if notes.is_empty() { String::new() } else { format!("（{}）", notes.join("；")) };
+    if ecs_leak > 0 {
+        (Level::Leak, format!("解析器向外透露了 {ecs_leak} 个与白名单完全不重叠的客户端网段（ECS）：域名查询来自白名单以外的出口{coverage}"))
+    } else if unknown > 0 {
+        (
             Level::Warn,
-            format!("发现 {n} 个未知的递归解析器（不在白名单、不可信、与出口不同网络）：可能绕过了白名单出口，也可能是 VPN 使用的公共解析器，确认后可以加入可信列表{coverage}"),
-        ),
+            format!("发现 {unknown} 个未知的递归解析器（不在白名单、不可信、与出口不同网络）：可能绕过了白名单出口，也可能是 VPN 使用的公共解析器，确认后可以加入可信列表{coverage}"),
+        )
+    } else if ecs_partial > 0 {
+        (
+            Level::Inconclusive,
+            format!("证据不足：解析器透露的 {ecs_partial} 个客户端网段（ECS）比白名单条目宽，只有一部分重叠，不能确定查询来自白名单出口{coverage}"),
+        )
+    } else if r.resolvers.is_empty() {
+        (Level::Inconclusive, format!("证据不足：没有观察到任何解析器，无法判断{coverage}"))
+    } else {
+        (Level::Ok, format!("未发现泄露：{} 个解析器都经白名单出口或可信{coverage}", r.resolvers.len()))
     }
 }
 
@@ -170,9 +197,9 @@ pub fn webrtc_summary(r: &webrtc::WebRtcReport) -> (Level, String) {
     } else if exposed > 0 {
         (Level::Warn, format!("网卡上有 {exposed} 个白名单以外的公网地址，网页获得摄像头/麦克风权限后可以读到"))
     } else if r.paths.is_empty() {
-        (Level::Warn, "没有可以测试的路径，无法判断".into())
+        (Level::Inconclusive, "证据不足：没有可以测试的路径，无法判断".into())
     } else if !r.any_response() {
-        (Level::Warn, "STUN 服务器都没有响应，无法确认：只说明到这几个服务器的 UDP 不通，不能证明 WebRTC 不会暴露公网 IP".into())
+        (Level::Inconclusive, "证据不足：STUN 服务器都没有响应，只说明到这几个服务器的 UDP 不通，不能证明 WebRTC 不会暴露公网 IP".into())
     } else if silent > 0 {
         (Level::Ok, format!("未发现泄露：有响应的路径看到的公网 IP 都在白名单内（另有 {silent} 条路径没有响应，未覆盖）"))
     } else {
@@ -217,21 +244,30 @@ impl Judge {
             if a == ea && self.whitelisted(eip) {
                 Verdict::SameNetwork
             } else {
-                Verdict::Leak
+                Verdict::Unknown
             }
         } else if !is_public(ip) {
             Verdict::Local
         } else {
-            Verdict::Leak
+            Verdict::Unknown
         }
     }
 
     /// 解析器转发给权威服务器的客户端网段（EDNS Client Subnet）。
-    /// 这是解析器看到的「你」的网段：它与白名单或出口不重合，说明查询是从白名单以外的出口发给解析器的。
+    /// 这是解析器看到的「你」的网段：
+    /// - 整个网段都在白名单内，或者包含测试时的出口：查询来自白名单出口（或者就是当前出口）；
+    /// - 网段比白名单条目宽、只有一部分重叠（例如白名单是 /32、网段是 /24）：证据不足；
+    /// - 完全不重叠：查询是从白名单以外的出口发给解析器的，算泄露。
     pub fn client_subnet(&self, subnet: IpNet, egress: Option<IpAddr>) -> Verdict {
-        let overlaps = |n: &IpNet| n.contains(&subnet.network()) || subnet.contains(&n.network());
-        if self.whitelist.iter().any(overlaps) || egress.is_some_and(|e| subnet.contains(&normalize(e))) {
-            Verdict::Whitelisted
+        let subnet = subnet.trunc();
+        if self.whitelist.iter().any(|n| n.contains(&subnet)) {
+            return Verdict::Whitelisted;
+        }
+        if let Some(e) = egress.map(normalize).filter(|e| subnet.contains(e)) {
+            return if self.whitelisted(e) { Verdict::Whitelisted } else { Verdict::SameNetwork };
+        }
+        if self.whitelist.iter().any(|n| subnet.contains(&n.network())) {
+            Verdict::Inconclusive
         } else {
             Verdict::Leak
         }
@@ -448,15 +484,25 @@ mod tests {
         assert_eq!(j.resolver(ip("9.9.9.9"), None, None), Verdict::Trusted);
         assert_eq!(j.resolver(ip("198.51.100.53"), Some(64500), egress), Verdict::SameNetwork);
         // 出口本身不在白名单：同网络不算数
-        assert_eq!(j.resolver(ip("198.51.100.53"), Some(64500), Some((ip("192.0.2.1"), Some(64500)))), Verdict::Leak);
-        assert_eq!(j.resolver(ip("198.51.100.53"), Some(64501), egress), Verdict::Leak);
-        assert_eq!(j.resolver(ip("198.51.100.53"), None, None), Verdict::Leak);
+        assert_eq!(j.resolver(ip("198.51.100.53"), Some(64500), Some((ip("192.0.2.1"), Some(64500)))), Verdict::Unknown);
+        assert_eq!(j.resolver(ip("198.51.100.53"), Some(64501), egress), Verdict::Unknown);
+        assert_eq!(j.resolver(ip("198.51.100.53"), None, None), Verdict::Unknown);
+        assert!(!Verdict::Unknown.is_leak(), "解析器本身不证明泄露");
 
         let net = |s: &str| s.parse::<IpNet>().unwrap();
         assert_eq!(j.client_subnet(net("203.0.113.0/24"), None), Verdict::Whitelisted);
-        assert_eq!(j.client_subnet(net("203.0.0.0/16"), None), Verdict::Whitelisted);
-        assert_eq!(j.client_subnet(net("198.51.100.0/24"), Some(ip("198.51.100.9"))), Verdict::Whitelisted);
+        assert_eq!(j.client_subnet(net("203.0.113.128/25"), None), Verdict::Whitelisted);
+        // 网段比白名单宽：只部分重叠，证据不足
+        assert_eq!(j.client_subnet(net("203.0.0.0/16"), None), Verdict::Inconclusive);
+        // 包含测试时的出口：与出口一致（出口不在白名单时只算同网络）
+        assert_eq!(j.client_subnet(net("203.0.0.0/16"), Some(ip("203.0.113.7"))), Verdict::Whitelisted);
+        assert_eq!(j.client_subnet(net("198.51.100.0/24"), Some(ip("198.51.100.9"))), Verdict::SameNetwork);
         assert_eq!(j.client_subnet(net("198.51.100.0/24"), Some(ip("203.0.113.7"))), Verdict::Leak);
+        // 白名单是 /32、ECS 是包含它的 /24
+        let j32 = Judge::from_strings(&["192.0.2.10".to_owned()], &[]);
+        assert_eq!(j32.client_subnet(net("192.0.2.0/24"), Some(ip("198.51.100.1"))), Verdict::Inconclusive);
+        assert_eq!(j32.client_subnet(net("192.0.2.0/24"), Some(ip("192.0.2.10"))), Verdict::Whitelisted);
+        assert_eq!(j32.client_subnet(net("192.0.3.0/24"), None), Verdict::Leak);
 
         assert_eq!(j.mapped(ip("203.0.113.7")), Verdict::Whitelisted);
         assert_eq!(j.mapped(ip("2001:db8:1::5")), Verdict::Whitelisted);
@@ -470,7 +516,7 @@ mod tests {
     fn summaries() {
         use super::webrtc::{HostAddr, StunPath, WebRtcReport};
         let mut r = WebRtcReport { paths: vec![], hosts: vec![], egress: None, unresolved: vec![] };
-        assert_eq!(webrtc_summary(&r).0, Level::Warn, "没有路径时不能下结论");
+        assert_eq!(webrtc_summary(&r).0, Level::Inconclusive, "没有路径时不能下结论");
         let silent = |local: &str| StunPath {
             iface: None,
             local: ip(local),
@@ -482,8 +528,8 @@ mod tests {
         // 全部超时：覆盖不足，不是「不会暴露」
         r.paths = vec![silent("0.0.0.0"), silent("::")];
         let (l, t) = webrtc_summary(&r);
-        assert_eq!(l, Level::Warn);
-        assert!(t.contains("无法确认"), "{t}");
+        assert_eq!(l, Level::Inconclusive);
+        assert!(t.contains("证据不足"), "{t}");
         // 只有 IPv4 回包：IPv4 在白名单，IPv6 未覆盖
         r.paths[0].mapped = Some("203.0.113.7:4000".parse().unwrap());
         r.paths[0].verdict = Verdict::Whitelisted;
@@ -527,19 +573,31 @@ mod tests {
         };
         assert_eq!(dns_summary(&r).0, Level::Ok);
         // VPN 合法使用公共 DNS（不在白名单、没有加入可信列表、不同网络）：需要留意，不算泄露
-        r.resolvers.push(resolver("8.8.8.8", Verdict::Leak));
+        r.resolvers.push(resolver("8.8.8.8", Verdict::Unknown));
         let (l, t) = dns_summary(&r);
         assert_eq!(l, Level::Warn);
         assert!(t.contains("未知的递归解析器"), "{t}");
         // 解析器透露了白名单以外的客户端网段：直接观察到，算泄露
         r.client_subnets.push(ClientSubnet { subnet: "198.51.100.0/24".parse().unwrap(), info: None, verdict: Verdict::Leak });
         assert_eq!(dns_summary(&r).0, Level::Leak);
+        // ECS 只与白名单部分重叠：证据不足，不算泄露也不算安全
+        r.resolvers.truncate(1);
+        r.client_subnets[0].verdict = Verdict::Inconclusive;
+        let (l, t) = dns_summary(&r);
+        assert_eq!(l, Level::Inconclusive);
+        assert!(t.contains("部分重叠"), "{t}");
+        // 同一自治系统、部分检测源失败：写进覆盖说明
+        r.client_subnets.clear();
+        r.resolvers.push(resolver("198.51.100.53", Verdict::SameNetwork));
+        r.sources.push(SourceStatus { name: "http".into(), ok: false, detail: "超时".into() });
+        let (l, t) = dns_summary(&r);
+        assert_eq!(l, Level::Ok);
+        assert!(t.contains("自治系统") && t.contains("1 个检测源失败"), "{t}");
         // 什么也没观察到
         r.resolvers.clear();
-        r.client_subnets.clear();
         r.sources[0].ok = false;
         let (l, t) = dns_summary(&r);
-        assert_eq!(l, Level::Warn);
+        assert_eq!(l, Level::Inconclusive);
         assert!(t.contains("所有检测源都失败"), "{t}");
     }
 

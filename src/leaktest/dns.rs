@@ -105,6 +105,7 @@ impl DnsReport {
         r
     }
 
+    /// 直接观察到的泄露数（未知解析器、证据不足的网段不算）。
     pub fn leaks(&self) -> usize {
         self.resolvers.iter().filter(|x| x.verdict.is_leak()).count()
             + self.client_subnets.iter().filter(|x| x.verdict.is_leak()).count()
@@ -131,7 +132,7 @@ pub fn aggregate(msgs: &[WatchMsg], id: &str) -> (Vec<Resolver>, Vec<IpNet>, u32
             sources: vec![DNSCHECK.to_owned()],
             protos: Vec::new(),
             info: None,
-            verdict: Verdict::Leak,
+            verdict: Verdict::Unknown,
         });
         r.queries += 1;
         let proto = m.proto.to_ascii_uppercase();
@@ -234,7 +235,7 @@ pub fn run(
                             sources: vec![src.name().into()],
                             protos: Vec::new(),
                             info: None,
-                            verdict: Verdict::Leak,
+                            verdict: Verdict::Unknown,
                         }),
                     }
                 }
@@ -623,12 +624,14 @@ mod tests {
         let j = Judge::from_strings(&["203.0.113.0/24".to_owned()], &[]);
         let a = r.judged(&j);
         assert_eq!(a.resolvers[0].verdict, Verdict::Whitelisted);
-        assert_eq!(a.resolvers[1].verdict, Verdict::Leak);
+        assert_eq!(a.resolvers[1].verdict, Verdict::Unknown, "未知解析器不算直接证据");
         assert_eq!(a.client_subnets[0].verdict, Verdict::Leak);
-        assert_eq!(a.leaks(), 2);
-        // 把 AS4134 加入可信后只剩 ECS 网段
+        assert_eq!(a.leaks(), 1);
+        // 把 AS4134 加入可信
         let j = Judge::from_strings(&["203.0.113.0/24".to_owned()], &["AS4134".to_owned()]);
-        assert_eq!(r.judged(&j).leaks(), 1);
+        let b = r.judged(&j);
+        assert_eq!(b.resolvers[1].verdict, Verdict::Trusted);
+        assert_eq!(b.leaks(), 1);
     }
 
     #[test]
