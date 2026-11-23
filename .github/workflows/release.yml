@@ -83,10 +83,27 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target\release\egress-guard.exe, target\release\egress-guard-gui.exe, config.example.toml, README.md $dir
           Compress-Archive -Path "$dir\*" -DestinationPath "dist\egress-guard-v$v-windows.zip"
+      - name: 冒烟测试：解开最终的 zip 再运行
+        shell: pwsh
+        run: |
+          $v = '${{ needs.check.outputs.version }}'
+          $zip = "dist\egress-guard-v$v-windows.zip"
+          $x = Join-Path $env:RUNNER_TEMP 'smoke'
+          Expand-Archive $zip -DestinationPath $x -Force
+          foreach ($f in 'egress-guard.exe', 'egress-guard-gui.exe', 'config.example.toml', 'README.md') {
+            if (-not (Test-Path (Join-Path $x $f))) { Write-Error "zip 里缺少 $f" }
+          }
+          $out = & (Join-Path $x 'egress-guard.exe') --version
+          if ($out -notmatch [regex]::Escape($v)) { Write-Error "版本不符：$out" }
+          # 记录摘要，发布时与上传后的远端资产逐一核对
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$sha  egress-guard-v$v-windows.zip" | Out-File -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
 
   macos:
     name: macOS 安装包
@@ -104,10 +121,30 @@ jobs:
           scripts/macos/bundle.sh --universal
           mkdir -p dist
           cp target/macos/egress-guard-*-macos.zip "dist/egress-guard-v${{ needs.check.outputs.version }}-macos.zip"
+      - name: 冒烟测试：解开最终的 zip 再运行
+        env:
+          V: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip="dist/egress-guard-v$V-macos.zip"
+          x="$RUNNER_TEMP/smoke"
+          rm -rf "$x" && mkdir -p "$x" && ditto -x -k "$zip" "$x"
+          app="$x/Egress Guard.app"
+          for f in egress-guard egress-guard-gui; do
+            [[ -x "$app/Contents/MacOS/$f" ]] || { echo "::error::zip 里缺少 $f"; exit 1; }
+            lipo -archs "$app/Contents/MacOS/$f" | grep -q arm64 || { echo "::error::$f 不是通用二进制"; exit 1; }
+            lipo -archs "$app/Contents/MacOS/$f" | grep -q x86_64 || { echo "::error::$f 不是通用二进制"; exit 1; }
+          done
+          out=$("$app/Contents/MacOS/egress-guard" --version)
+          [[ "$out" == *"$V"* ]] || { echo "::error::版本不符：$out"; exit 1; }
+          codesign --verify --deep "$app" || { echo "::error::签名校验失败"; exit 1; }
+          (cd dist && shasum -a 256 "egress-guard-v$V-macos.zip" > "egress-guard-v$V-macos.zip.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
 
   release:
     name: 创建 GitHub Release
@@ -117,34 +154,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: dist
-      - env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 核对安装包就是冒烟测试过的那两个
+        env:
           V: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           ls -la dist
-          # 两个平台的安装包都要在
+          cd dist
           for f in "egress-guard-v$V-windows.zip" "egress-guard-v$V-macos.zip"; do
-            [[ -s "dist/$f" ]] || { echo "::error::缺少 $f"; exit 1; }
+            [[ -s "$f" && -s "$f.sha256" ]] || { echo "::error::缺少 $f 或它的摘要"; exit 1; }
+            sha256sum -c "$f.sha256"
           done
-          # 先建草稿，核对标签、提交和资产后再公开
-          gh release create "v$V" "dist/egress-guard-v$V-windows.zip" "dist/egress-guard-v$V-macos.zip" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Egress Guard $V" \
-            --generate-notes \
-            --draft
-          info=$(gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json tagName,assets,targetCommitish)
-          echo "$info"
-          [[ "$(jq -r .tagName <<<"$info")" == "v$V" ]] || { echo "::error::标签不符"; exit 1; }
-          n=$(jq '[.assets[].name | select(. == "egress-guard-v'"$V"'-windows.zip" or . == "egress-guard-v'"$V"'-macos.zip")] | length' <<<"$info")
-          [[ "$n" == 2 ]] || { echo "::error::草稿里的安装包不全（$n/2）"; exit 1; }
-          gh release edit "v$V" --repo "$GITHUB_REPOSITORY" --draft=false
-          # 公开后标签必须指向这个提交
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/v$V" --jq .sha)
-          [[ "$sha" == "$GITHUB_SHA" ]] || { echo "::error::标签 v$V 指向 $sha，不是 $GITHUB_SHA"; exit 1; }
+      # 草稿续传、标签绑定、资产摘要核对，全部通过才公开；见 scripts/release/publish.sh
+      - name: 创建或续传发布，核对后公开
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release/publish.sh "${{ needs.check.outputs.version }}" "$GITHUB_SHA" dist

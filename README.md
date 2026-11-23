@@ -117,7 +117,7 @@ Windows 版提供两个程序：
 
 界面启动 20 秒后、之后每天检查一次 GitHub Releases，有新版本时在概览页顶部提示，并发一次系统通知。只提醒，不会自动下载安装：点「下载」打开对应平台的安装包。在 **设置 → 检查更新** 里可以关闭或立即检查。仓库是私有的时候需要填一个只有读取权限的 GitHub 令牌。
 
-发布：合并到 `main` 后，如果 `Cargo.toml` 里的版本还没有发布过，`.github/workflows/release.yml` 会构建 Windows、macOS 两个安装包（`egress-guard-v<版本>-windows.zip`、`-macos.zip`），并创建标签为 `v<版本>` 的 Release。所以发新版本只需要改版本号。发布前会对同一个提交再跑一遍完整的 CI（三个平台），通过后才打包；Release 先建草稿，核对两个安装包和标签指向的提交后才公开。手动运行只对 `main` 生效。
+发布：合并到 `main` 后，如果 `Cargo.toml` 里的版本还没有发布过，`.github/workflows/release.yml` 会构建 Windows、macOS 两个安装包（`egress-guard-v<版本>-windows.zip`、`-macos.zip`），并创建标签为 `v<版本>` 的 Release。所以发新版本只需要改版本号。发布前会对同一个提交再跑一遍完整的 CI（三个平台），通过后才打包；两个安装包都会解开最终的 zip 再运行一次（版本号、文件齐全、macOS 签名和通用二进制），记录 SHA-256。Release 先建草稿（正文带本次提交的标记），上传后按大小和 SHA-256 逐个核对远端资产，确认标签指向本次提交（没有标签时先绑定到本次提交）后才公开；中途失败时保持草稿，重跑会接着用同一个草稿，已经公开的版本直接跳过。逻辑在 `scripts/release/publish.sh`，CI 用假 gh 测试各种情况（`scripts/release/test-publish.sh`）。手动运行只对 `main` 生效。
 
 系统通知：Windows 用 Toast 通知，程序会在 `HKCU\Software\Classes\AppUserModelId\EgressGuard.App` 登记显示名称和图标。macOS 用系统通知中心，第一次会请求权限；被拒绝时改用 AppleScript 的 `display notification`。
 

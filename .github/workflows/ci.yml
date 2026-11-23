@@ -30,6 +30,8 @@ jobs:
       - run: cargo test
       - name: 文件权限测试（umask 077）
         run: "umask 077 && cargo test --lib config::"
+      - name: 发布脚本测试（假 gh）
+        run: scripts/release/test-publish.sh
 
   windows:
     name: Windows 构建
