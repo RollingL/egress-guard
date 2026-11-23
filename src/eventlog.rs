@@ -81,6 +81,13 @@ impl EventLog {
     /// 打开（或创建）记录文件，载入最近的记录。
     pub fn open(path: &Path) -> Self {
         let mut me = Self { path: Some(path.to_path_buf()), ..Default::default() };
+        // 0.9.0 建的文件是 0644：升级后立刻收紧，不等下次重写
+        #[cfg(unix)]
+        if let Err(e) = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("无法收紧连接记录的权限 {}: {e}", path.display());
+            }
+        }
         if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 me.file_lines += 1;
@@ -229,6 +236,18 @@ mod tests {
         l.items.push_back(ConnEvent::now(Kind::Block, "x"));
         assert!(l.clear().is_err());
         assert_eq!(l.recent().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_world_readable_log_is_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("eg-events-perm-{}.jsonl", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _l = EventLog::open(&path);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
