@@ -1,9 +1,11 @@
 //! 图形界面（eframe/egui），苹果风格：侧边栏导航、大标题、分组圆角卡片、开关控件，
 //! 浅色/深色跟随系统。另有系统托盘（Windows）/ 菜单栏图标（macOS）。
 
+mod auto;
 pub mod backend;
 pub mod icons;
 mod leak;
+mod notify;
 mod platform;
 mod theme;
 #[cfg(windows)]
@@ -24,9 +26,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText};
 
-use crate::config::{parse_net, Appearance, ChildMode, Config, FailMode, RawConfig};
+use crate::config::{parse_net, Appearance, ChildMode, Config, FailMode, Ipv6Mode, RawConfig};
 use crate::discovery::Source;
 use crate::engine::{self, Status};
+use crate::eventlog::Kind;
 use backend::{Backend, ServiceState};
 use icons::Shade;
 use platform::procs;
@@ -95,10 +98,12 @@ type Job = Arc<Mutex<Option<Result<(), String>>>>;
 pub struct Options {
     pub config_path: PathBuf,
     pub start_minimized: bool,
-    /// 打开时显示的页面（overview / whitelist / apps / network / leaktest / settings / log），用于截图。
+    /// 打开时显示的页面（overview / whitelist / apps / network / leaktest / events / settings / log），用于截图。
     pub start_page: Option<String>,
     /// 打开后立即开始泄露测试（截图、CI 用）。
     pub run_leak_test: bool,
+    /// 打开时页面向下滚动的距离（截图用）。
+    pub scroll: Option<f32>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -108,6 +113,7 @@ enum Page {
     Apps,
     Network,
     Leak,
+    Events,
     Settings,
     Log,
 }
@@ -120,6 +126,7 @@ impl Page {
             "apps" => Page::Apps,
             "network" => Page::Network,
             "leaktest" => Page::Leak,
+            "events" => Page::Events,
             "settings" => Page::Settings,
             "log" => Page::Log,
             _ => return None,
@@ -184,6 +191,22 @@ struct App {
     leak: leak::LeakUi,
     /// 第一帧开始泄露测试。
     run_leak_test: bool,
+    /// 开头几帧把页面滚动到这里（截图用），以及还剩几帧。
+    start_scroll: Option<(f32, u32)>,
+    /// 已保存的配置，供后台任务（自动泄露测试、检查更新）读取。
+    shared_cfg: Arc<Mutex<RawConfig>>,
+    auto_leak: Arc<Mutex<auto::AutoLeak>>,
+    update: Arc<Mutex<auto::UpdateState>>,
+    /// 「立即检查更新」。
+    update_tx: mpsc::Sender<()>,
+    gui_state: auto::GuiState,
+    /// 「VPN 守护」网卡名称、IPv6 查询服务的文本框。
+    vpn_text: String,
+    v6_services_text: String,
+    /// 本机网卡（设置页显示可选的 VPN 网卡），以及上次读取的时间。
+    adapters: (Option<Instant>, Vec<(String, String, bool)>),
+    /// 连接记录页的筛选。
+    event_filter: Option<Kind>,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -243,9 +266,35 @@ pub fn run(opts: Options) -> Result<()> {
             );
 
             let raw = cfg.to_raw();
+            let leak = leak::LeakUi::new(&raw.leak_test.stun_servers);
+            let shared_cfg = Arc::new(Mutex::new(raw.clone()));
+            let auto_leak = Arc::new(Mutex::new(auto::AutoLeak::default()));
+            auto::LeakScheduler {
+                status: status.clone(),
+                config: shared_cfg.clone(),
+                job: leak.job.clone(),
+                backend: backend.clone(),
+                ctx: ctx.clone(),
+                state: auto_leak.clone(),
+            }
+            .spawn();
+            let update = Arc::new(Mutex::new(auto::UpdateState::default()));
+            let (update_tx, update_rx) = mpsc::channel();
+            auto::UpdateChecker { config: shared_cfg.clone(), state: update.clone(), manual: update_rx, ctx: ctx.clone() }
+                .spawn();
             Ok(Box::new(App {
-                leak: leak::LeakUi::new(&raw.leak_test.stun_servers),
+                leak,
+                shared_cfg,
+                auto_leak,
+                update,
+                update_tx,
+                gui_state: auto::GuiState::load(),
+                vpn_text: raw.vpn.interfaces.join("\n"),
+                v6_services_text: raw.ipv6.services.join("\n"),
+                adapters: (None, Vec::new()),
+                event_filter: None,
                 run_leak_test: opts.run_leak_test,
+                start_scroll: opts.scroll.map(|y| (y, 30)),
                 autostart: backend.autostart_enabled(),
                 backend,
                 status,
@@ -296,6 +345,13 @@ pub const CLIPBOARD_PROBE_COPY: &str = "egress-guard-copy-ok";
 
 /// 剪贴板自检（CI 用）：打开一个只有输入框的窗口并让它获得焦点。
 ///
+/// 发一条测试通知，打印使用的方式（CI 用：之后截图看通知有没有出现）。
+pub fn notify_selftest() -> Result<()> {
+    let how = notify::try_show("Egress Guard 通知测试", "自动泄露测试发现泄露、发现新版本时会这样提醒你。")?;
+    eprintln!("已发送通知：{how}");
+    Ok(())
+}
+
 /// 第一帧把 [`CLIPBOARD_PROBE_COPY`] 复制到系统剪贴板（检查「复制」能到达其他程序）；
 /// 之后 CI 往系统剪贴板放一段文字、模拟按下 ⌘V / Ctrl+V，`seconds` 秒后把输入框里的内容
 /// 写入 `out`（JSON：`{"pasted": "..."}`）并退出（检查「粘贴」能从其他程序拿到内容）。
@@ -353,6 +409,7 @@ pub fn clipboard_selftest(out: PathBuf, seconds: f64) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn start_backend(cfg: Config, config_path: &std::path::Path, reporter: engine::Reporter) -> (Arc<dyn Backend>, Config) {
     let learned = crate::learned_file(config_path);
+    crate::eventlog::init(&crate::events_file(config_path));
     let engine = Arc::new(engine::spawn(cfg.clone(), false, false, Some(learned), reporter));
     (Arc::new(backend::Local { engine, config_path: config_path.to_path_buf() }), cfg)
 }
@@ -380,6 +437,9 @@ fn tray_state(s: &Status) -> tray::TrayState {
     let mut tooltip = format!("出口 IP 网络控制：{what}");
     if let Some(ip) = s.egress_ip {
         tooltip.push_str(&format!("\n出口 IP：{ip}"));
+    }
+    if let Some(r) = s.block_reason.as_deref().filter(|_| s.blocked) {
+        tooltip.push_str(&format!("\n{}", shorten(r, 60)));
     }
     if s.simulated {
         tooltip.push_str("\n模拟模式（规则未生效）");
@@ -443,14 +503,20 @@ fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
     } else if inert(s) {
         ("未拦截", "出口 IP 没有通过白名单，但网络扩展没有启用、全局断网也没有开启，什么也没有切断。".into(), p.orange)
     } else if s.blocked {
-        let why = match (s.egress_ip, &s.detect_error) {
-            (Some(_), _) => "出口 IP 不在白名单内。出口回到白名单后会自动恢复。",
-            (None, Some(_)) => "无法确定出口 IP，为安全起见保持断网。",
-            (None, None) => "正在确认出口 IP，确认前保持断网。",
+        let why = match (&s.block_reason, s.egress_ip, &s.detect_error) {
+            (Some(r), _, _) if s.egress_ip.is_some() || !s.checking => format!("{r}。出口回到白名单后会自动恢复。"),
+            (_, Some(_), _) => "出口 IP 不在白名单内。出口回到白名单后会自动恢复。".into(),
+            (_, None, Some(_)) => "无法确定出口 IP，为安全起见保持断网。".into(),
+            (_, None, None) => "正在确认出口 IP，确认前保持断网。".into(),
         };
-        ("已阻断", why.into(), p.red)
+        ("已阻断", why, p.red)
     } else if s.egress_ip.is_some() {
-        ("已放行", "出口 IP 在白名单内。网络一有变化就会重新检查。".into(), p.green)
+        let why = if s.vpn_guarded.is_empty() {
+            "出口 IP 在白名单内。网络一有变化就会重新检查。".to_owned()
+        } else {
+            format!("出口 IP 在白名单内。VPN（{}）一断开就立即断网。", s.vpn_guarded.join("、"))
+        };
+        ("已放行", why, p.green)
     } else if s.detect_error.is_some() {
         ("状态未知", "出口 IP 检测失败，按「检测失败时」的设置保持当前状态。".into(), p.orange)
     } else {
@@ -474,8 +540,7 @@ impl App {
             Ok(cfg)
         }) {
             Ok(cfg) => {
-                self.applied = cfg.to_raw();
-                self.draft = self.applied.clone();
+                self.set_applied(cfg.to_raw());
                 self.load_error = None;
                 self.notify(true, "已保存并生效");
             }
@@ -483,18 +548,35 @@ impl App {
         }
     }
 
+    /// 采用新的已保存配置（保存成功、后台服务推来新配置时）。
+    fn set_applied(&mut self, raw: RawConfig) {
+        *self.shared_cfg.lock().unwrap() = raw.clone();
+        self.applied = raw;
+        self.draft = self.applied.clone();
+        self.reset_texts();
+    }
+
+    /// 让文本框与 draft 一致。
+    fn reset_texts(&mut self) {
+        self.services_text = self.draft.detect.services.join("\n");
+        self.vpn_text = self.draft.vpn.interfaces.join("\n");
+        self.v6_services_text = self.draft.ipv6.services.join("\n");
+        self.leak.reset_text(&self.draft.leak_test.stun_servers);
+    }
+
     fn revert(&mut self) {
         self.draft = self.applied.clone();
-        self.services_text = self.draft.detect.services.join("\n");
-        self.leak.reset_text(&self.draft.leak_test.stun_servers);
+        self.reset_texts();
         self.message = None;
         self.entry_error = None;
         self.remote_error = None;
     }
 
     fn sync_services(&mut self) {
-        self.draft.detect.services =
-            self.services_text.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+        let lines = |t: &str| -> Vec<String> { t.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect() };
+        self.draft.detect.services = lines(&self.services_text);
+        self.draft.vpn.interfaces = lines(&self.vpn_text);
+        self.draft.ipv6.services = lines(&self.v6_services_text);
     }
 
     fn add_whitelist_entry(&mut self, entry: String) {
@@ -651,6 +733,309 @@ impl App {
         }
     }
 
+    // ---------------- 检查更新 ----------------
+
+    /// 概览顶部：发现新版本时的提示。
+    fn update_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let rel = match self.update.lock().unwrap().newer() {
+            Some(r) if r.version != self.gui_state.dismissed_version => r.clone(),
+            _ => return,
+        };
+        let notes = rel.notes.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
+        let body = format!(
+            "当前是 {}。{}",
+            crate::update::CURRENT,
+            if notes.is_empty() { String::new() } else { shorten(notes.trim_start_matches(['-', '*', ' ']), 120) }
+        );
+        let (mut download, mut dismiss) = (false, false);
+        info_card_with(ui, p, &format!("Egress Guard {} 已发布", rel.version), &body, |ui| {
+            dismiss = theme::text_button(ui, p.secondary, "忽略这个版本").clicked();
+            download = theme::accent_button(ui, p, if rel.download.is_some() { "下载" } else { "查看" }, true).clicked();
+        });
+        if download {
+            open_url(rel.download.as_deref().unwrap_or(&rel.url));
+        }
+        if dismiss {
+            // 后台线程也会写这个文件（已通知的版本），先读最新的再改
+            self.gui_state = auto::GuiState::load();
+            self.gui_state.dismissed_version = rel.version.clone();
+            self.gui_state.save();
+        }
+        ui.add_space(4.0);
+    }
+
+    fn update_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::section(ui, p, "检查更新");
+        let st = self.update.lock().unwrap().clone();
+        let mut check_now = false;
+        theme::card(ui, p, |ui| {
+            let u = &mut self.draft.update;
+            theme::row(ui, p, "自动检查新版本", Some("启动时和之后每天一次，读取 GitHub 上的发布版本；发现新版本时通知你"), |ui| {
+                theme::toggle(ui, p, &mut u.check);
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "仓库", None, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut u.repo)
+                        .desired_width(220.0)
+                        .font(egui::TextStyle::Monospace)
+                        .margin(Margin::symmetric(8, 4)),
+                );
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "访问令牌", Some("私有仓库才需要：GitHub 细粒度令牌，只给这个仓库 Contents 只读权限"), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut u.token)
+                        .password(true)
+                        .hint_text("公开仓库留空")
+                        .desired_width(220.0)
+                        .margin(Margin::symmetric(8, 4)),
+                );
+            });
+            theme::hairline(ui, p);
+            let (color, text) = match (&st.newer(), &st.latest, &st.error) {
+                _ if st.checking => (p.secondary, "正在检查…".to_owned()),
+                (Some(r), _, _) => (p.accent, format!("有新版本 {}", r.version)),
+                (None, Some(r), _) => (p.green, format!("已是最新（最新发布 {}）", r.version)),
+                (None, None, Some(e)) => (p.orange, shorten(e, 60)),
+                _ => (p.secondary, "尚未检查".to_owned()),
+            };
+            let sub = st.checked_at.as_ref().map(|t| format!("上次检查：{t}"));
+            theme::row(ui, p, &format!("当前版本 {}", crate::update::CURRENT), sub.as_deref(), |ui| {
+                if st.checking {
+                    ui.add(egui::Spinner::new().size(14.0));
+                } else {
+                    check_now = theme::gray_button(ui, p, "立即检查").clicked();
+                }
+                ui.label(RichText::new(text).size(12.5).color(color))
+                    .on_hover_text(st.error.clone().unwrap_or_default());
+            });
+            if let Some(r) = st.newer() {
+                theme::hairline(ui, p);
+                let r = r.clone();
+                theme::row(ui, p, &format!("新版本 {}", r.version), None, |ui| {
+                    if theme::text_button(ui, p.accent, "打开发布页  ›").on_hover_text(&r.url).clicked() {
+                        open_url(&r.url);
+                    }
+                });
+            }
+        });
+        if check_now {
+            // 用正在编辑的仓库和令牌（尚未保存时也能先试试）
+            let mut cfg = self.shared_cfg.lock().unwrap().clone();
+            cfg.update = self.draft.update.clone();
+            cfg.update.repo = cfg.update.repo.trim().trim_matches('/').to_owned();
+            cfg.update.token = cfg.update.token.trim().to_owned();
+            *self.shared_cfg.lock().unwrap() = cfg;
+            let _ = self.update_tx.send(());
+        }
+        theme::footnote(ui, p, "只读取发布信息，不会自动下载或安装。令牌保存在配置文件里。");
+    }
+
+    // ---------------- VPN 守护、IPv6 ----------------
+
+    fn vpn_section(&mut self, ui: &mut egui::Ui, p: &Palette, s: &Status) {
+        theme::section(ui, p, "VPN 守护");
+        if self.adapters.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+            self.adapters = (Some(Instant::now()), crate::vpn::candidates(&crate::vpn::scan()));
+        }
+        let mut add = None;
+        theme::card(ui, p, |ui| {
+            let v = &mut self.draft.vpn;
+            theme::row(
+                ui,
+                p,
+                "VPN 断开时立即断网",
+                Some("放行时记下正在使用的 VPN 网卡，它断开、关闭或失去地址就立即阻断，不等下一次检测"),
+                |ui| {
+                    theme::toggle(ui, p, &mut v.guard);
+                },
+            );
+            theme::hairline(ui, p);
+            theme::row(ui, p, "连着 VPN 时的检测间隔", Some("更勤地确认出口 IP，VPN 服务器一侧换了出口也能尽快发现；0 表示与平时相同"), |ui| {
+                ui.add(egui::DragValue::new(&mut v.check_interval_secs).range(0..=3600).suffix(" 秒"));
+            });
+            theme::hairline(ui, p);
+            ui.add_space(4.0);
+            ui.label(RichText::new("守护的网卡").color(p.label));
+            ui.add_space(-2.0);
+            ui.label(
+                RichText::new("每行一个网卡名称（Windows 也可以填网卡描述）。留空时自动识别 utun、wg、ppp、TAP、WireGuard、OpenVPN 等 VPN 网卡")
+                    .size(12.0)
+                    .color(p.secondary),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut self.vpn_text)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("自动识别")
+                    .font(egui::TextStyle::Monospace)
+                    .margin(Margin::symmetric(8, 6)),
+            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                ui.label(RichText::new("本机网卡（点击加入）：").size(12.0).color(p.secondary));
+                for (name, desc, vpnish) in &self.adapters.1 {
+                    let on = s.vpn_connected.contains(name);
+                    let color = if s.vpn_guarded.contains(name) { p.green } else if on || *vpnish { p.accent } else { p.gray };
+                    let hover = if desc.is_empty() { name.clone() } else { format!("{name}\n{desc}") };
+                    let hover = if s.vpn_guarded.contains(name) {
+                        format!("{hover}\n守护中")
+                    } else if on {
+                        format!("{hover}\n识别为 VPN")
+                    } else {
+                        hover
+                    };
+                    if theme::chip(ui, color, name).on_hover_text(hover).interact(egui::Sense::click()).clicked() {
+                        add = Some(name.clone());
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        });
+        if let Some(name) = add {
+            if !self.vpn_text.lines().any(|l| l.trim().eq_ignore_ascii_case(&name)) {
+                if !self.vpn_text.trim().is_empty() && !self.vpn_text.ends_with('\n') {
+                    self.vpn_text.push('\n');
+                }
+                self.vpn_text.push_str(&name);
+            }
+        }
+        let status = if !s.vpn_guarded.is_empty() {
+            format!("正在守护：{}。", s.vpn_guarded.join("、"))
+        } else if !s.vpn_connected.is_empty() {
+            format!("识别到的 VPN：{}（出口通过白名单后开始守护）。", s.vpn_connected.join("、"))
+        } else {
+            "现在没有识别到 VPN 网卡。".to_owned()
+        };
+        theme::footnote(ui, p, &format!("{status}VPN 重新连上、出口回到白名单后自动恢复。"));
+    }
+
+    fn ipv6_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::section(ui, p, "IPv6");
+        theme::card(ui, p, |ui| {
+            theme::row(ui, p, "IPv6 防护", None, |ui| {
+                theme::segmented(
+                    ui,
+                    p,
+                    &mut self.draft.ipv6.mode,
+                    &[(Ipv6Mode::Off, "不处理"), (Ipv6Mode::Block, "始终阻断"), (Ipv6Mode::Check, "检测出口")],
+                );
+            });
+            let explain = match self.draft.ipv6.mode {
+                Ipv6Mode::Check => "另外只走 IPv6 检测一次出口：本机能直连 IPv6、而 IPv6 出口不在白名单时也阻断（IPv6 流量常常绕过只支持 IPv4 的 VPN）",
+                Ipv6Mode::Block => {
+                    if cfg!(target_os = "macos") {
+                        "放行期间也一直切断 IPv6：受控应用的 IPv6 连接由网络扩展切断，开启全局断网时用 pf 切断整机 IPv6（例外同全局断网）"
+                    } else {
+                        "放行期间也一直切断 IPv6：受控应用的 IPv6 连接，开启全局断网时为整机 IPv6（例外同全局断网）。适合不支持 IPv6 的 VPN"
+                    }
+                }
+                Ipv6Mode::Off => "只按默认路由检测到的出口 IP 决定（0.8 及以前的行为）",
+            };
+            ui.label(RichText::new(explain).size(12.0).color(p.secondary));
+            if self.draft.ipv6.mode == Ipv6Mode::Check {
+                theme::hairline(ui, p);
+                ui.add_space(4.0);
+                ui.label(RichText::new("IPv6 查询服务").color(p.label));
+                ui.add_space(-2.0);
+                ui.label(RichText::new("每行一个，只走 IPv6、同时请求，第一个成功的结果生效；都失败时视为本机不能直连 IPv6").size(12.0).color(p.secondary));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.v6_services_text)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace)
+                        .margin(Margin::symmetric(8, 6)),
+                );
+            }
+            ui.add_space(4.0);
+        });
+        if self.draft.ipv6.mode == Ipv6Mode::Check {
+            theme::footnote(ui, p, "IPv6 出口不在白名单而又用不到 IPv6 时，可以改为「始终阻断」，或者把 IPv6 出口加入白名单。");
+        }
+    }
+
+    // ---------------- 连接记录 ----------------
+
+    fn events_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::page_title(ui, p, "连接记录", "每次阻断、恢复的时间、原因和当时的出口 IP，以及自动泄露测试发现的泄露。");
+        let events = self.backend.events();
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            theme::segmented(
+                ui,
+                p,
+                &mut self.event_filter,
+                &[(None, "全部"), (Some(Kind::Block), "阻断"), (Some(Kind::Restore), "恢复"), (Some(Kind::Leak), "泄露")],
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !events.is_empty() {
+                    clear = theme::gray_button(ui, p, "清空").clicked();
+                }
+                let n = events.iter().filter(|e| e.kind == Kind::Block).count();
+                ui.label(RichText::new(format!("共 {} 条，阻断 {n} 次", events.len())).size(12.5).color(p.secondary));
+            });
+        });
+        ui.add_space(6.0);
+        const SHOWN: usize = 300;
+        let list: Vec<_> = events.iter().rev().filter(|e| self.event_filter.is_none_or(|k| e.kind == k)).take(SHOWN).collect();
+        theme::card(ui, p, |ui| {
+            if list.is_empty() {
+                empty_state(ui, p, "暂无记录", "阻断、恢复和自动泄露测试发现的泄露会记在这里。");
+                return;
+            }
+            let n = list.len();
+            for (i, e) in list.iter().enumerate() {
+                let color = match e.kind {
+                    Kind::Block => p.red,
+                    Kind::Restore => p.green,
+                    Kind::Leak => p.orange,
+                };
+                ui.horizontal(|ui| {
+                    ui.set_min_height(44.0);
+                    ui.allocate_ui_with_layout(egui::vec2(52.0, 40.0), Layout::top_down(Align::Min), |ui| {
+                        ui.add_space(6.0);
+                        theme::chip(ui, color, e.kind.label());
+                    });
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(RichText::new(&e.reason).color(p.label)).wrap());
+                        ui.add_space(-5.0);
+                        let mut sub = vec![e.time.clone()];
+                        if let Some(ip) = e.egress {
+                            sub.push(format!("出口 {ip}"));
+                        }
+                        if let Some(ip) = e.egress_v6 {
+                            sub.push(format!("IPv6 {ip}"));
+                        }
+                        if !e.scope.is_empty() {
+                            sub.push(e.scope.clone());
+                        }
+                        ui.label(RichText::new(sub.join(" · ")).size(12.0).color(p.secondary));
+                        ui.add_space(2.0);
+                    });
+                });
+                if i + 1 < n {
+                    theme::hairline(ui, p);
+                }
+            }
+        });
+        let file = crate::events_file(std::path::Path::new(&self.backend.config_location()));
+        theme::footnote(
+            ui,
+            p,
+            &format!("最多保留最近 {} 条，这里显示最近 {SHOWN} 条。记录文件：{}", crate::eventlog::MAX_EVENTS, file.display()),
+        );
+        if clear {
+            match self.backend.clear_events() {
+                Ok(()) => self.notify(true, "已清空连接记录"),
+                Err(e) => self.notify(false, format!("{e:#}")),
+            }
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(2));
+    }
+
     // ---------------- 网络扩展（macOS） ----------------
 
     /// 定时读取网络扩展的安装状态；在「受控应用」页时每 10 秒向系统查询一次。
@@ -803,6 +1188,7 @@ impl App {
             (Page::Apps, theme::NavItem { glyph: Glyph::Grid, icon_bg: p.orange, text: "受控应用", badge: Some(&apps) }),
             (Page::Network, theme::NavItem { glyph: Glyph::Globe, icon_bg: p.red, text: "全局断网", badge: Some(scope) }),
             (Page::Leak, theme::NavItem { glyph: Glyph::Drop, icon_bg: p.teal, text: "泄露测试", badge: None }),
+            (Page::Events, theme::NavItem { glyph: Glyph::Clock, icon_bg: p.purple, text: "连接记录", badge: None }),
             (Page::Settings, theme::NavItem { glyph: Glyph::Gear, icon_bg: p.gray, text: "设置", badge: None }),
             (Page::Log, theme::NavItem { glyph: Glyph::Lines, icon_bg: p.indigo, text: "日志", badge: None }),
         ];
@@ -858,6 +1244,7 @@ impl App {
             ui.add_space(4.0);
         }
         self.service_card(ui, p);
+        self.update_card(ui, p);
         if let (true, Some(e)) = (s.running, &s.backend_error) {
             warning_card(ui, p, "拦截规则未生效", &format!("{}{e}", text::BACKEND_UNAVAILABLE));
             ui.add_space(4.0);
@@ -899,7 +1286,10 @@ impl App {
         let gate = match (s.whitelisted, s.blocked) {
             _ if !s.running => if s.backend_error.is_some() { "未连接" } else { "已停止" },
             _ if inert(&s) => "未通过，未拦截",
-            (Some(true), _) => "命中，放行",
+            // 出口命中但仍阻断：IPv6 出口未命中，或者 VPN 断开、网络变化后在等重新检测
+            (Some(true), true) if s.v6_whitelisted == Some(false) => "IPv6 未命中，阻断",
+            (Some(true), true) => "命中，暂时阻断",
+            (Some(true), false) => "命中，放行",
             (Some(false), _) => "未命中，阻断",
             (None, true) => "未确认，阻断",
             (None, false) if s.detect_error.is_some() => "检测失败",
@@ -930,8 +1320,29 @@ impl App {
         theme::section(ui, p, "检测");
         theme::card(ui, p, |ui| {
             theme::row(ui, p, "检测方式", None, |ui| {
-                let secs = self.applied.detect.interval_secs;
+                let mut secs = self.applied.detect.interval_secs;
+                let fast = self.applied.vpn.check_interval_secs;
+                if !s.vpn_guarded.is_empty() && fast > 0 {
+                    secs = secs.min(fast);
+                }
                 ui.label(RichText::new(format!("每 {secs} 秒，网络变化时立即")).color(p.secondary));
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "IPv6 出口", None, |ui| {
+                match (self.applied.ipv6.mode, s.egress_v6, s.v6_whitelisted) {
+                    (Ipv6Mode::Block, _, _) => theme::chip(ui, p.indigo, "始终阻断"),
+                    (Ipv6Mode::Off, _, _) => theme::chip(ui, p.gray, "不单独检测"),
+                    (Ipv6Mode::Check, Some(ip), Some(ok)) => {
+                        let r = theme::chip(ui, if ok { p.green } else { p.red }, if ok { "白名单内" } else { "不在白名单" });
+                        ui.label(RichText::new(ip.to_string()).monospace().color(p.secondary));
+                        r
+                    }
+                    (Ipv6Mode::Check, _, _) if s.egress_ip.is_some_and(|i| i.is_ipv6()) => {
+                        theme::chip(ui, p.gray, "与出口 IP 相同")
+                    }
+                    (Ipv6Mode::Check, _, _) if s.egress_ip.is_some() => theme::chip(ui, p.gray, "没有（不能直连 IPv6）"),
+                    (Ipv6Mode::Check, _, _) => theme::chip(ui, p.gray, "未检测"),
+                };
             });
             theme::hairline(ui, p);
             theme::row(ui, p, "上次检测", None, |ui| {
@@ -986,9 +1397,32 @@ impl App {
                 }
             });
             theme::hairline(ui, p);
+            theme::row(ui, p, "VPN 守护", Some("VPN 一断开就立即断网，不等下一次检测"), |ui| {
+                let (color, text) = if !self.applied.vpn.guard {
+                    (p.gray, "已关闭".to_owned())
+                } else if !s.vpn_guarded.is_empty() {
+                    (p.green, format!("守护中 · {}", s.vpn_guarded.join("、")))
+                } else if !s.vpn_connected.is_empty() {
+                    (p.gray, format!("等待放行 · {}", s.vpn_connected.join("、")))
+                } else {
+                    (p.gray, "没有连接 VPN".to_owned())
+                };
+                if theme::text_button(ui, color, &format!("{}  ›", shorten(&text, 40))).clicked() {
+                    goto = Some(Page::Settings);
+                }
+            });
+            theme::hairline(ui, p);
             if self.leak_overview_row(ui, p) {
                 goto = Some(Page::Leak);
             }
+            theme::hairline(ui, p);
+            let last = self.backend.events().into_iter().rev().find(|e| e.kind != Kind::Leak);
+            let sub = last.as_ref().map(|e| format!("{} {} · {}", e.time, e.kind.label(), shorten(&e.reason, 40)));
+            theme::row(ui, p, "连接记录", sub.as_deref(), |ui| {
+                if theme::text_button(ui, p.accent, "查看  ›").clicked() {
+                    goto = Some(Page::Events);
+                }
+            });
         });
         if let Some(pg) = goto {
             self.page = pg;
@@ -1561,6 +1995,12 @@ impl App {
             });
         });
 
+        let s = self.status.lock().unwrap().clone();
+        self.vpn_section(ui, p, &s);
+        self.ipv6_section(ui, p);
+        self.sync_services();
+        self.update_section(ui, p);
+
         theme::section(ui, p, "启动");
         let mut auto = self.autostart;
         let mut changed = false;
@@ -1720,6 +2160,25 @@ fn info_card(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
         });
 }
 
+/// 带右侧操作的提示卡片（蓝色）。
+fn info_card_with(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str, action: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(p.accent.gamma_multiply(if p.dark { 0.16 } else { 0.08 }))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 8.0, p.accent);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "↑", theme::bold(12.0), Color32::WHITE);
+                ui.label(RichText::new(title).font(theme::bold(14.0)).color(p.accent));
+                ui.with_layout(Layout::right_to_left(Align::Center), action);
+            });
+            ui.label(RichText::new(text).size(12.5).color(p.label));
+        });
+}
+
 fn empty_state(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(14.0);
@@ -1747,10 +2206,7 @@ impl eframe::App for App {
         // macOS：连上后台服务后以服务里的配置为准（没有未保存的修改时）
         if let Some(raw) = self.backend.take_new_config() {
             if !self.dirty() && raw != self.applied {
-                self.applied = raw.clone();
-                self.draft = raw;
-                self.services_text = self.draft.detect.services.join("\n");
-                self.leak.reset_text(&self.draft.leak_test.stun_servers);
+                self.set_applied(raw);
             }
         }
         // --leak-test：等出口 IP 检测出来（最多 15 秒）再开始，结果才能和出口对照
@@ -1837,7 +2293,17 @@ impl eframe::App for App {
                     self.log(ui, &p);
                     return;
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                // 内容高度要等排版过几帧才知道，所以连续几帧都设一次
+                if let Some((y, n)) = self.start_scroll.as_mut() {
+                    area = area.vertical_scroll_offset(*y);
+                    *n -= 1;
+                    if *n == 0 {
+                        self.start_scroll = None;
+                    }
+                    ui.ctx().request_repaint();
+                }
+                area.show(ui, |ui| {
                     ui.set_max_width(ui.available_width().min(760.0));
                     match self.page {
                         Page::Overview => self.overview(ui, &p),
@@ -1845,6 +2311,7 @@ impl eframe::App for App {
                         Page::Apps => self.apps(ui, &p),
                         Page::Network => self.network(ui, &p),
                         Page::Leak => self.leak_page(ui, &p),
+                        Page::Events => self.events_page(ui, &p),
                         Page::Settings => self.settings(ui, &p),
                         Page::Log => {}
                     }
@@ -1875,13 +2342,24 @@ fn titlebar_drag_area(ui: &mut egui::Ui) {
 }
 
 /// 从路径中取出不带扩展名（.exe / .app）的程序名（与运行平台无关）。
-/// 用系统默认方式打开链接（macOS 的 open；其他平台不需要）。
+/// 用系统默认方式打开链接（macOS 的 open，Windows 的 ShellExecute）。
 fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     if let Err(e) = std::process::Command::new("/usr/bin/open").arg(url).spawn() {
         log::warn!("无法打开 {url}: {e}");
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let u: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        // 只打开 http(s) 链接，不把任意文字交给 ShellExecute
+        if url.starts_with("https://") || url.starts_with("http://") {
+            unsafe { ShellExecuteW(None, w!("open"), PCWSTR(u.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     log::info!("打开 {url}");
 }
 

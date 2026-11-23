@@ -1,7 +1,8 @@
 // 按应用阻断的规则（网络扩展与测试共用，不依赖 NetworkExtension）。
 //
 // 后台服务推送的 JSON：
-//   {"kind":"filter","data":{"blocked":true,"inspect_existing":true,"apps":["/Applications/Foo.app", "/usr/local/bin/x"]}}
+//   {"kind":"filter","data":{"blocked":true,"inspect_existing":true,"apps":["/Applications/Foo.app", "/usr/local/bin/x"],"block_ipv6":false}}
+// block_ipv6：放行期间也丢弃受控应用的 IPv6 连接（「始终阻断 IPv6」）。
 // apps 里的条目可以是可执行文件的完整路径，也可以是 .app 应用包（包里的所有程序都算）。
 // 路径比较不区分大小写（与 Rust 一侧的 discovery::normalize 一致；APFS 默认也不区分大小写）。
 
@@ -19,15 +20,23 @@ enum FilterDecision: Equatable {
 struct FilterRules: Equatable {
     var blocked: Bool
     var inspectExisting: Bool
+    /// 放行期间也阻断受控应用的 IPv6 连接。
+    var blockIPv6: Bool
     /// 规范化后的路径：小写、去掉结尾的 "/"。
     private(set) var apps: [String]
 
     static let allowAll = FilterRules(blocked: false, inspectExisting: false, apps: [])
 
-    init(blocked: Bool, inspectExisting: Bool, apps: [String]) {
+    init(blocked: Bool, inspectExisting: Bool, apps: [String], blockIPv6: Bool = false) {
         self.blocked = blocked
         self.inspectExisting = inspectExisting
+        self.blockIPv6 = blockIPv6
         self.apps = apps.map(FilterRules.normalize).filter { !$0.isEmpty }
+    }
+
+    /// 远端地址是不是真正的 IPv6（IPv4 映射地址 ::ffff:a.b.c.d 走的是 IPv4，不算）。
+    static func isIPv6(host: String) -> Bool {
+        host.contains(":") && !host.lowercased().hasPrefix("::ffff:")
     }
 
     static func normalize(_ path: String) -> String {
@@ -47,7 +56,8 @@ struct FilterRules: Equatable {
         return FilterRules(
             blocked: data["blocked"] as? Bool ?? false,
             inspectExisting: data["inspect_existing"] as? Bool ?? false,
-            apps: data["apps"] as? [String] ?? []
+            apps: data["apps"] as? [String] ?? [],
+            blockIPv6: data["block_ipv6"] as? Bool ?? false
         )
     }
 
@@ -74,9 +84,10 @@ struct FilterRules: Equatable {
     }
 
     /// 任意一个路径受控即受控（例如连接既有发起进程，也有代为发起的应用）。
-    func decide(_ paths: [String]) -> FilterDecision {
+    /// `remoteIPv6`：连接的远端是 IPv6 地址。
+    func decide(_ paths: [String], remoteIPv6: Bool = false) -> FilterDecision {
         guard paths.contains(where: controls) else { return .allow }
-        if blocked { return .block }
+        if blocked || (blockIPv6 && remoteIPv6) { return .block }
         return inspectExisting ? .watch : .allow
     }
 }

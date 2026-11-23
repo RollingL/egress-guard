@@ -137,6 +137,7 @@ pub fn run(opts: Options) -> Result<()> {
         Arc::new(move |s| hub.publish(s))
     };
     let learned = crate::learned_file(&opts.config_path);
+    crate::eventlog::init(&crate::events_file(&opts.config_path));
     let handle = engine::spawn(cfg.clone(), opts.dry_run, false, Some(learned), reporter);
     let daemon = Arc::new(Daemon {
         tx: Mutex::new(handle.sender()),

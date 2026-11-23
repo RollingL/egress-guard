@@ -6,7 +6,9 @@
 //!   -c, --config PATH  配置文件路径（Windows，默认：exe 所在目录下的 config.toml）
 //!   --page NAME        打开时显示的页面（截图用）
 //!   --leak-test        打开后立即开始 DNS / WebRTC 泄露测试（截图用）
+//!   --scroll PX        打开时页面向下滚动的距离（截图用）
 //!   --netext-selftest [秒]  macOS：查询网络扩展状态并尝试安装，打印结果后退出（CI 用）
+//!   --notify-selftest  发一条测试通知后退出（CI 用）
 //!   --clipboard-selftest 输出文件 [秒]  打开一个输入框窗口检查系统剪贴板的复制、粘贴（CI 用）
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -19,6 +21,17 @@ fn clipboard_selftest(mut args: impl Iterator<Item = String>) -> ! {
         std::process::exit(1);
     }
     std::process::exit(0);
+}
+
+/// `--notify-selftest`：见 [`egress_guard::gui::notify_selftest`]。
+fn notify_selftest() -> ! {
+    match egress_guard::gui::notify_selftest() {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("无法发送通知：{e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -38,13 +51,16 @@ fn main() {
     let mut config: Option<PathBuf> = None;
     let mut start_page = None;
     let mut run_leak_test = false;
+    let mut scroll = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--minimized" => start_minimized = true,
             "-c" | "--config" => config = args.next().map(PathBuf::from),
             "--page" => start_page = args.next(),
             "--leak-test" => run_leak_test = true,
+            "--scroll" => scroll = args.next().and_then(|s| s.parse().ok()),
             "--clipboard-selftest" => clipboard_selftest(args),
+            "--notify-selftest" => notify_selftest(),
             _ => {}
         }
     }
@@ -68,7 +84,7 @@ fn main() {
     logbuf::init("info", false, Some(&dir.join("egress-guard.log")));
     log::info!("egress-guard-gui {} 启动", env!("CARGO_PKG_VERSION"));
 
-    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test }) {
+    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test, scroll }) {
         log::error!("{e:#}");
         let text: Vec<u16> = format!("{e:#}").encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
@@ -90,17 +106,20 @@ fn main() {
     let mut start_minimized = false;
     let mut start_page = None;
     let mut run_leak_test = false;
+    let mut scroll = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--minimized" => start_minimized = true,
             "--page" => start_page = args.next(),
             "--leak-test" => run_leak_test = true,
+            "--scroll" => scroll = args.next().and_then(|s| s.parse().ok()),
             // CI 自检：查询网络扩展状态并尝试安装，打印结果（JSON）后退出
             "--netext-selftest" => {
                 egress_guard::netext::selftest(args.next().and_then(|s| s.parse().ok()).unwrap_or(10.0));
                 return;
             }
             "--clipboard-selftest" => clipboard_selftest(args),
+            "--notify-selftest" => notify_selftest(),
             _ => {}
         }
     }
@@ -122,7 +141,7 @@ fn main() {
 
     // 配置由后台服务保存；这里的路径只在连不上服务时作为占位
     let config_path = paths::config_path();
-    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test }) {
+    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test, scroll }) {
         log::error!("{e:#}");
         let msg = format!("{e:#}").replace('\\', "\\\\").replace('"', "\\\"");
         let _ = std::process::Command::new("/usr/bin/osascript")
@@ -143,15 +162,18 @@ fn main() {
     let mut config_path = std::path::PathBuf::from("config.toml");
     let mut start_page = None;
     let mut run_leak_test = false;
+    let mut scroll = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--page" => start_page = args.next(),
             "--leak-test" => run_leak_test = true,
+            "--scroll" => scroll = args.next().and_then(|s| s.parse().ok()),
             "--clipboard-selftest" => clipboard_selftest(args),
+            "--notify-selftest" => notify_selftest(),
             other => config_path = other.into(),
         }
     }
-    if let Err(e) = gui::run(gui::Options { config_path, start_minimized: false, start_page, run_leak_test }) {
+    if let Err(e) = gui::run(gui::Options { config_path, start_minimized: false, start_page, run_leak_test, scroll }) {
         eprintln!("{e:#}");
         std::process::exit(1);
     }

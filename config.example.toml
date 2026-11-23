@@ -85,7 +85,15 @@ allow_remote = [
 appearance = "system"
 
 [leak_test]
-# 泄露测试（界面「泄露测试」页、命令行 egress-guard leak-test）。只在手动开始测试时使用。
+# 泄露测试（界面「泄露测试」页、命令行 egress-guard leak-test）。
+# 界面在后台自动测试：出口放行后、出口 IP 变化后等 10 秒测一次；之后按 interval_mins 定时测试。
+# 自动测试由界面进行，命令行版本只在执行 leak-test 时测试。
+# 网络变化后（刚放行、出口 IP 变化）自动测试
+auto_after_change = true
+# 定时测试的间隔（分钟），距上次测试（手动或自动）满这么久再测；0 = 不定时测试
+interval_mins = 60
+# 自动测试发现泄露时发系统通知（同一出口、同样的结论只提醒一次）
+notify = true
 # 可信 DNS 解析器：IP、CIDR 或自治系统号。DNS 泄露测试发现的解析器在这里或在出口 IP 白名单内时，不算泄露。
 # 用 Cloudflare、Google 等公共解析器时，它们向外查询的 IP 不固定，按自治系统信任更方便。
 trusted_dns = [
@@ -99,3 +107,32 @@ dnscheck_zone = "dnscheck.tools"
 dns_sources = ["dnscheck", "ip-api", "every1dns", "fastly", "surfshark", "ipleak", "browserleaks"]
 # WebRTC 泄露测试用的 STUN 服务器（主机:端口），按顺序尝试
 stun_servers = ["myip.addr.tools:3478", "stun.cloudflare.com:3478", "stun.l.google.com:19302", "stun.miwifi.com:3478"]
+
+[vpn]
+# VPN 守护：放行时记下正在使用的 VPN 网卡，之后它断开（网卡消失、关闭或失去地址）就立即阻断，
+# 不等下一次出口 IP 检测，也不受 behavior.block_on_network_change 的影响。
+guard = true
+# 要守护的网卡名称（Windows 为「以太网 2」这样的名称，也可以填网卡描述；macOS 为 utun4 等）。
+# 留空时自动识别：utun、tun、tap、ppp、ipsec、wg、tailscale 等名称，Windows 上还看接口类型与描述
+# （WireGuard、OpenVPN、TAP-Windows、Wintun 等）。只算有可用地址（不只是 fe80::）的网卡。
+interfaces = []
+# 通过 VPN 放行期间的检测间隔（秒），比 detect.interval_secs 更勤；0 = 与平时相同
+check_interval_secs = 15
+
+[ipv6]
+# IPv6 防护：
+#   check（默认）= 另外只走 IPv6 检测一次出口；本机能直连 IPv6 且这个地址不在白名单内时也阻断
+#                 （常见于 VPN 只接管 IPv4，IPv6 流量仍然直连）
+#   block        = 始终阻断受控应用的 IPv6（开启全局断网时为全部 IPv6，例外同全局断网），放行时也一样
+#   off          = 不处理 IPv6
+mode = "check"
+# 只走 IPv6 的出口查询服务，同时查询，取第一个成功结果
+services = ["https://6.ipw.cn", "https://api6.ipify.org", "https://v6.ident.me"]
+
+[update]
+# 界面启动 20 秒后、之后每天检查一次 GitHub Releases，有新版本时提醒（只提醒，不会自动下载安装）
+check = true
+# 发布所在的仓库（所有者/仓库名）
+repo = "RollingL/egress-guard"
+# 私有仓库需要一个有读取权限的 GitHub 令牌（fine-grained token 只勾选 Contents: Read）；公开仓库留空
+token = ""

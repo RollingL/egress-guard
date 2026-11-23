@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RawConfig;
 use crate::engine::Status;
+use crate::eventlog::{self, ConnEvent};
 use crate::filterfeed::{self, FilterHello, FilterState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,11 @@ pub enum Request {
     ClearLearned,
     Logs,
     ClearLogs,
+    /// 连接记录（阻断、恢复、泄露）。
+    Events,
+    ClearEvents,
+    /// 界面的自动泄露测试发现泄露时写入连接记录（只接受「泄露」类型）。
+    RecordEvent(Box<ConnEvent>),
     /// 开机自动启动后台服务。
     SetAutostart(bool),
     /// 移除全部阻断规则并退出服务。
@@ -43,7 +49,13 @@ impl Request {
     fn mutating(&self) -> bool {
         !matches!(
             self,
-            Request::Hello | Request::GetStatus | Request::Watch | Request::GetConfig | Request::Logs | Request::FilterWatch(_)
+            Request::Hello
+                | Request::GetStatus
+                | Request::Watch
+                | Request::GetConfig
+                | Request::Logs
+                | Request::Events
+                | Request::FilterWatch(_)
         )
     }
 }
@@ -67,6 +79,7 @@ pub enum Reply {
     Status(Box<Status>),
     Config(Box<RawConfig>),
     Logs(Vec<String>),
+    Events(Vec<ConnEvent>),
     /// 推送给网络扩展的规则。
     Filter(FilterState),
     Ok,
@@ -208,7 +221,14 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
         let reply = match req {
             Request::Hello => Reply::Hello(handler.hello()),
             Request::GetStatus => Reply::Status(Box::new(hub.state.lock().unwrap().1.clone())),
-            Request::GetConfig => Reply::Config(Box::new(handler.get_config())),
+            Request::GetConfig => {
+                let mut raw = handler.get_config();
+                // GitHub 令牌只给能修改设置的账户（管理员）；其他账户读到的配置里没有令牌
+                if !uid.is_some_and(may_modify) {
+                    raw.update.token.clear();
+                }
+                Reply::Config(Box::new(raw))
+            }
             Request::SetConfig(raw) => match handler.set_config(*raw) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Err(format!("{e:#}")),
@@ -226,6 +246,17 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
                 crate::logbuf::clear();
                 Reply::Ok
             }
+            Request::Events => Reply::Events(eventlog::recent()),
+            Request::ClearEvents => {
+                eventlog::clear();
+                log::info!("界面清空了连接记录");
+                Reply::Ok
+            }
+            Request::RecordEvent(e) if e.kind == eventlog::Kind::Leak => {
+                eventlog::record(*e);
+                Reply::Ok
+            }
+            Request::RecordEvent(_) => Reply::Err("只能写入泄露测试的结果".into()),
             Request::SetAutostart(on) => match handler.set_autostart(on) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Err(format!("{e:#}")),
@@ -373,6 +404,13 @@ impl Client {
         }
     }
 
+    pub fn events(&self) -> Result<Vec<ConnEvent>> {
+        match self.request(&Request::Events, Duration::from_secs(5))? {
+            Reply::Events(l) => Ok(l),
+            other => bail!("意外的回复: {other:?}"),
+        }
+    }
+
     pub fn logs(&self) -> Result<Vec<String>> {
         match self.request(&Request::Logs, Duration::from_secs(5))? {
             Reply::Logs(l) => Ok(l),
@@ -498,6 +536,14 @@ mod tests {
         }
         assert!(c.status().unwrap().running);
 
+        // 连接记录：界面只能写入泄露类型
+        let leak = eventlog::ConnEvent::now(eventlog::Kind::Leak, "ipc-test-leak");
+        c.command(&Request::RecordEvent(Box::new(leak)), Duration::from_secs(5)).unwrap();
+        assert!(c.events().unwrap().iter().any(|e| e.reason == "ipc-test-leak"));
+        let fake = eventlog::ConnEvent::now(eventlog::Kind::Restore, "ipc-test-fake");
+        assert!(c.command(&Request::RecordEvent(Box::new(fake)), Duration::from_secs(5)).is_err());
+        assert!(!c.events().unwrap().iter().any(|e| e.reason == "ipc-test-fake"));
+
         c.command(&Request::Stop, Duration::from_secs(5)).unwrap();
         // 服务先回复再调用 stop()（stop 可能直接退出进程），所以这里稍等片刻
         let t = std::time::Instant::now();
@@ -515,7 +561,7 @@ mod tests {
         let handler = Arc::new(TestHandler { cfg: Mutex::new(RawConfig::default()), stopped: AtomicBool::new(false) });
         serve(listener, handler, Arc::new(StatusHub::default()));
         let hub = filterfeed::hub();
-        hub.set(FilterState { blocked: true, inspect_existing: true, apps: vec!["/Applications/A.app".into()] });
+        hub.set(FilterState { blocked: true, inspect_existing: true, apps: vec!["/Applications/A.app".into()], block_ipv6: false });
 
         let (tx, rx) = std::sync::mpsc::channel();
         let c = Client::new(&path);
@@ -536,7 +582,7 @@ mod tests {
             if hub.connected().is_none() {
                 break;
             }
-            hub.set(FilterState { blocked: false, inspect_existing: false, apps: vec![format!("{:?}", std::time::Instant::now())] });
+            hub.set(FilterState { apps: vec![format!("{:?}", std::time::Instant::now())], ..Default::default() });
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(hub.connected(), None);
@@ -554,7 +600,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&Reply::Filter(FilterState::default())).unwrap(),
-            "{\"kind\":\"filter\",\"data\":{\"blocked\":false,\"inspect_existing\":false,\"apps\":[]}}"
+            "{\"kind\":\"filter\",\"data\":{\"blocked\":false,\"inspect_existing\":false,\"apps\":[],\"block_ipv6\":false}}"
         );
     }
 }

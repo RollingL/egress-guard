@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod egress;
 pub mod engine;
+pub mod eventlog;
 #[cfg(unix)]
 pub mod filterfeed;
 pub mod leaktest;
@@ -22,6 +23,8 @@ pub mod logbuf;
 pub mod mac;
 pub mod netext;
 pub mod pfrules;
+pub mod update;
+pub mod vpn;
 #[cfg(windows)]
 pub mod win;
 
@@ -32,11 +35,16 @@ pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
+fn config_dir(config_path: &Path) -> &Path {
+    config_path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
 /// 子进程识别记录文件：与配置文件放在同一目录。
 pub fn learned_file(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .join("learned-apps.txt")
+    config_dir(config_path).join("learned-apps.txt")
+}
+
+/// 连接记录（阻断、恢复、泄露）文件：与配置文件放在同一目录。
+pub fn events_file(config_path: &Path) -> PathBuf {
+    config_dir(config_path).join("connection-log.jsonl")
 }
