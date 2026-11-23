@@ -227,17 +227,8 @@ impl EgressDetector {
         };
         // 走代理时本机路由无关：要验证的是代理的出口，连不上代理、代理没有这个地址族的出口都算失败。
         // 判断不了有没有路由时照常检测：测不到就是 Failed，而不是当作没有路由跳过验证
-        if !self.via_proxy() {
-            match has_route(v6) {
-                Route::Yes => {}
-                Route::No => return Probe::NoRoute,
-                Route::Unknown => log::debug!("无法判断本机有没有{}路由，按有路由检测", if v6 { " IPv6 " } else { " IPv4 " }),
-            }
-        }
-        match self.detect() {
-            Ok(ip) => Probe::Verified(ip),
-            Err(e) => Probe::Failed(format!("{e:#}")),
-        }
+        let route = if self.via_proxy() { Route::Yes } else { has_route(v6) };
+        probe_with(v6, route, || self.detect())
     }
 
     /// 依次尝试各服务（IPv6 时同时请求），返回第一个成功解析的出口 IP。
@@ -325,25 +316,92 @@ pub enum Route {
     Unknown,
 }
 
+/// 按路由判断的结果决定是否检测：没有路由的地址族不需要验证，其余（包括判断不了的）都按配置的服务实际检测。
+pub fn probe_with(v6: bool, route: Route, detect: impl FnOnce() -> Result<IpAddr>) -> Probe {
+    match route {
+        Route::Yes => {}
+        Route::No => return Probe::NoRoute,
+        Route::Unknown => log::debug!("无法确认本机有没有{}路由，按有路由检测", if v6 { " IPv6 " } else { " IPv4 " }),
+    }
+    match detect() {
+        Ok(ip) => Probe::Verified(ip),
+        Err(e) => Probe::Failed(format!("{e:#}")),
+    }
+}
+
 /// 本机有没有通往公网的 IPv4 / IPv6 路由。
 ///
-/// 用 UDP 套接字 connect 一个公网地址：只查路由表、不发任何数据包。只有系统明确报告「不支持这个地址族 /
-/// 网络不可达」，或者只能选出未指定 / 链路本地的源地址时才算没有路由；其他错误一律是 [`Route::Unknown`]。
+/// 用 UDP 套接字 connect 一个固定的公网地址：只查路由表、不发任何数据包。一个目的地不能代表整个地址族
+/// （更具体的路由、VPN 分流、临时地址切换都可能让它单独不可达），所以只有系统级的证据才算没有路由：
+/// 系统不支持这个地址族，或者本机根本没有这个地址族可用于公网的地址（IPv4：非回环、非链路本地；
+/// IPv6：全球单播 2000::/3）。到这个目的地不可达、选不出可用的源地址，而本机又有这样的地址时是
+/// [`Route::Unknown`]，照样按配置的服务检测。
 pub fn has_route(v6: bool) -> Route {
     use std::net::UdpSocket;
     let (bind, target) =
         if v6 { ("[::]:0", "[2001:4860:4860::8888]:443") } else { ("0.0.0.0:0", "8.8.8.8:443") };
-    let s = match UdpSocket::bind(bind) {
-        Ok(s) => s,
-        Err(e) => return route_error(&e),
+    let source = UdpSocket::bind(bind).and_then(|s| {
+        s.connect(target)?;
+        Ok(s.local_addr()?.ip())
+    });
+    classify_route(v6, source, || {
+        crate::leaktest::ifaces::try_adapters().map(|a| a.into_iter().flat_map(|x| x.addrs).collect())
+    })
+}
+
+/// [`has_route`] 的判断部分：`source` 是系统为固定目的地选出的源地址（或出错原因），
+/// `addrs` 列出本机网卡上的地址（列不出时为 None）。
+pub fn classify_route(
+    v6: bool,
+    source: std::io::Result<IpAddr>,
+    addrs: impl FnOnce() -> Option<Vec<IpAddr>>,
+) -> Route {
+    let single = match &source {
+        Ok(src) => route_from_source(v6, *src),
+        Err(e) => route_error(e),
     };
-    if let Err(e) = s.connect(target) {
-        return route_error(&e);
+    if single != Route::No {
+        return single;
     }
-    match s.local_addr() {
-        Ok(a) => route_from_source(v6, a.ip()),
-        Err(e) => route_error(&e),
+    if let Err(e) = &source {
+        if family_unsupported(e) {
+            return Route::No;
+        }
     }
+    // 只是这一个目的地走不通：看本机还有没有这个地址族可用于公网的地址
+    match addrs() {
+        Some(list) if !list.iter().any(|a| usable_for_family(v6, *a)) => Route::No,
+        Some(_) => {
+            log::debug!("{}固定目的地不可达，但本机有可用地址，照常检测", if v6 { "IPv6 " } else { "IPv4 " });
+            Route::Unknown
+        }
+        None => Route::Unknown,
+    }
+}
+
+/// 本机地址能否用于这个地址族的公网通信。
+fn usable_for_family(v6: bool, a: IpAddr) -> bool {
+    match crate::config::normalize(a) {
+        IpAddr::V4(a) => !v6 && !a.is_unspecified() && !a.is_loopback() && !a.is_link_local(),
+        // 全球单播 2000::/3（ULA、链路本地都不能直接上公网）。休眠的 Teredo 隧道（2001::/32）
+        // 在只有 IPv4 的 Windows 上也常带着地址，不算证据
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            v6 && (s[0] & 0xe000) == 0x2000 && !(s[0] == 0x2001 && s[1] == 0)
+        }
+    }
+}
+
+#[cfg(unix)]
+const AF_NOT_SUPPORTED: [i32; 2] = [libc::EAFNOSUPPORT, libc::EPROTONOSUPPORT];
+#[cfg(windows)]
+const AF_NOT_SUPPORTED: [i32; 2] = [10047 /* WSAEAFNOSUPPORT */, 10043 /* WSAEPROTONOSUPPORT */];
+#[cfg(not(any(unix, windows)))]
+const AF_NOT_SUPPORTED: [i32; 0] = [];
+
+/// 系统不支持这个地址族（例如关闭了 IPv6）。
+fn family_unsupported(e: &std::io::Error) -> bool {
+    e.raw_os_error().is_some_and(|c| AF_NOT_SUPPORTED.contains(&c))
 }
 
 /// 按系统为公网目的地选出的源地址判断。
@@ -356,21 +414,14 @@ pub fn route_from_source(v6: bool, src: IpAddr) -> Route {
     if usable { Route::Yes } else { Route::No }
 }
 
-/// 只有「地址族不受支持」和「网络 / 主机不可达、没有可用的源地址」才确认没有路由。
+/// 单个目的地的错误：只有「地址族不受支持」和「网络 / 主机不可达、没有可用的源地址」才可能是没有路由
+/// （后者还要看本机地址，见 [`classify_route`]）；其他错误（权限、资源不足等）是 [`Route::Unknown`]。
 pub fn route_error(e: &std::io::Error) -> Route {
     use std::io::ErrorKind::*;
-    if matches!(e.kind(), NetworkUnreachable | HostUnreachable | AddrNotAvailable) {
-        return Route::No;
-    }
-    #[cfg(unix)]
-    const AF_NOT_SUPPORTED: [i32; 2] = [libc::EAFNOSUPPORT, libc::EPROTONOSUPPORT];
-    #[cfg(windows)]
-    const AF_NOT_SUPPORTED: [i32; 2] = [10047 /* WSAEAFNOSUPPORT */, 10043 /* WSAEPROTONOSUPPORT */];
-    #[cfg(not(any(unix, windows)))]
-    const AF_NOT_SUPPORTED: [i32; 0] = [];
-    match e.raw_os_error() {
-        Some(code) if AF_NOT_SUPPORTED.contains(&code) => Route::No,
-        _ => Route::Unknown,
+    if matches!(e.kind(), NetworkUnreachable | HostUnreachable | AddrNotAvailable) || family_unsupported(e) {
+        Route::No
+    } else {
+        Route::Unknown
     }
 }
 
@@ -551,6 +602,47 @@ mod tests {
         assert_eq!(route_from_source(true, ip("2001:db8::5")), Route::Yes);
         assert_eq!(route_from_source(true, ip("fe80::1")), Route::No);
         assert_eq!(route_from_source(true, ip("::")), Route::No);
+    }
+
+    /// 固定目的地不可达不能代表整个地址族：本机有可用地址时照常检测；只有系统级证据才跳过。
+    #[test]
+    fn single_destination_unreachable_is_not_no_route() {
+        use std::io::{Error, ErrorKind};
+        let unreachable = || Err(Error::from(ErrorKind::NetworkUnreachable));
+        let addrs = |list: &'static [&'static str]| move || Some(list.iter().map(|a| ip(a)).collect::<Vec<_>>());
+        // 有全球单播 IPv6 地址（例如 VPN 分流、只有更具体的路由）：不确定，要检测
+        assert_eq!(classify_route(true, unreachable(), addrs(&["192.168.1.5", "fe80::1", "2001:db8::5"])), Route::Unknown);
+        assert_eq!(classify_route(true, Err(Error::from(ErrorKind::AddrNotAvailable)), addrs(&["2001:db8::5"])), Route::Unknown);
+        assert_eq!(classify_route(true, Ok(ip("fe80::1")), addrs(&["2001:db8::5"])), Route::Unknown);
+        // 真单栈：只有链路本地 / ULA 的 IPv6，没有全球单播地址
+        assert_eq!(classify_route(true, unreachable(), addrs(&["192.168.1.5", "fe80::1", "fd00::5", "2001:0:4136:e378::1"])), Route::No);
+        assert_eq!(classify_route(false, unreachable(), addrs(&["2001:db8::5", "169.254.3.3"])), Route::No);
+        assert_eq!(classify_route(false, unreachable(), addrs(&["10.8.0.2"])), Route::Unknown);
+        // 列不出网卡：不确定
+        assert_eq!(classify_route(true, unreachable(), || None), Route::Unknown);
+        // 系统不支持这个地址族：不看网卡
+        #[cfg(unix)]
+        assert_eq!(classify_route(true, Err(Error::from_raw_os_error(libc::EAFNOSUPPORT)), addrs(&["2001:db8::5"])), Route::No);
+        // 权限不足等：不确定
+        assert_eq!(classify_route(true, Err(Error::from(ErrorKind::PermissionDenied)), addrs(&[])), Route::Unknown);
+        assert_eq!(classify_route(true, Ok(ip("2001:db8::5")), addrs(&[])), Route::Yes);
+    }
+
+    /// 固定目的地不可达、同族检测服务仍可达并返回白名单外地址：最终阻断；检测失败时按检测失败处理（不放行）。
+    #[test]
+    fn unreachable_probe_target_still_verifies_family() {
+        let cfg = Config::parse("whitelist=[\"203.0.113.0/24\"]\n[ipv6]\nmode=\"check\"").unwrap();
+        let wl = |a: IpAddr| cfg.is_whitelisted(a);
+        let v4 = Probe::Verified(ip("203.0.113.9"));
+        let v6 = probe_with(true, Route::Unknown, || Ok(ip("2001:db8::9")));
+        assert_eq!(v6, Probe::Verified(ip("2001:db8::9")));
+        let e = combine(v4.clone(), v6, wl).unwrap();
+        assert!(!crate::controller::egress_allowed(&cfg, &e));
+        let failed = probe_with(true, Route::Unknown, || Err(anyhow!("超时")));
+        assert!(combine(v4.clone(), failed, wl).is_err(), "未验证，不能放行");
+        // 真单栈才跳过
+        assert_eq!(probe_with(true, Route::No, || panic!("不应检测")), Probe::NoRoute);
+        assert!(crate::controller::egress_allowed(&cfg, &combine(v4, Probe::NoRoute, wl).unwrap()));
     }
 
     fn ip(s: &str) -> IpAddr {
