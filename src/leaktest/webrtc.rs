@@ -96,6 +96,11 @@ pub fn run(
     let mut resolved: Vec<(String, Vec<SocketAddr>)> = Vec::new();
     let mut unresolved = Vec::new();
     for s in servers {
+        // 解析也会发出 DNS 查询：取消后不再解析
+        if cancel() {
+            unresolved.push(format!("{s}：测试已取消"));
+            continue;
+        }
         match stun::resolve(s) {
             Ok(addrs) => {
                 let mut pick = Vec::new();
@@ -178,7 +183,7 @@ fn probe(
                 return path;
             }
             tried += 1;
-            match stun::query(&sock, *a, PER_SERVER) {
+            match stun::query(&sock, *a, PER_SERVER, cancel) {
                 Ok(m) => {
                     path.mapped = Some(m);
                     path.server = Some(name.clone());
@@ -200,6 +205,13 @@ fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_run_sends_nothing() {
+        let r = run(&["stun.example.invalid:3478".into()], None, &Judge::default(), &|| true);
+        assert!(r.unresolved.iter().all(|u| u.contains("已取消")), "{:?}", r.unresolved);
+        assert!(r.paths.iter().all(|p| p.mapped.is_none()));
+    }
 
     fn path(iface: Option<&str>, mapped: Option<&str>) -> StunPath {
         StunPath {

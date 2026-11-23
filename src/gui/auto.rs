@@ -86,6 +86,9 @@ fn allowed_key(s: &Status) -> Option<Key> {
         && !s.blocked
         && !s.simulated
         && s.apply_error.is_none()
+        // 保护范围没有完全就绪（例如网络扩展缺能力、规则没按新配置更新）时测出来的结果说明不了问题
+        && s.degraded.is_none()
+        && s.config_apply_error.is_none()
         && s.whitelisted == Some(true)
         && s.v6_whitelisted != Some(false);
     ok.then_some(())?;

@@ -328,11 +328,14 @@ impl IpInfo {
 const LOOKUP_PARALLEL: usize = 8;
 
 /// 查询多个 IP 的归属（并行，失败的为 None）。
-pub fn lookup_info(ips: &[IpAddr]) -> Vec<Option<IpInfo>> {
+/// `cancel` 为真时不再发出新的查询（已经发出的照常收尾）。
+pub fn lookup_info(ips: &[IpAddr], cancel: &(dyn Fn() -> bool + Sync)) -> Vec<Option<IpInfo>> {
     use ureq::tls::{TlsConfig, TlsProvider};
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
         .timeout_global(Some(Duration::from_secs(6)))
+        // 与其他测试请求一样直连：不用环境变量里的代理（ureq 默认会读），归属查询看的是本机直连能到的服务
+        .proxy(None)
         .user_agent(concat!("egress-guard/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
@@ -341,6 +344,9 @@ pub fn lookup_info(ips: &[IpAddr]) -> Vec<Option<IpInfo>> {
     uniq.sort();
     uniq.dedup();
     let found = parallel_map(&uniq, LOOKUP_PARALLEL, |ip| -> Option<IpInfo> {
+        if cancel() {
+            return None;
+        }
         let body = agent
             .get(&format!("https://ip.addr.tools/{ip}"))
             .header("Accept", "application/json")

@@ -4,12 +4,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use egress_guard::config::Config;
+#[cfg(unix)]
 use egress_guard::egress::EgressDetector;
 use egress_guard::{engine, exe_dir, learned_file, logbuf};
 
@@ -317,16 +319,16 @@ fn leak_test(cfg: &Config, do_dns: bool, do_webrtc: bool, json: bool, fail_on_le
 
     let lt = &cfg.leak_test;
     let judge = Judge { whitelist: cfg.whitelist.clone(), trusted: lt.trusted_dns.iter().filter_map(|s| leaktest::Trusted::parse(s).ok()).collect() };
-    let det = EgressDetector::new(cfg.detect.services.clone(), Duration::from_secs(cfg.detect.timeout_secs));
-    let egress = match det.detect() {
-        Ok(ip) => Some(ip),
+    // 出口基线与引擎相同（同样的代理设置和地址族），对照的才是引擎据以放行的那个出口
+    let egress = match egress_guard::egress::Detectors::new(cfg).detect() {
+        Ok(e) => Some(e.ip),
         Err(e) => {
             log::warn!("无法检测出口 IP：{e:#}");
             None
         }
     };
     let (dns_r, rtc_r) = std::thread::scope(|s| {
-        let d = do_dns.then(|| s.spawn(|| dns::run(&lt.dnscheck_zone, &lt.dns_sources, egress, &judge, &|_| {})));
+        let d = do_dns.then(|| s.spawn(|| dns::run(&lt.dnscheck_zone, &lt.dns_sources, egress, &judge, &|_| {}, &|| false)));
         let w = do_webrtc.then(|| s.spawn(|| webrtc::run(&lt.stun_servers, egress, &judge, &|| false)));
         (d.map(|j| j.join().expect("DNS 测试线程异常")), w.map(|j| j.join().expect("WebRTC 测试线程异常")))
     });

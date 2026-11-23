@@ -126,8 +126,13 @@ pub fn new_txid() -> [u8; 12] {
     t
 }
 
-/// 用给定的套接字向一个 STUN 服务器发送绑定请求，等待映射地址（中途重发一次）。
-pub fn query(sock: &UdpSocket, server: SocketAddr, timeout: Duration) -> Result<SocketAddr> {
+/// 用给定的套接字向一个 STUN 服务器发送绑定请求，等待映射地址（中途重发一次；`cancel` 为真时不再重发）。
+pub fn query(
+    sock: &UdpSocket,
+    server: SocketAddr,
+    timeout: Duration,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<SocketAddr> {
     let txid = new_txid();
     let req = binding_request(&txid);
     let start = Instant::now();
@@ -157,7 +162,9 @@ pub fn query(sock: &UdpSocket, server: SocketAddr, timeout: Duration) -> Result<
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                 if !resent {
                     resent = true;
-                    let _ = sock.send_to(&req, server);
+                    if !cancel() {
+                        let _ = sock.send_to(&req, server);
+                    }
                 }
             }
             // Windows：之前发出的包收到 ICMP 端口不可达时，下一次接收会报 ConnectionReset。
@@ -266,8 +273,25 @@ mod tests {
             server.send_to(&enc(&txid), from).unwrap();
         });
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let a = query(&sock, addr, Duration::from_millis(1500)).unwrap();
+        let a = query(&sock, addr, Duration::from_millis(1500), &|| false).unwrap();
         assert_eq!(a, "192.0.2.1:32853".parse().unwrap());
         t.join().unwrap();
     }
+
+    #[test]
+    fn no_resend_after_cancel() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let addr = server.local_addr().unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(query(&sock, addr, Duration::from_millis(400), &|| true).is_err());
+        let mut buf = [0u8; 64];
+        let mut got = 0;
+        while server.recv_from(&mut buf).is_ok() {
+            got += 1;
+        }
+        // 已经发出的第一个请求照常，取消后不再重发
+        assert_eq!(got, 1);
+    }
+
 }
