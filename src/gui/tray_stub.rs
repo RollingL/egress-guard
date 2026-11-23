@@ -8,6 +8,7 @@ use super::backend::Backend;
 use super::icons::Shade;
 
 #[allow(dead_code)]
+#[derive(PartialEq)]
 pub struct TrayState {
     pub shade: Shade,
     pub tooltip: String,
@@ -22,3 +23,6 @@ pub struct TrayCtx {
 }
 
 pub fn spawn(_t: TrayCtx, _rx: Receiver<TrayState>) {}
+
+/// 有新状态时唤醒托盘线程（这里没有托盘）。
+pub fn wake() {}

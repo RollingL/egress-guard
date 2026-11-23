@@ -151,6 +151,78 @@ struct ProcPicker {
     filter: String,
     list: Vec<procs::ProcInfo>,
     target: PickFor,
+    /// 后台线程正在读取的进程列表（列出全部进程要逐个打开，不在界面线程里做）。
+    loading: Option<mpsc::Receiver<Vec<procs::ProcInfo>>>,
+}
+
+impl ProcPicker {
+    fn open(target: PickFor, ctx: &egui::Context) -> Self {
+        let mut p = Self { filter: String::new(), list: Vec::new(), target, loading: None };
+        p.reload(ctx);
+        p
+    }
+
+    fn reload(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("list-processes".into()).spawn(move || {
+            let _ = tx.send(procs::list_processes());
+            ctx.request_repaint();
+        });
+        match spawned {
+            Ok(_) => self.loading = Some(rx),
+            Err(_) => self.list = procs::list_processes(),
+        }
+    }
+
+    /// 取回后台读到的列表；返回是否还在读取。
+    fn poll(&mut self) -> bool {
+        let Some(rx) = &self.loading else { return false };
+        match rx.try_recv() {
+            Ok(list) => {
+                self.list = list;
+                self.loading = None;
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.loading = None;
+                false
+            }
+        }
+    }
+}
+
+/// 每帧都要显示、但不必每帧重新取的数据（日志、连接记录）：最多每 [`Refreshing::EVERY`] 取一次，
+/// 各帧共用同一份，不再每帧复制几百行日志或上千条记录。
+struct Refreshing<T> {
+    at: Option<Instant>,
+    data: Arc<T>,
+}
+
+impl<T: Default> Default for Refreshing<T> {
+    fn default() -> Self {
+        Self { at: None, data: Arc::new(T::default()) }
+    }
+}
+
+impl<T> Refreshing<T> {
+    const EVERY: Duration = Duration::from_millis(500);
+
+    fn get(&mut self, ctx: &egui::Context, fetch: impl FnOnce() -> T) -> Arc<T> {
+        if self.at.is_none_or(|t| t.elapsed() >= Self::EVERY) {
+            self.data = Arc::new(fetch());
+            self.at = Some(Instant::now());
+        }
+        // 页面开着时按这个间隔刷新，新内容最多晚这么久出现
+        ctx.request_repaint_after(Self::EVERY);
+        self.data.clone()
+    }
+
+    /// 内容刚被清空等：下一帧重新取。
+    fn invalidate(&mut self) {
+        self.at = None;
+    }
 }
 
 struct App {
@@ -174,6 +246,8 @@ struct App {
     applying: Option<u64>,
     load_error: Option<String>,
     picker: Option<ProcPicker>,
+    logs_cache: Refreshing<Vec<String>>,
+    events_cache: Refreshing<Vec<crate::eventlog::ConnEvent>>,
     autostart: bool,
     hide_on_first_frame: bool,
     /// 已经处理过第一帧。
@@ -266,9 +340,18 @@ pub fn run(opts: Options) -> Result<()> {
             let reporter: engine::Reporter = {
                 let status = status.clone();
                 let ctx = ctx.clone();
+                // 托盘只在显示的内容变了时更新
+                let last_tray: Mutex<Option<tray::TrayState>> = Mutex::new(None);
                 Arc::new(move |s: &Status| {
                     *status.lock().unwrap() = s.clone();
-                    let _ = tray_tx.send(tray_state(s));
+                    let t = tray_state(s);
+                    let mut last = last_tray.lock().unwrap();
+                    if last.as_ref() != Some(&t) {
+                        let _ = tray_tx.send(tray_state(s));
+                        *last = Some(t);
+                        tray::wake();
+                    }
+                    drop(last);
                     ctx.request_repaint();
                 })
             };
@@ -330,6 +413,8 @@ pub fn run(opts: Options) -> Result<()> {
                 applying: None,
                 load_error,
                 picker: None,
+                logs_cache: Default::default(),
+                events_cache: Default::default(),
                 hide_on_first_frame: opts.start_minimized,
                 started: false,
                 shown_appearance: None,
@@ -1012,7 +1097,8 @@ impl App {
 
     fn events_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         theme::page_title(ui, p, "连接记录", "每次阻断、恢复的时间、原因和当时的出口 IP，以及自动泄露测试发现的泄露。");
-        let events = self.backend.events();
+        let backend = self.backend.clone();
+        let events = self.events_cache.get(ui.ctx(), || backend.events());
         let mut clear = false;
         ui.horizontal(|ui| {
             theme::segmented(
@@ -1080,6 +1166,7 @@ impl App {
             &format!("最多保留最近 {} 条，这里显示最近 {SHOWN} 条。记录文件：{}", crate::eventlog::MAX_EVENTS, file.display()),
         );
         if clear {
+            self.events_cache.invalidate();
             match self.backend.clear_events() {
                 Ok(()) => self.notify(true, "已清空连接记录"),
                 Err(e) => self.notify(false, format!("{e:#}")),
@@ -1489,7 +1576,9 @@ impl App {
                 goto = Some(Page::Leak);
             }
             theme::hairline(ui, p);
-            let last = self.backend.events().into_iter().rev().find(|e| e.kind != Kind::Leak);
+            let backend = self.backend.clone();
+            let events = self.events_cache.get(ui.ctx(), || backend.events());
+            let last = events.iter().rev().find(|e| e.kind != Kind::Leak);
             let sub = last.as_ref().map(|e| format!("{} {} · {}", e.time, e.kind.label(), shorten(&e.reason, 40)));
             theme::row(ui, p, "连接记录", sub.as_deref(), |ui| {
                 if theme::text_button(ui, p.accent, "查看  ›").clicked() {
@@ -1596,8 +1685,7 @@ impl App {
                 }
             }
             if theme::gray_button(ui, p, "从正在运行的程序中选择…").clicked() {
-                self.picker =
-                    Some(ProcPicker { filter: String::new(), list: procs::list_processes(), target: PickFor::Apps });
+                self.picker = Some(ProcPicker::open(PickFor::Apps, ui.ctx()));
             }
         });
         ui.add_space(4.0);
@@ -1778,10 +1866,13 @@ impl App {
                             .desired_width(ui.available_width() - 70.0)
                             .margin(Margin::symmetric(8, 5)),
                     );
-                    if theme::gray_button(ui, p, "刷新").clicked() {
-                        picker.list = procs::list_processes();
+                    if theme::gray_button(ui, p, "刷新").clicked() && picker.loading.is_none() {
+                        picker.reload(ui.ctx());
                     }
                 });
+                if picker.poll() && picker.list.is_empty() {
+                    ui.label(RichText::new("正在读取正在运行的程序…").color(p.secondary));
+                }
                 ui.add_space(4.0);
                 let f = picker.filter.to_lowercase();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -1901,11 +1992,7 @@ impl App {
                 }
             }
             if theme::gray_button(ui, p, "从正在运行的程序中选择…").clicked() {
-                self.picker = Some(ProcPicker {
-                    filter: String::new(),
-                    list: procs::list_processes(),
-                    target: PickFor::AllowApps,
-                });
+                self.picker = Some(ProcPicker::open(PickFor::AllowApps, ui.ctx()));
             }
         });
         ui.add_space(4.0);
@@ -2126,6 +2213,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::gray_button(ui, p, "清空").clicked() {
                     self.backend.clear_logs();
+                    self.logs_cache.invalidate();
                 }
             });
         });
@@ -2135,7 +2223,8 @@ impl App {
         ui.add_space(8.0);
         theme::card(ui, p, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                for line in self.backend.logs() {
+                let backend = self.backend.clone();
+                for line in self.logs_cache.get(ui.ctx(), || backend.logs()).iter() {
                     let c = if line.contains(" ERROR ") {
                         p.red
                     } else if line.contains(" WARN ") {

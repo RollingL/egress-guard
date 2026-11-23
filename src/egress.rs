@@ -64,10 +64,6 @@ pub struct EgressDetector {
 }
 
 impl EgressDetector {
-    pub fn new(services: Vec<String>, timeout: Duration) -> Self {
-        Self::with_family(services, timeout, Family::Any)
-    }
-
     pub fn with_family(services: Vec<String>, timeout: Duration, family: Family) -> Self {
         Self::with_proxy(services, timeout, family, None)
     }
@@ -148,7 +144,6 @@ impl EgressDetector {
     pub fn detect_unprivileged(&self) -> Result<IpAddr> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        use std::time::Instant;
 
         let (uid, gid) = unsafe {
             let pw = libc::getpwnam(c"nobody".as_ptr());
@@ -189,19 +184,30 @@ impl EgressDetector {
         // 每个服务最多 timeout（IPv6 同时请求，总共最多 timeout），再留一些余量
         let n = if self.family == Family::V6 { 1 } else { (self.services.len() as u32).max(1) };
         let wait = self.timeout.saturating_mul(n).saturating_add(Duration::from_secs(5));
-        let deadline = Instant::now().checked_add(wait).unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
-        loop {
-            if child.try_wait()?.is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(anyhow!("检测子进程超时"));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let out = child.wait_with_output()?;
+        // 在单独的线程里读完子进程的输出（子进程退出时管道关闭），这里阻塞等它，不再每 50ms 醒来看一次。
+        // 子进程本身留在这里：超时时还没回收，PID 仍属于它，可以安全地结束它
+        let (mut so, mut se) = (child.stdout.take(), child.stderr.take());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("probe-read".into())
+            .spawn(move || {
+                use std::io::Read;
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                if let Some(p) = so.as_mut() {
+                    let _ = p.read_to_end(&mut out);
+                }
+                if let Some(p) = se.as_mut() {
+                    let _ = p.read_to_end(&mut err);
+                }
+                let _ = tx.send((out, err));
+            })
+            .map_err(|e| anyhow!("无法创建读取检测子进程输出的线程: {e}"))?;
+        let Ok((stdout, stderr)) = rx.recv_timeout(wait.min(Duration::from_secs(3600))) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("检测子进程超时"));
+        };
+        let out = std::process::Output { status: child.wait()?, stdout, stderr };
         let stdout = String::from_utf8_lossy(&out.stdout);
         if out.status.success() {
             if let Ok(ip) = stdout.trim().parse() {

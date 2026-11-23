@@ -4,6 +4,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ pub enum Event {
 }
 
 /// 引擎对外报告的状态快照。macOS 上由后台服务通过本地套接字发给界面。
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Status {
     /// 最近一次检测到的出口 IP。
@@ -104,6 +105,35 @@ pub struct Status {
 }
 
 pub type Reporter = Arc<dyn Fn(&Status) + Send + Sync>;
+
+/// 网卡变化监听用的通知端：一批连续的系统通知只给引擎发一个 [`Event::NetworkChanged`]。
+///
+/// 第一个通知立即发出（不推迟阻断）；引擎取到这个事件、开始处理之前清掉标志，
+/// 处理期间再来的通知会再发一个，所以不会漏掉最后一次变化。
+#[derive(Clone)]
+pub struct NetNotifier {
+    tx: Sender<Event>,
+    pending: Arc<AtomicBool>,
+}
+
+impl NetNotifier {
+    pub fn new(tx: Sender<Event>) -> Self {
+        Self { tx, pending: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// 报告一次网络变化。引擎已经退出时返回 false。
+    pub fn notify(&self) -> bool {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        self.tx.send(Event::NetworkChanged).is_ok()
+    }
+
+    /// 引擎开始处理网络变化：之后的通知要再发一次。
+    pub fn taken(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
 
 pub struct EngineHandle {
     tx: Sender<Event>,
@@ -172,7 +202,8 @@ fn run(
     let mut status = Status { running: true, per_app: true, ..Default::default() };
 
     // 网卡变化监听，需在整个循环期间保持存活；注册失败时稍后重试（见下面的 recover）
-    let mut watcher = start_netwatch(tx.clone());
+    let net = NetNotifier::new(tx.clone());
+    let mut watcher = start_netwatch(net.clone());
     // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
     // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
@@ -237,11 +268,13 @@ fn run(
     status.extra_apps = initial;
     discovery::spawn(watch.clone(), learned_file, snapshot_fn(), system_dirs, tx.clone());
 
-    let mut detector = Arc::new(make_detector(&cfg));
+    let mut detector = Arc::new(Detectors::new(&cfg));
     let mut generation: u64 = 0;
     let mut checking = false;
     let mut next_check: Option<Instant> = Some(Instant::now());
     let mut debounce_until: Option<Instant> = None;
+    // 这一轮网络变化开始的时刻：变化一直不停时，防抖最多推迟到这之后 MAX_SETTLE
+    let mut change_started: Option<Instant> = None;
     let mut after_change = false;
     // 规则同步失败或有程序暂未加上规则时，定时重试
     let mut next_retry: Option<Instant> = None;
@@ -292,6 +325,8 @@ fn run(
     update_status(&mut status, &ctrl, checking);
     status.vpn_connected = vpn::names(&vpn_links);
     reporter(&status);
+    // 上一次报告的状态：没有变化时不再报告（每个事件、每次定时器到期都会走一遍循环）
+    let mut reported = status.clone();
 
     loop {
         if ctrl.needs_retry() {
@@ -309,6 +344,7 @@ fn run(
         match event {
             Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Event::NetworkChanged) => {
+                net.taken();
                 // 先看是不是守护中的 VPN 断了（原因更明确，也不受「网络变化时先阻断」开关影响）
                 // 列不出网卡时沿用上一次的结果（不当作全部断开）
                 if let Some(a) = vpn::scan() {
@@ -324,7 +360,9 @@ fn run(
                 }
                 // 正在进行的检测结果作废；等网络安静下来再检测
                 generation += 1;
-                debounce_until = Some(later(Duration::from_millis(ctrl.config().behavior.debounce_ms)));
+                let now = Instant::now();
+                let started = *change_started.get_or_insert(now);
+                debounce_until = Some(settle_deadline(now, started, Duration::from_millis(ctrl.config().behavior.debounce_ms)));
                 next_check = None;
             }
             Ok(Event::CheckNow) => {
@@ -338,7 +376,7 @@ fn run(
                     new_cfg.apps.len(),
                     new_cfg.whitelist.len()
                 );
-                detector = Arc::new(make_detector(&new_cfg));
+                detector = Arc::new(Detectors::new(&new_cfg));
                 watch_version += 1;
                 {
                     let mut w = watch.lock().unwrap();
@@ -386,6 +424,7 @@ fn run(
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
+                    change_started.get_or_insert_with(Instant::now);
                     debounce_until.get_or_insert_with(|| later(Duration::from_millis(ctrl.config().behavior.debounce_ms)));
                 }
             }
@@ -401,7 +440,7 @@ fn run(
                     status.last_check = Some(logbuf::now_hms());
                     // 放行时记下正在使用的 VPN 网卡，之后它一断开就立即阻断
                     let vcfg = &ctrl.config().vpn;
-                    guarded = if !ctrl.is_blocked() && vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    guarded = guard_links(&ctrl, &adapters);
                     if !guarded.is_empty() && status.vpn_guarded != vpn::names(&guarded) {
                         log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                     }
@@ -432,6 +471,7 @@ fn run(
             let now = Instant::now();
             if debounce_until.is_some_and(|d| d <= now) {
                 debounce_until = None;
+                change_started = None;
                 after_change = true;
                 log::info!("网络发生变化，重新检测出口 IP");
                 start_check(&mut checking, &detector, generation);
@@ -463,7 +503,7 @@ fn run(
                 }
             }
             if watch_retry.due(now) {
-                watcher = start_netwatch(tx.clone());
+                watcher = start_netwatch(net.clone());
                 if watcher.is_some() {
                     watch_retry.done();
                     log::info!("网卡变化监听已恢复");
@@ -487,7 +527,7 @@ fn run(
                 // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
                 if was_blocked && !ctrl.is_blocked() {
                     let vcfg = &ctrl.config().vpn;
-                    guarded = if vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    guarded = guard_links(&ctrl, &adapters);
                     if !guarded.is_empty() {
                         log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                         if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
@@ -506,7 +546,10 @@ fn run(
         status.generation = generation;
         vpn_watch.set_active(!guarded.is_empty());
         update_status(&mut status, &ctrl, checking);
-        reporter(&status);
+        if status != reported {
+            reporter(&status);
+            reported.clone_from(&status);
+        }
     }
 
     log::info!("引擎退出，移除阻断规则");
@@ -523,6 +566,28 @@ fn run(
 fn later(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
+}
+
+/// 放行时要守护的 VPN 网卡：已经放行、开了 VPN 守护时，现在连着的 VPN 网卡；否则为空。
+fn guard_links(ctrl: &Controller, adapters: &[Adapter]) -> Vec<vpn::Link> {
+    let vcfg = &ctrl.config().vpn;
+    if !ctrl.is_blocked() && vcfg.guard {
+        vpn::links(adapters, vcfg)
+    } else {
+        Vec::new()
+    }
+}
+
+/// 防抖的截止时刻：每次变化都从现在起再等 `debounce`，但从这一轮变化开始算最多等 [`max_settle`]。
+/// 网络一直抖动（例如每 1.5 秒一次通知、防抖 2 秒）时，检测不会被无限期推迟，阻断也不会一直不解除。
+fn settle_deadline(now: Instant, started: Instant, debounce: Duration) -> Instant {
+    let cap = started.checked_add(max_settle(debounce)).unwrap_or(now);
+    now.checked_add(debounce).map_or(cap, |d| d.min(cap)).max(now)
+}
+
+/// 一轮网络变化最多等多久就检测一次：防抖的 5 倍，至少 10 秒。
+fn max_settle(debounce: Duration) -> Duration {
+    debounce.saturating_mul(5).max(Duration::from_secs(10))
 }
 
 /// 有上限的指数退避：5 秒起，每次失败加倍，最多 5 分钟。
@@ -574,19 +639,15 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.limitation = ctrl.limitation();
 }
 
-fn make_detector(cfg: &Config) -> Detectors {
-    Detectors::new(cfg)
-}
-
 /// 网卡/地址/路由变化监听；返回值需保持存活。
-fn start_netwatch(tx: Sender<Event>) -> Option<Box<dyn std::any::Any>> {
+fn start_netwatch(net: NetNotifier) -> Option<Box<dyn std::any::Any>> {
     #[cfg(windows)]
-    let r = crate::win::netwatch::NetWatcher::start(tx).map(|w| Box::new(w) as Box<dyn std::any::Any>);
+    let r = crate::win::netwatch::NetWatcher::start(net).map(|w| Box::new(w) as Box<dyn std::any::Any>);
     #[cfg(target_os = "macos")]
-    let r = crate::mac::netwatch::start(tx).map(|w| Box::new(w) as Box<dyn std::any::Any>);
+    let r = crate::mac::netwatch::start(net).map(|w| Box::new(w) as Box<dyn std::any::Any>);
     #[cfg(not(any(windows, target_os = "macos")))]
     let r: Result<Box<dyn std::any::Any>> = {
-        let _ = tx;
+        let _ = net;
         Err(anyhow!("此平台不支持"))
     };
     match r {
@@ -628,4 +689,48 @@ fn open_backend(cfg: &Config, tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn open_backend(_cfg: &Config, _tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
     anyhow::bail!("只支持 Windows（WFP）和 macOS（pf）；在其他平台请使用 --dry-run")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一批通知只发一个事件；引擎开始处理之后再来的通知会再发一个。
+    #[test]
+    fn net_notifier_coalesces_bursts_but_keeps_trailing_change() {
+        let (tx, rx) = mpsc::channel();
+        let n = NetNotifier::new(tx);
+        for _ in 0..30 {
+            assert!(n.notify());
+        }
+        assert!(matches!(rx.try_recv(), Ok(Event::NetworkChanged)));
+        assert!(rx.try_recv().is_err());
+        n.taken();
+        assert!(n.notify() && n.notify());
+        assert!(matches!(rx.try_recv(), Ok(Event::NetworkChanged)));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        n.taken();
+        assert!(!n.notify(), "引擎已退出");
+    }
+
+    #[test]
+    fn settle_deadline_slides_but_is_capped() {
+        let t0 = Instant::now();
+        let d = Duration::from_secs(2);
+        // 第一个通知：等满防抖
+        assert_eq!(settle_deadline(t0, t0, d), t0 + d);
+        // 之后的通知继续往后推
+        let t = t0 + Duration::from_millis(1500);
+        assert_eq!(settle_deadline(t, t0, d), t + d);
+        // 推到上限（10 秒）为止
+        let t = t0 + Duration::from_secs(9);
+        assert_eq!(settle_deadline(t, t0, d), t0 + Duration::from_secs(10));
+        // 已经过了上限：立刻检测
+        let t = t0 + Duration::from_secs(12);
+        assert_eq!(settle_deadline(t, t0, d), t);
+        // 防抖很长时上限是它的 5 倍
+        assert_eq!(max_settle(Duration::from_secs(5)), Duration::from_secs(25));
+        assert_eq!(max_settle(Duration::ZERO), Duration::from_secs(10));
+    }
 }

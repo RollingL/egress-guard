@@ -20,6 +20,7 @@ use super::backend::Backend;
 use super::icons::{shield_rgba, Shade};
 
 /// 菜单栏需要显示的状态。
+#[derive(PartialEq)]
 pub struct TrayState {
     pub shade: Shade,
     pub tooltip: String,
@@ -177,3 +178,6 @@ pub fn spawn(t: TrayCtx, state_rx: Receiver<TrayState>) {
         })
         .expect("无法创建菜单栏状态线程");
 }
+
+/// 有新状态时唤醒托盘线程：macOS 的状态线程阻塞在通道上，不需要额外唤醒。
+pub fn wake() {}

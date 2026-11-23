@@ -1,6 +1,6 @@
 [package]
 name = "egress-guard"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2021"
 description = "根据本机公网出口 IP 判断是否阻断选中应用（Windows：WFP；macOS：网络扩展）或全部网络（Windows：WFP；macOS：pf）的连接"
 
@@ -33,13 +33,11 @@ rfd = "0.18"
 dispatch2 = "0.3"
 winit = { version = "0.30", default-features = false }
 objc2 = "0.6"
-objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSWorkspace"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26"
 rfd = "0.18"
-raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
@@ -57,6 +55,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    # 子进程识别：一次系统调用取到全部进程的父 PID 与创建时间
+    "Wdk_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
     "Win32_System_SystemInformation",
     "Win32_System_Registry",
     "Win32_UI_Shell",

@@ -45,80 +45,172 @@ fn path_and_time(pid: u32, buf: &mut [u16]) -> (Option<String>, u64) {
     }
 }
 
-/// 进程的创建时间；打不开时为 0。
-fn created_time(pid: u32) -> u64 {
-    unsafe {
-        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return 0;
-        };
-        let (mut c, mut e, mut k, mut u) =
-            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
-        let created = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u).is_ok() {
-            ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64
-        } else {
-            0
-        };
-        let _ = CloseHandle(h);
-        created
-    }
-}
-
-/// 快照缓存的一项：同一 PID、同一父进程、同一 exe 名、同一创建时间时直接复用路径，不再查询路径。
+/// 快照缓存的一项：同一 PID、同一父进程、同一创建时间、同一映像名（一次系统调用就能拿到
+/// 全部进程的这几项）时直接复用路径，不再打开进程。Windows 没有 exec：进程的映像在它的一生中不会换。
 struct Cached {
     ppid: u32,
-    name: [u16; 260],
-    path: String,
     created: u64,
+    name_hash: u64,
+    /// exe 路径；打不开的进程（受保护）为空。
+    path: String,
+    /// 能否打开这个进程。打不开时对外报告的创建时间为 0，识别时会断开祖先链（与以前一致）。
+    opened: bool,
+}
+
+#[derive(Default)]
+struct Scanner {
+    cache: HashMap<u32, Cached>,
+    /// NtQuerySystemInformation 的缓冲区（u64 保证对齐），按需增长、反复使用。
+    buf: Vec<u64>,
+    path_buf: Vec<u16>,
 }
 
 thread_local! {
-    static CACHE: RefCell<HashMap<u32, Cached>> = RefCell::new(HashMap::new());
+    static SCANNER: RefCell<Scanner> = RefCell::new(Scanner::default());
 }
 
 /// 进程树快照（含父进程 ID、创建时间、exe 路径），用于识别子进程。
 ///
-/// 每秒调用一次。已见过的进程（PID、父 PID、exe 名都没变）直接用缓存，
-/// 只对新进程调用 OpenProcess；已退出进程的缓存项随之清掉。
+/// 每 2 秒调用一次。用 NtQuerySystemInformation 一次取到全部进程的 PID、父 PID 和创建时间；
+/// 三项都没变的进程直接用缓存，只对新进程调用 OpenProcess 查路径。已退出进程的缓存项随之清掉。
+/// 系统调用失败时退回逐个打开进程的旧做法。
 pub fn snapshot() -> Vec<ProcEntry> {
-    CACHE.with(|c| snapshot_cached(&mut c.borrow_mut()))
+    SCANNER.with(|s| {
+        let mut s = s.borrow_mut();
+        match system_processes(&mut s.buf) {
+            Some(list) => s.resolve(list),
+            None => toolhelp_snapshot(&mut s.path_buf),
+        }
+    })
 }
 
-fn snapshot_cached(cache: &mut HashMap<u32, Cached>) -> Vec<ProcEntry> {
+impl Scanner {
+    fn resolve(&mut self, list: Vec<SysProc>) -> Vec<ProcEntry> {
+        if self.path_buf.is_empty() {
+            self.path_buf = vec![0u16; 32768];
+        }
+        let mut out = Vec::with_capacity(list.len());
+        let mut next: HashMap<u32, Cached> = HashMap::with_capacity(list.len());
+        for SysProc { pid, ppid, created, name_hash } in list {
+            if pid <= 4 {
+                continue;
+            }
+            // PID 可能在两次快照之间被复用：父进程、创建时间、映像名都一致才算同一个进程。
+            // 创建时间取不到（0）时不复用，每次重新查询
+            let hit = self
+                .cache
+                .remove(&pid)
+                .filter(|c| c.ppid == ppid && c.created == created && c.name_hash == name_hash && created != 0);
+            let entry = hit.unwrap_or_else(|| {
+                let (path, opened) = match path_and_time(pid, &mut self.path_buf) {
+                    (_, 0) => (None, false),
+                    (path, _) => (path, true),
+                };
+                Cached { ppid, created, name_hash, path: path.unwrap_or_default(), opened }
+            });
+            let created = if entry.opened { entry.created } else { 0 };
+            out.push(ProcEntry { pid, ppid, created, path: entry.path.clone() });
+            next.insert(pid, entry);
+        }
+        self.cache = next;
+        out
+    }
+}
+
+/// 系统调用取到的一个进程。
+struct SysProc {
+    pid: u32,
+    ppid: u32,
+    /// 与 GetProcessTimes 的创建时间单位相同（FILETIME）。
+    created: u64,
+    /// 映像名（exe 文件名）的散列。
+    name_hash: u64,
+}
+
+/// FNV-1a，不必为每个进程分配字符串。
+fn hash_name(name: &[u16]) -> u64 {
+    name.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| (h ^ c as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// 全部进程的 PID、父 PID、创建时间和映像名。
+fn system_processes(buf: &mut Vec<u64>) -> Option<Vec<SysProc>> {
+    use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
+    use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    if buf.is_empty() {
+        buf.resize(64 * 1024, 0);
+    }
+    let mut tries = 0;
+    loop {
+        let bytes = (buf.len() * 8) as u32;
+        let mut need = 0u32;
+        let st = unsafe { NtQuerySystemInformation(SystemProcessInformation, buf.as_mut_ptr().cast(), bytes, &mut need) };
+        if st.0 == STATUS_INFO_LENGTH_MISMATCH && tries < 4 {
+            // 两次调用之间可能又多了进程：多留一些余量
+            buf.resize((need as usize).max(bytes as usize * 2) / 8 + 4096, 0);
+            tries += 1;
+            continue;
+        }
+        if st.is_err() {
+            return None;
+        }
+        break;
+    }
+    let mut out = Vec::with_capacity(512);
+    let base = buf.as_ptr() as *const u8;
+    let len = buf.len() * 8;
+    let mut off = 0usize;
+    loop {
+        if off + std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>() > len {
+            break;
+        }
+        // SAFETY: 偏移在缓冲区内，系统按 8 字节对齐每一项
+        let e = unsafe { &*(base.add(off) as *const SYSTEM_PROCESS_INFORMATION) };
+        // Reserved1 的第 24..32 字节是 CreateTime，Reserved2 是 InheritedFromUniqueProcessId（父 PID）
+        let created = u64::from_le_bytes(e.Reserved1[24..32].try_into().unwrap());
+        let name: &[u16] = if e.ImageName.Buffer.is_null() {
+            &[]
+        } else {
+            // SAFETY: 系统填写的 UNICODE_STRING，指向同一缓冲区内，Length 以字节计
+            unsafe { std::slice::from_raw_parts(e.ImageName.Buffer.0, e.ImageName.Length as usize / 2) }
+        };
+        out.push(SysProc {
+            pid: e.UniqueProcessId.0 as usize as u32,
+            ppid: e.Reserved2 as usize as u32,
+            created,
+            name_hash: hash_name(name),
+        });
+        if e.NextEntryOffset == 0 {
+            break;
+        }
+        off += e.NextEntryOffset as usize;
+    }
+    Some(out)
+}
+
+/// 退回的做法：ToolHelp 枚举，再逐个打开进程查路径和创建时间。
+fn toolhelp_snapshot(buf: &mut Vec<u16>) -> Vec<ProcEntry> {
+    if buf.is_empty() {
+        buf.resize(32768, 0);
+    }
     let mut out = Vec::new();
-    let mut buf = vec![0u16; 32768];
-    let mut next: HashMap<u32, Cached> = HashMap::with_capacity(cache.len());
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return out;
         };
-        let mut e = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
         let mut ok = Process32FirstW(snap, &mut e).is_ok();
         while ok {
             let pid = e.th32ProcessID;
             if pid > 4 {
-                let ppid = e.th32ParentProcessID;
-                // PID 可能在两次快照之间被同名的新进程复用（路径可能不同）：创建时间也要一致。
-                // 创建时间未知（0）的项不复用，每次重新查询
-                let hit = cache
-                    .remove(&pid)
-                    .filter(|c| c.ppid == ppid && c.name == e.szExeFile && c.created != 0)
-                    .filter(|c| created_time(pid) == c.created);
-                let entry = hit.unwrap_or_else(|| {
-                    // 无法打开的进程（受保护）创建时间未知，记为 0，识别时会断开祖先链
-                    let (path, created) = path_and_time(pid, &mut buf);
-                    Cached { ppid, name: e.szExeFile, path: path.unwrap_or_default(), created }
-                });
-                out.push(ProcEntry { pid, ppid, created: entry.created, path: entry.path.clone() });
-                next.insert(pid, entry);
+                // 无法打开的进程（受保护）创建时间未知，记为 0，识别时会断开祖先链
+                let (path, created) = path_and_time(pid, buf);
+                out.push(ProcEntry { pid, ppid: e.th32ParentProcessID, created, path: path.unwrap_or_default() });
             }
             ok = Process32NextW(snap, &mut e).is_ok();
         }
         let _ = CloseHandle(snap);
     }
-    *cache = next;
     out
 }
 
@@ -165,4 +257,33 @@ pub fn list_processes() -> Vec<ProcInfo> {
     }
     out.sort_by_key(|p| p.name.to_lowercase());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 系统调用取到的父 PID、创建时间与逐个打开进程查到的一致（结构体里保留字段的偏移没有取错）。
+    #[test]
+    fn system_snapshot_matches_per_process_query() {
+        let me = std::process::id();
+        let list = system_processes(&mut Vec::new()).expect("NtQuerySystemInformation");
+        assert!(list.len() > 10, "{}", list.len());
+        let mine = list.iter().find(|p| p.pid == me).expect("找不到本进程");
+        let (ppid, created) = (mine.ppid, mine.created);
+        let (path, want) = path_and_time(me, &mut vec![0u16; 32768]);
+        assert_eq!(created, want);
+        assert!(ppid > 0 && list.iter().any(|p| p.pid == ppid), "父进程 {ppid}");
+        let exe = std::env::current_exe().unwrap();
+        let file: Vec<u16> = exe.file_name().unwrap().to_string_lossy().encode_utf16().collect();
+        assert_eq!(mine.name_hash, hash_name(&file), "映像名");
+        let snap = snapshot();
+        let e = snap.iter().find(|e| e.pid == me).unwrap();
+        assert_eq!(normalize_path(&e.path), normalize_path(&path.unwrap()));
+        assert_eq!((e.ppid, e.created), (ppid, created));
+        // 第二次走缓存，结果一样
+        let again = snapshot();
+        let e2 = again.iter().find(|e| e.pid == me).unwrap();
+        assert_eq!((e2.ppid, e2.created, &e2.path), (e.ppid, e.created, &e.path));
+    }
 }

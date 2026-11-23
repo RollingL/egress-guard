@@ -194,6 +194,8 @@ struct Global {
     complete: bool,
     /// 有例外程序添加失败（不是暂不存在）。
     failed: bool,
+    /// 暂不存在、没有加上放行的例外程序：出现之后才需要重建全局部分。
+    missing: Vec<PathBuf>,
 }
 
 /// 新加上的全局断网规则。
@@ -380,13 +382,23 @@ impl<A: Api> Wfp<A> {
             .map(|(k, p)| (k.clone(), p.clone()))
             .collect();
         let want_global = self.rules.block_all.clone();
+        let api = &self.api;
+        // 全局部分只在规则变了、上次有例外程序添加失败、或缺的例外程序现在出现了时才重建：
+        // 例外程序仍然不存在时重建也加不上它，只是白白开一个事务
         let global_stale = match (&self.global, &want_global) {
             (None, None) => false,
-            (Some(g), Some(p)) => g.policy != *p || !g.complete,
+            (Some(g), Some(p)) => g.policy != *p || g.failed || g.missing.iter().any(|a| api.may_exist(a)),
             _ => true,
         };
-        if to_remove.is_empty() && to_add.is_empty() && !global_stale {
-            self.pending.clear();
+        // 仍然不存在的程序加不上：只有它们时不开事务（定时重试照旧，程序出现后再加）
+        let work = !to_remove.is_empty() || global_stale || to_add.iter().any(|(_, p)| api.may_exist(p));
+        if !work {
+            for (k, app) in &to_add {
+                if self.warned.insert(k.clone()) {
+                    log::warn!("程序不存在，暂时跳过: {}", app.display());
+                }
+            }
+            self.pending = to_add.into_iter().map(|(k, _)| k).collect();
             return Ok(Synced::default());
         }
 
@@ -434,7 +446,7 @@ impl<A: Api> Wfp<A> {
                             released_global = true;
                         }
                         let complete = g.missing.is_empty() && !g.failed;
-                        Some(Global { policy: p.clone(), ids: g.ids, complete, failed: g.failed })
+                        Some(Global { policy: p.clone(), ids: g.ids, complete, failed: g.failed, missing: g.missing })
                     }
                     None => None,
                 });
@@ -1003,6 +1015,41 @@ mod tests {
         w.set_rules(rules(&["C:\\a.exe", "C:\\b.exe"], false)).unwrap();
         assert!(w.degraded().is_none() && !w.has_pending());
         assert_eq!(api.0.borrow().count(|e| e.what.contains("b.exe")), 2);
+    }
+
+    /// 阻断期间受控程序或全局例外程序不存在：定时重试不开空事务，程序出现后的那次重试再加上。
+    #[test]
+    fn missing_apps_do_not_open_empty_transactions() {
+        let (api, mut w) = wfp();
+        let a = PathBuf::from("C:\\a.exe");
+        let x = PathBuf::from("C:\\x.exe");
+        api.0.borrow_mut().missing.extend([a.clone(), x.clone()]);
+        let mut r = rules(&["C:\\a.exe"], true);
+        r.block_all.as_mut().unwrap().allow_apps.push(x.clone());
+        w.set_rules(r.clone()).unwrap();
+        w.block().unwrap();
+        assert!(w.has_pending());
+        let commits = api.0.borrow().commits;
+        for _ in 0..12 {
+            w.set_rules(r.clone()).unwrap();
+        }
+        assert_eq!(api.0.borrow().commits, commits, "程序仍不存在时不应再提交事务");
+        assert!(w.has_pending(), "程序出现之前仍要定时重试");
+        // 受控程序出现：下一次重试加上它（主阻断和 IPv6 兜底各一个事务），全局部分不动
+        api.0.borrow_mut().missing.remove(&a);
+        w.set_rules(r.clone()).unwrap();
+        let after_a = api.0.borrow().commits;
+        assert!(after_a > commits);
+        assert!(api.0.borrow().count(|e| e.what == "block app C:\\a.exe") >= 4);
+        assert!(api.0.borrow().count(|e| e.what.contains("x.exe")) == 0);
+        w.set_rules(r.clone()).unwrap();
+        assert_eq!(api.0.borrow().commits, after_a, "例外程序仍不存在：不重建全局部分");
+        // 全局例外程序出现：重建全局部分，放行它
+        api.0.borrow_mut().missing.remove(&x);
+        w.set_rules(r.clone()).unwrap();
+        assert!(api.0.borrow().commits > after_a);
+        assert!(api.0.borrow().count(|e| e.what.contains("x.exe")) > 0);
+        assert!(!w.has_pending());
     }
 
     /// 保留了 IPv6 阻断之后再阻断失败、又改回放行：保留的过滤器仍归 retained，最终能撤掉，不残留。

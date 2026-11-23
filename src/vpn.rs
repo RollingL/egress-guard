@@ -114,7 +114,8 @@ pub fn names(links: &[Link]) -> Vec<String> {
     v
 }
 
-/// 现在连着的 VPN 网卡名称（有可用地址），按名称排序。
+/// 现在连着的 VPN 网卡名称（有可用地址），按名称排序。只有测试用。
+#[cfg(test)]
 pub fn connected(adapters: &[Adapter], cfg: &VpnConfig) -> Vec<String> {
     names(&links(adapters, cfg))
 }

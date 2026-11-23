@@ -298,16 +298,14 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
             Request::Watch => {
                 let mut seen = 0;
                 loop {
-                    // 定时发送一次（即使没变化），以便尽快发现已断开的连接
+                    // 状态有变化时推送；5 秒没有变化时发一个 ok 作为心跳（以便尽快发现已断开的连接），
+                    // 不再重发整份状态。各版本的界面都会忽略 Watch 连接上的 ok
                     match hub.wait_newer(seen, Duration::from_secs(5)) {
                         Some((v, s)) => {
                             seen = v;
                             write_reply(&mut w, &Reply::Status(Box::new(s)))?;
                         }
-                        None => {
-                            let s = hub.state.lock().unwrap().1.clone();
-                            write_reply(&mut w, &Reply::Status(Box::new(s)))?;
-                        }
+                        None => write_reply(&mut w, &Reply::Ok)?,
                     }
                 }
             }

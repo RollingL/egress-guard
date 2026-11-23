@@ -1,7 +1,6 @@
 //! 监听网卡、IP 地址和路由变化（IP Helper 通知），用于立即触发出口 IP 重新检测。
 
 use std::ffi::c_void;
-use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -9,14 +8,15 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::IpHelper::*;
 use windows::Win32::Networking::WinSock::AF_UNSPEC;
 
-use crate::engine::Event;
+use crate::engine::NetNotifier;
 
-/// 回调里用的发送端。注册失败后引擎会重新调用 start，这里每次换成最新的。
-static TX: Mutex<Option<Sender<Event>>> = Mutex::new(None);
+/// 回调里用的通知端。注册失败后引擎会重新调用 start，这里每次换成最新的。
+/// 一次网络变化通常触发好几个回调（一次 IPv6 地址变化 3–4 个），通知端把它们合并成一个事件。
+static TX: Mutex<Option<NetNotifier>> = Mutex::new(None);
 
 fn notify() {
-    if let Some(tx) = TX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        let _ = tx.send(Event::NetworkChanged);
+    if let Some(n) = TX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        n.notify();
     }
 }
 
@@ -49,7 +49,7 @@ pub struct NetWatcher {
 }
 
 impl NetWatcher {
-    pub fn start(tx: Sender<Event>) -> Result<Self> {
+    pub fn start(tx: NetNotifier) -> Result<Self> {
         *TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
         // 中途注册失败时 w 被丢弃，已经注册的通知随之取消
         let mut w = Self { handles: Vec::new() };

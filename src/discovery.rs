@@ -133,16 +133,15 @@ fn is_direct(key: &str, roots: &Roots) -> bool {
 /// 返回 (进程下标, 所属受控应用)。
 pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> Vec<(usize, Roots)> {
     let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
-    let target_of = |p: &ProcEntry| {
-        if p.path.is_empty() {
-            None
-        } else {
-            lookup_target(&normalize(&p.path), targets)
-        }
-    };
+    // 每个进程只规范化一次路径（祖先链会反复经过同一个进程）
+    let hits: Vec<Option<(&String, &Roots)>> = procs
+        .iter()
+        .map(|p| if p.path.is_empty() { None } else { lookup_target(&normalize(&p.path), targets) })
+        .collect();
+    let target_of = |p: &ProcEntry| by_pid.get(&p.pid).and_then(|&i| hits[i]);
     let mut out = Vec::new();
     for (i, p) in procs.iter().enumerate() {
-        if p.pid <= 4 || target_of(p).is_some_and(|(k, r)| is_direct(k, r)) {
+        if p.pid <= 4 || hits[i].is_some_and(|(k, r)| is_direct(k, r)) {
             continue;
         }
         let mut cur = p;
@@ -208,26 +207,96 @@ fn is_program(path: &Path, meta: &std::fs::Metadata) -> bool {
 
 /// 递归列出目录下的程序（限制深度和数量）。
 pub fn scan_dir_exes(dir: &Path, max_depth: usize, max_count: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![(dir.to_path_buf(), 0usize)];
-    while let Some((d, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            let path = entry.path();
-            if ft.is_dir() && !ft.is_symlink() {
-                if depth < max_depth {
-                    stack.push((path, depth + 1));
+    let mut scan = DirWalk::new(dir);
+    while !scan.step(max_depth, max_count, usize::MAX).0 {}
+    scan.found
+}
+
+/// 扩展名是 .exe 的不必再取文件属性；其余的（Unix 上没有扩展名的可执行文件）才看权限位。
+fn is_program_entry(path: &Path, entry: &std::fs::DirEntry) -> bool {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+        return true;
+    }
+    cfg!(unix) && entry.metadata().is_ok_and(|m| is_program(path, &m))
+}
+
+/// 可以分几次走完的目录遍历：每次最多看大约 `budget` 个条目（按整个目录计），下次从停下的位置继续。
+struct DirWalk {
+    stack: Vec<(PathBuf, usize)>,
+    found: Vec<PathBuf>,
+}
+
+impl DirWalk {
+    fn new(root: &Path) -> Self {
+        Self { stack: vec![(root.to_path_buf(), 0)], found: Vec::new() }
+    }
+
+    /// 走一批；返回（是否已经走完，这一批看过的条目数）。
+    fn step(&mut self, max_depth: usize, max_count: usize, budget: usize) -> (bool, usize) {
+        let mut n = 0usize;
+        while let Some((d, depth)) = self.stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for entry in rd.flatten() {
+                n += 1;
+                let Ok(ft) = entry.file_type() else { continue };
+                let path = entry.path();
+                if ft.is_dir() && !ft.is_symlink() {
+                    if depth < max_depth {
+                        self.stack.push((path, depth + 1));
+                    }
+                } else if ft.is_file() && is_program_entry(&path, &entry) {
+                    self.found.push(path);
+                    if self.found.len() >= max_count {
+                        self.stack.clear();
+                        return (true, n);
+                    }
                 }
-            } else if ft.is_file() && entry.metadata().is_ok_and(|m| is_program(&path, &m)) {
-                out.push(path);
-                if out.len() >= max_count {
-                    return out;
-                }
+            }
+            if n >= budget {
+                return (self.stack.is_empty(), n);
+            }
+        }
+        (true, n)
+    }
+}
+
+/// 一轮应用目录扫描（同目录模式）：依次走完每个根目录，可以分批进行。整轮完成后才替换旧结果。
+struct AppDirScan {
+    roots: Vec<(PathBuf, Roots)>,
+    next: usize,
+    walk: Option<DirWalk>,
+    found: Vec<(PathBuf, Roots)>,
+}
+
+impl AppDirScan {
+    fn new(roots: Vec<(PathBuf, Roots)>) -> Self {
+        Self { roots, next: 0, walk: None, found: Vec::new() }
+    }
+
+    /// 走一批（最多大约 `budget` 个条目、`time` 时间）；返回是否整轮完成。
+    fn step(&mut self, budget: usize, time: Duration) -> bool {
+        let start = Instant::now();
+        let mut left = budget;
+        loop {
+            if self.walk.is_none() {
+                let Some((root, _)) = self.roots.get(self.next) else { return true };
+                self.walk = Some(DirWalk::new(root));
+            }
+            let walk = self.walk.as_mut().unwrap();
+            // macOS 应用包的辅助程序可能嵌套较深（Frameworks/…/Helpers/…app/Contents/MacOS）
+            let (done, used) = walk.step(12, 1000, left);
+            left = left.saturating_sub(used);
+            if done {
+                let owners = self.roots[self.next].1.clone();
+                let walk = self.walk.take().unwrap();
+                self.found.extend(walk.found.into_iter().map(|p| (p, owners.clone())));
+                self.next += 1;
+            }
+            if left == 0 || start.elapsed() >= time {
+                return self.next >= self.roots.len();
             }
         }
     }
-    out
 }
 
 /// 自动识别到的程序的来源。
@@ -336,8 +405,14 @@ impl WatchSettings {
 /// 进程快照函数：Windows 上为真实实现，其他平台返回空。
 pub type SnapshotFn = fn() -> Vec<ProcEntry>;
 
-const POLL: Duration = Duration::from_millis(1000);
+/// 子进程识别的扫描间隔：受控应用启动的子进程最多晚这么久被识别并加入阻断。
+const POLL: Duration = Duration::from_secs(2);
+/// 上一轮应用目录核对完成后，隔多久开始下一轮。
 const DIR_RESCAN: Duration = Duration::from_secs(30);
+/// 定期核对应用目录时，每次（每个扫描间隔）最多查看的条目数和花的时间：大目录分几秒走完，
+/// 不会把同一线程里的子进程识别推迟几秒。
+const DIR_STEP_ENTRIES: usize = 2000;
+const DIR_STEP_TIME: Duration = Duration::from_millis(50);
 
 /// 启动识别线程。识别结果变化时向引擎发送 `Event::ExtraApps`。
 pub fn spawn(
@@ -353,29 +428,34 @@ pub fn spawn(
         .expect("无法创建子进程识别线程");
 }
 
-/// 扫描受控应用所在目录（include_app_dir 开启时）。返回 (exe, 所属受控应用规范路径)；
-/// 几个受控应用在同一个目录里时，目录下的程序同时属于它们。
-fn scan_app_dirs(s: &WatchSettings, system_dirs: &[String]) -> Vec<(PathBuf, Roots)> {
-    let mut out = Vec::new();
+/// 受控应用所在目录模式要扫描的根目录及其所属的受控应用（include_app_dir 开启时）。
+/// `warn`：报告太宽泛、不整体扫描的目录（只在设置变化后报告一次）。
+fn app_dir_roots(s: &WatchSettings, system_dirs: &[String], warn: bool) -> Vec<(PathBuf, Roots)> {
     if !s.include_app_dir {
-        return out;
+        return Vec::new();
     }
     let mut dirs: BTreeMap<String, (PathBuf, Roots)> = BTreeMap::new();
     for app in &s.apps {
         let Some(root) = app_scan_root(app, system_dirs) else {
-            log::warn!(
-                "目录太宽泛，不整体阻断: {}",
-                app.parent().map(|d| d.display().to_string()).unwrap_or_default()
-            );
+            if warn {
+                log::warn!(
+                    "目录太宽泛，不整体阻断: {}",
+                    app.parent().map(|d| d.display().to_string()).unwrap_or_default()
+                );
+            }
             continue;
         };
         dirs.entry(normalize_path(&root)).or_insert_with(|| (root, Roots::new())).1.insert(normalize_path(app));
     }
-    for (root, owners) in dirs.into_values() {
-        // macOS 应用包的辅助程序可能嵌套较深（Frameworks/…/Helpers/…app/Contents/MacOS）
-        out.extend(scan_dir_exes(&root, 12, 1000).into_iter().map(|p| (p, owners.clone())));
-    }
-    out
+    dirs.into_values().collect()
+}
+
+/// 一次扫描完受控应用所在的目录。返回 (exe, 所属受控应用规范路径)；
+/// 几个受控应用在同一个目录里时，目录下的程序同时属于它们。
+fn scan_app_dirs(roots: Vec<(PathBuf, Roots)>) -> Vec<(PathBuf, Roots)> {
+    let mut scan = AppDirScan::new(roots);
+    while !scan.step(usize::MAX, Duration::MAX) {}
+    scan.found
 }
 
 /// 当前生效的目标程序：规范路径 → 所属受控应用（只算还在配置里的）。
@@ -426,19 +506,28 @@ fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) 
 /// 启动时同步计算一次（读取历史记录 + 目录扫描）。
 pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, system_dirs: &[String]) -> Vec<ExtraApp> {
     let learned = Learned::load(learned_file);
-    collect(s, &learned, &scan_app_dirs(s, system_dirs))
+    collect(s, &learned, &scan_app_dirs(app_dir_roots(s, system_dirs, false)))
+}
+
+/// 有没有目标进程（受控应用、已识别程序、同目录程序）正在运行。
+fn any_target_running(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> bool {
+    procs.iter().any(|p| !p.path.is_empty() && lookup_target(&normalize(&p.path), targets).is_some())
 }
 
 /// 根据一次进程快照记下受控应用（及已识别程序）启动的子程序和它们的来源。
+/// 返回是否有目标进程正在运行（没有时不必找后代）。
 fn learn_children(
     s: &WatchSettings,
     learned: &mut Learned,
     dir_exes: &[(PathBuf, Roots)],
     procs: &[ProcEntry],
     system_dirs: &[String],
-) {
-    let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
+) -> bool {
     let t = targets(s, learned, dir_exes);
+    if !any_target_running(procs, &t) {
+        return false;
+    }
+    let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
     for (i, roots) in descendants_of_targets(procs, &t) {
         let p = &procs[i];
         if p.path.is_empty() {
@@ -464,6 +553,7 @@ fn learn_children(
             }
         }
     }
+    true
 }
 
 fn run(
@@ -475,7 +565,10 @@ fn run(
 ) {
     let mut learned = Learned::load(learned_file);
     let mut dir_exes: Vec<(PathBuf, Roots)> = Vec::new();
-    let mut last_scan: Option<(Instant, u64)> = None;
+    // 目录结果对应的设置版本、上一轮核对完成的时刻、正在分批进行的这一轮核对
+    let mut scanned_version: Option<u64> = None;
+    let mut last_round = Instant::now();
+    let mut round: Option<AppDirScan> = None;
     let mut last_sent: Option<Vec<ExtraApp>> = None;
 
     loop {
@@ -492,13 +585,21 @@ fn run(
             g.clone()
         };
 
-        let rescan = match last_scan {
-            None => true,
-            Some((t, v)) => v != s.version || t.elapsed() >= DIR_RESCAN,
-        };
-        if rescan {
-            dir_exes = scan_app_dirs(&s, &system_dirs);
-            last_scan = Some((Instant::now(), s.version));
+        // 第一次和设置变了时一次扫完（与以前一样立即生效）；之后每 DIR_RESCAN 完整核对一轮，
+        // 分批进行，整轮完成后才替换旧结果
+        if scanned_version != Some(s.version) {
+            dir_exes = scan_app_dirs(app_dir_roots(&s, &system_dirs, true));
+            scanned_version = Some(s.version);
+            last_round = Instant::now();
+            round = None;
+        } else if s.include_app_dir {
+            if round.is_none() && last_round.elapsed() >= DIR_RESCAN {
+                round = Some(AppDirScan::new(app_dir_roots(&s, &system_dirs, false)));
+            }
+            if round.as_mut().is_some_and(|r| r.step(DIR_STEP_ENTRIES, DIR_STEP_TIME)) {
+                dir_exes = round.take().unwrap().found;
+                last_round = Instant::now();
+            }
         }
 
         // 子进程识别
@@ -633,6 +734,21 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// 没有目标进程在运行时直接返回（不找后代）；受控应用或已识别程序在运行时照常识别。
+    #[test]
+    fn reports_whether_any_target_is_running() {
+        let sys = vec![normalize(r"C:\Windows")];
+        let s = WatchSettings { apps: vec![PathBuf::from(r"C:\Apps\A\a.exe")], mode: ChildMode::Tree, ..Default::default() };
+        let mut learned = Learned::load(None);
+        let others = [p(10, 1, 1, r"C:\Other\x.exe"), p(11, 10, 2, r"C:\Other\y.exe")];
+        assert!(!learn_children(&s, &mut learned, &[], &others, &sys));
+        assert_eq!(learned.iter().count(), 0);
+        assert!(learn_children(&s, &mut learned, &[], &[p(20, 1, 3, r"C:\Apps\A\A.EXE"), p(21, 20, 4, r"D:\h.exe")], &sys));
+        assert_eq!(learned.iter().count(), 1);
+        // 只剩已识别的辅助程序在运行：它的子进程也要识别
+        assert!(learn_children(&s, &mut learned, &[], &[p(30, 1, 5, r"D:\h.exe")], &sys));
+    }
+
     /// 两个独立的受控应用先后启动同一个（在两者目录之外的）辅助程序：两个来源都记下，
     /// 重启后仍在；移除任一个仍受控，移除最后一个才解除；显式忽略始终有效。
     #[test]
@@ -686,6 +802,38 @@ mod tests {
         let mut found = scan_dir_exes(&dir, 8, 100);
         found.sort();
         assert_eq!(found.len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 分批扫描：每批只看一部分条目，下次接着走；整轮结果与一次扫完相同，深层新增的程序下一轮能找到。
+    #[test]
+    fn app_dir_scan_in_batches() {
+        let dir = std::env::temp_dir().join(format!("eg-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["a", "b/c", "b/d/e"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+            for i in 0..5 {
+                std::fs::write(dir.join(d).join(format!("{i}.exe")), b"").unwrap();
+            }
+        }
+        let roots = || vec![(dir.clone(), Roots::from([String::from("app")]))];
+        let sorted = |mut v: Vec<(PathBuf, Roots)>| {
+            v.sort();
+            v
+        };
+        let whole = sorted(scan_app_dirs(roots()));
+        assert_eq!(whole.len(), 15);
+        let mut scan = AppDirScan::new(roots());
+        let mut steps = 1;
+        while !scan.step(3, Duration::MAX) {
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(steps > 2, "应当分了几批：{steps}");
+        assert_eq!(sorted(scan.found), whole);
+        // 深层目录里新增程序：根目录和一级子目录的修改时间可能不变，下一轮仍能找到
+        std::fs::write(dir.join("b/d/e/new.exe"), b"").unwrap();
+        assert_eq!(scan_app_dirs(roots()).len(), 16);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -767,7 +915,10 @@ mod tests {
 
         // 清空记录
         settings.lock().unwrap().clear_learned = true;
-        std::thread::sleep(Duration::from_millis(1500));
+        let t = Instant::now();
+        while std::fs::read_to_string(&learned).unwrap().contains("helper.exe") && t.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(!std::fs::read_to_string(&learned).unwrap().contains("helper.exe"));
 
         std::fs::remove_dir_all(dir).unwrap();
