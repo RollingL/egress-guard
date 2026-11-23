@@ -426,6 +426,8 @@ fn tray_state(s: &Status) -> tray::TrayState {
         (Shade::Gray, if s.backend_error.is_some() { "未连接后台服务" } else { "已停止" }.to_string())
     } else if inert(s) {
         (Shade::Amber, "未拦截（网络扩展、全局断网都未启用）".to_string())
+    } else if let Some(e) = &s.apply_error {
+        (Shade::Amber, shorten(e, 60))
     } else if s.blocked {
         (Shade::Red, "已阻断".to_string())
     } else if s.egress_ip.is_some() {
@@ -459,6 +461,8 @@ fn status_line(s: &Status) -> String {
         if s.backend_error.is_some() { "未连接后台服务".to_owned() } else { "已停止".to_owned() }
     } else if inert(s) {
         "未拦截：网络扩展、全局断网都没有启用".to_owned()
+    } else if let Some(e) = &s.apply_error {
+        shorten(e, 40)
     } else if s.blocked {
         match s.egress_ip {
             Some(ip) => format!("已切断网络：出口 IP {ip} 不在白名单"),
@@ -502,6 +506,8 @@ fn describe(s: &Status, p: &Palette) -> (&'static str, String, Color32) {
         }
     } else if inert(s) {
         ("未拦截", "出口 IP 没有通过白名单，但网络扩展没有启用、全局断网也没有开启，什么也没有切断。".into(), p.orange)
+    } else if let Some(e) = &s.apply_error {
+        ("未生效", format!("{e}。每 5 秒自动重试一次。"), p.orange)
     } else if s.blocked {
         let why = match (&s.block_reason, s.egress_ip, &s.detect_error) {
             (Some(r), _, _) if s.egress_ip.is_some() || !s.checking => format!("{r}。出口回到白名单后会自动恢复。"),
@@ -837,7 +843,7 @@ impl App {
     fn vpn_section(&mut self, ui: &mut egui::Ui, p: &Palette, s: &Status) {
         theme::section(ui, p, "VPN 守护");
         if self.adapters.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
-            self.adapters = (Some(Instant::now()), crate::vpn::candidates(&crate::vpn::scan()));
+            self.adapters = (Some(Instant::now()), crate::vpn::candidates(&crate::vpn::scan().unwrap_or_default()));
         }
         let mut add = None;
         theme::card(ui, p, |ui| {
@@ -1247,6 +1253,14 @@ impl App {
         self.update_card(ui, p);
         if let (true, Some(e)) = (s.running, &s.backend_error) {
             warning_card(ui, p, "拦截规则未生效", &format!("{}{e}", text::BACKEND_UNAVAILABLE));
+            ui.add_space(4.0);
+        }
+        if let (true, Some(e)) = (s.running, &s.apply_error) {
+            warning_card(ui, p, "切换没有生效，正在重试", &format!("{e}。每 5 秒自动重试一次，生效后这条提示会消失。"));
+            ui.add_space(4.0);
+        }
+        if let (true, Some(e)) = (s.running, &s.degraded) {
+            warning_card(ui, p, "网络扩展需要更新", e);
             ui.add_space(4.0);
         }
         // macOS：网络扩展没连上时只有 pf 全局断网有效

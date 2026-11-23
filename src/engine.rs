@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
-use crate::config::{Config, Ipv6Mode};
+use crate::config::Config;
 use crate::controller::{Controller, DryRunFirewall, Egress, Firewall};
 use crate::discovery::{self, ExtraApp, WatchSettings};
-use crate::egress::{EgressDetector, Family};
+use crate::egress::Detectors;
 use crate::leaktest::ifaces::Adapter;
 use crate::{logbuf, vpn};
 
@@ -74,6 +74,12 @@ pub struct Status {
     pub failures: u32,
     /// 拦截后端不可用的原因（此时为模拟模式，规则未真正生效）。
     pub backend_error: Option<String>,
+    /// 上一次阻断/放行没能生效的原因（正在每 5 秒重试）。
+    pub apply_error: Option<String>,
+    /// 拦截后端的其他问题（例如 macOS 网络扩展版本太旧，不支持当前设置）。
+    pub degraded: Option<String>,
+    /// 网络 / 配置代次：网络变化、VPN 网卡增减、应用新配置时加一。界面的后台任务据此丢弃过期的结果。
+    pub generation: u64,
     /// 模拟模式（--dry-run 或拦截后端打开失败）。
     pub simulated: bool,
     /// 拦截后端现在能否按应用阻断（macOS 需要网络扩展已连接；否则只有 pf 全局断网）。
@@ -151,9 +157,10 @@ fn run(
 
     // 网卡变化监听，需在整个循环期间保持存活
     let _watcher = start_netwatch(tx.clone());
-    // VPN 守护：每 0.25 秒检查一次网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）
-    vpn::spawn_engine_watch(tx.clone());
-    let mut adapters: Vec<Adapter> = vpn::scan();
+    // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
+    // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
+    let vpn_watch = vpn::spawn_engine_watch(tx.clone());
+    let mut adapters: Vec<Adapter> = vpn::scan().unwrap_or_default();
     let mut guarded: Vec<String> = Vec::new();
 
     let fw: Box<dyn Firewall> = if dry_run {
@@ -242,17 +249,18 @@ fn run(
             let connected = vpn::connected(&adapters, cfg_vpn);
             status.vpn_connected = connected.clone();
             let mut blocked_now = false;
-            if ctrl.is_blocked() || !cfg_vpn.guard {
+            if ctrl.wants_block() || !cfg_vpn.guard {
                 guarded.clear();
             } else {
                 let lost = vpn::lost(&guarded, &connected);
                 if !lost.is_empty() {
                     let reason = format!("VPN 断开（{}）", lost.join("、"));
-                    guarded.clear();
-                    match ctrl.block_for(reason) {
-                        Ok(()) => blocked_now = true,
-                        Err(e) => log::error!("{e:#}"),
+                    // 阻断失败时控制器记着目标和原因，每 5 秒重试，直到生效或被新的检测结果取代
+                    if let Err(e) = ctrl.block_for(reason) {
+                        log::error!("{e:#}");
                     }
+                    guarded.clear();
+                    blocked_now = true;
                 }
             }
             blocked_now
@@ -279,7 +287,10 @@ fn run(
             Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Event::NetworkChanged) => {
                 // 先看是不是守护中的 VPN 断了（原因更明确，也不受「网络变化时先阻断」开关影响）
-                adapters = vpn::scan();
+                // 列不出网卡时沿用上一次的结果（不当作全部断开）
+                if let Some(a) = vpn::scan() {
+                    adapters = a;
+                }
                 let vpn_blocked = check_vpn!();
                 if debounce_until.is_none() && !vpn_blocked {
                     if let Err(e) = ctrl.on_network_change() {
@@ -399,10 +410,12 @@ fn run(
             }
         }
 
-        if ctrl.is_blocked() {
+        if ctrl.wants_block() {
             guarded.clear();
         }
         status.vpn_guarded = guarded.clone();
+        status.generation = generation;
+        vpn_watch.set_active(!guarded.is_empty());
         update_status(&mut status, &ctrl, checking);
         reporter(&status);
     }
@@ -429,42 +442,12 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.checking = checking;
     s.detect_error = ctrl.last_error().map(str::to_owned);
     s.failures = ctrl.failures();
-}
-
-/// 主出口检测，以及（检测 IPv6 出口时）只走 IPv6 的检测。
-struct Detectors {
-    main: EgressDetector,
-    v6: Option<EgressDetector>,
-}
-
-impl Detectors {
-    /// 两项检测同时进行。IPv6 检测失败视为本机不能直连 IPv6（不算检测失败）。
-    fn detect(&self) -> Result<Egress> {
-        std::thread::scope(|s| {
-            let v6 = self.v6.as_ref().map(|d| s.spawn(|| d.detect()));
-            let main = self.main.detect();
-            // 先等 IPv6 检测结束再返回主检测的错误：未 join 的线程若 panic，scope 会把 panic 传出来
-            let v6 = match v6.map(|h| h.join()) {
-                Some(Ok(Ok(v))) => Some(v),
-                Some(Ok(Err(e))) => {
-                    log::debug!("没有检测到 IPv6 出口: {e:#}");
-                    None
-                }
-                Some(Err(_)) => None,
-                None => None,
-            };
-            Ok(Egress { ip: main?, v6 })
-        })
-    }
+    s.apply_error = ctrl.apply_error().map(str::to_owned);
+    s.degraded = ctrl.degraded();
 }
 
 fn make_detector(cfg: &Config) -> Detectors {
-    let timeout = Duration::from_secs(cfg.detect.timeout_secs);
-    Detectors {
-        main: EgressDetector::with_family(cfg.detect.services.clone(), timeout, Family::for_main(cfg.ipv6.mode)),
-        v6: (cfg.ipv6.mode == Ipv6Mode::Check)
-            .then(|| EgressDetector::with_family(cfg.ipv6.services.clone(), timeout, Family::V6)),
-    }
+    Detectors::new(cfg)
 }
 
 /// 网卡/地址/路由变化监听；返回值需保持存活。

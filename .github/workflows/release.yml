@@ -1,8 +1,8 @@
 name: 发布
 
-# 合并到 main 后，如果 Cargo.toml 里的版本还没有发布过，就构建 Windows、macOS 两个安装包，
-# 创建 GitHub Release（标签 v<版本>）。界面的「检查更新」读取的就是这里的最新发布。
-# 也可以在 Actions 页面手动运行。
+# 合并到 main 后，如果 Cargo.toml 里的版本还没有发布过，先对同一个提交跑一遍完整的 CI（ci.yml），
+# 通过后构建 Windows、macOS 两个安装包，创建 GitHub Release（标签 v<版本>）。
+# 界面的「检查更新」读取的就是这里的最新发布。也可以在 Actions 页面手动运行（只能针对 main）。
 
 on:
   push:
@@ -19,6 +19,8 @@ env:
 jobs:
   check:
     name: 是否需要发布
+    # 手动运行也只发布 main 上的提交
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -29,19 +31,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          V=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          set -euo pipefail
+          # 版本号以 Cargo 元数据为准（不靠文本匹配）
+          V=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "egress-guard") | .version')
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "::error::读不出版本号：$V"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          if gh release view "v$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # 只有 404 才算「还没发布」；鉴权失败、限流、服务错误都让发布失败，而不是重复发布
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$V" 2>&1); then
             echo "v$V 已经发布过，跳过"
             echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "将发布 v$V"
-            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif ! grep -q "HTTP 404" <<<"$out"; then
+            echo "::error::查询发布失败：$out"
+            exit 1
           fi
+          # 标签已经存在、却指向别的提交：不能把这个提交的安装包挂到别人的标签上
+          if tag=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$V" --jq '.object.sha' 2>&1); then
+            if [[ "$tag" != "$GITHUB_SHA" ]]; then
+              # 附注标签指向标签对象，再取一层
+              tag=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag" --jq '.object.sha' 2>/dev/null || echo "$tag")
+            fi
+            [[ "$tag" == "$GITHUB_SHA" ]] || { echo "::error::标签 v$V 已存在并指向 $tag，不是 $GITHUB_SHA"; exit 1; }
+          elif ! grep -q "HTTP 404" <<<"$tag"; then
+            echo "::error::查询标签失败：$tag"
+            exit 1
+          fi
+          echo "将发布 v$V"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: 发布前的完整测试
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
 
   windows:
     name: Windows 安装包
-    needs: check
+    needs: [check, ci]
     if: needs.check.outputs.release == 'true'
     runs-on: windows-latest
     steps:
@@ -64,7 +90,7 @@ jobs:
 
   macos:
     name: macOS 安装包
-    needs: check
+    needs: [check, ci]
     if: needs.check.outputs.release == 'true'
     runs-on: macos-latest
     steps:
@@ -85,7 +111,8 @@ jobs:
 
   release:
     name: 创建 GitHub Release
-    needs: [check, windows, macos]
+    needs: [check, ci, windows, macos]
+    if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -99,9 +126,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           V: ${{ needs.check.outputs.version }}
         run: |
+          set -euo pipefail
           ls -la dist
-          gh release create "v$V" dist/*.zip \
+          # 两个平台的安装包都要在
+          for f in "egress-guard-v$V-windows.zip" "egress-guard-v$V-macos.zip"; do
+            [[ -s "dist/$f" ]] || { echo "::error::缺少 $f"; exit 1; }
+          done
+          # 先建草稿，核对标签、提交和资产后再公开
+          gh release create "v$V" "dist/egress-guard-v$V-windows.zip" "dist/egress-guard-v$V-macos.zip" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Egress Guard $V" \
-            --generate-notes
+            --generate-notes \
+            --draft
+          info=$(gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json tagName,assets,targetCommitish)
+          echo "$info"
+          [[ "$(jq -r .tagName <<<"$info")" == "v$V" ]] || { echo "::error::标签不符"; exit 1; }
+          n=$(jq '[.assets[].name | select(. == "egress-guard-v'"$V"'-windows.zip" or . == "egress-guard-v'"$V"'-macos.zip")] | length' <<<"$info")
+          [[ "$n" == 2 ]] || { echo "::error::草稿里的安装包不全（$n/2）"; exit 1; }
+          gh release edit "v$V" --repo "$GITHUB_REPOSITORY" --draft=false
+          # 公开后标签必须指向这个提交
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/v$V" --jq .sha)
+          [[ "$sha" == "$GITHUB_SHA" ]] || { echo "::error::标签 v$V 指向 $sha，不是 $GITHUB_SHA"; exit 1; }

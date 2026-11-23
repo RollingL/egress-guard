@@ -65,21 +65,39 @@ const E_ACCESSDENIED: u32 = 0x8007_0005;
 const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
 
 /// 「始终阻断 IPv6」的过滤器：放行期间也在 IPv6 层阻断受控应用（全局断网时为全部 IPv6）。
-/// 与阻断状态无关，规则变化时整体替换。阻断期间与主规则重复，不影响结果。
+/// 与阻断状态无关。和主规则一样按程序增量同步：已经生效的阻断在新程序加不上时保持不动，
+/// 不会出现「先删掉旧的一整套、新的只加上一半」的情况。阻断期间与主规则重复，不影响结果。
+#[derive(Default)]
 struct V6Guard {
-    /// 生成这套过滤器时的受控应用（规范化路径，排序）与全局断网规则。
-    key: (Vec<String>, Option<BlockAllPolicy>),
+    /// 规范化路径 → 该程序在 IPv6 层的阻断过滤器。
+    apps: HashMap<String, Vec<u64>>,
+    /// 因为文件不存在而暂未加上的程序：等它出现再加。
+    missing: HashMap<String, PathBuf>,
+    /// 添加失败的程序：定时重试。
+    failed: HashSet<String>,
+    /// 全局断网时的 IPv6 兜底阻断与例外。
+    global: Option<V6Global>,
+}
+
+struct V6Global {
+    policy: BlockAllPolicy,
     ids: Vec<u64>,
-    /// 受控应用和例外程序是否全部加上了。
-    complete: bool,
-    /// 因为文件不存在而跳过的程序；只有其中某个出现了才值得重建。
+    /// 不存在的例外程序（出现后重建）。
     missing: Vec<PathBuf>,
+    /// 有例外程序添加失败（定时重试）。
+    failed: bool,
 }
 
 impl V6Guard {
-    /// 需要重试：有程序添加失败，或者之前不存在的程序现在出现了。
+    /// 需要重试：有程序添加失败，或者之前不存在的程序现在出现了。两类原因分别判断，互不掩盖。
     fn needs_retry(&self) -> bool {
-        !self.complete && (self.missing.is_empty() || self.missing.iter().any(|p| p.exists()))
+        !self.failed.is_empty()
+            || self.missing.values().any(|p| p.exists())
+            || self.global.as_ref().is_some_and(|g| g.failed || g.missing.iter().any(|p| p.exists()))
+    }
+
+    fn all_ids(&self) -> Vec<u64> {
+        self.apps.values().flatten().chain(self.global.iter().flat_map(|g| g.ids.iter())).copied().collect()
     }
 }
 
@@ -105,6 +123,13 @@ pub struct WfpFirewall {
     /// 本工具自身，全局断网时始终放行（否则无法再检测出口 IP）。
     self_exe: Option<PathBuf>,
     v6guard: Option<V6Guard>,
+}
+
+/// 新加上的全局断网规则。
+struct GlobalAdded {
+    ids: Vec<u64>,
+    missing: Vec<PathBuf>,
+    failed: bool,
 }
 
 /// 同步结果。
@@ -221,21 +246,25 @@ impl WfpFirewall {
         Ok(id)
     }
 
-    fn delete_ids(&self, ids: &[u64]) {
+    fn delete_ids(&self, ids: &[u64]) -> Result<()> {
         for id in ids {
-            unsafe { FwpmFilterDeleteById0(self.engine, *id) };
+            check(unsafe { FwpmFilterDeleteById0(self.engine, *id) }, "FwpmFilterDeleteById0")?;
         }
+        Ok(())
     }
 
     /// 为单个程序在给定的层上添加过滤器（阻断或放行），返回过滤器 ID。
-    /// 任一层失败时删掉已加上的部分，不留半套规则。
-    fn add_app_filters(&self, app: &Path, permit: bool, layers: &[&Layer]) -> Result<Vec<u64>> {
+    /// 任一层失败时删掉已加上的部分，不留半套规则：这时返回 `Ok(Err(..))`，调用方可以跳过这个程序继续；
+    /// 清理本身失败时返回外层的 `Err`，调用方必须中止整个事务（否则会提交半套规则）。
+    fn add_app_filters(&self, app: &Path, permit: bool, layers: &[&Layer]) -> Result<Result<Vec<u64>>> {
         let path_w = wide(&app.to_string_lossy());
         let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
-        check(
+        if let Err(e) = check(
             unsafe { FwpmGetAppIdFromFileName0(PCWSTR(path_w.as_ptr()), &mut app_id) },
             &format!("FwpmGetAppIdFromFileName0({})", app.display()),
-        )?;
+        ) {
+            return Ok(Err(e));
+        }
         let (what, weight) = if permit { ("allow app", W_PERMIT) } else { ("block app", W_APP_BLOCK) };
         let mut ids = Vec::with_capacity(layers.len());
         let mut result = Ok(());
@@ -259,23 +288,23 @@ impl WfpFirewall {
         let mut p = app_id as *mut c_void;
         unsafe { FwpmFreeMemory0(&mut p) };
         match result {
-            Ok(()) => Ok(ids),
+            Ok(()) => Ok(Ok(ids)),
             Err(e) => {
-                self.delete_ids(&ids);
-                Err(e)
+                self.delete_ids(&ids).map_err(|d| d.context(format!("清理 {} 的部分过滤器失败", app.display())))?;
+                Ok(Err(e))
             }
         }
     }
 
     /// 添加全局断网的兜底阻断与例外放行。基础规则失败时返回错误（整个事务回滚）；
-    /// 单个例外程序失败只跳过它，并把 complete 记为 false 以便稍后重试。
+    /// 单个例外程序失败只跳过它：不存在的记进 missing（等它出现），添加失败的把 failed 记为 true（定时重试）。
     fn add_global_filters(
         &self,
         policy: &BlockAllPolicy,
         layers: &[&Layer],
         warnings: &mut Vec<(String, String)>,
         ok_keys: &mut Vec<String>,
-    ) -> Result<(Vec<u64>, bool)> {
+    ) -> Result<GlobalAdded> {
         let mut ids = Vec::new();
         let mut remote: Vec<IpNet> = if policy.allow_lan { lan_nets() } else { Vec::new() };
         remote.extend(policy.allow_remote.iter().copied());
@@ -323,31 +352,30 @@ impl WfpFirewall {
             }
             Ok(())
         })();
-        if let Err(e) = base {
-            self.delete_ids(&ids);
-            return Err(e);
-        }
+        // 出错时整个事务会回滚，不必逐个删除
+        base?;
 
-        let mut complete = true;
+        let mut missing = Vec::new();
+        let mut failed = false;
         for app in self.self_exe.iter().chain(policy.allow_apps.iter()) {
             let key = format!("allow:{}", normalize_path(app));
             if !app.exists() {
-                complete = false;
+                missing.push(app.clone());
                 warnings.push((key, format!("例外程序不存在，暂时跳过: {}", app.display())));
                 continue;
             }
-            match self.add_app_filters(app, true, layers) {
+            match self.add_app_filters(app, true, layers)? {
                 Ok(mut v) => {
                     ids.append(&mut v);
                     ok_keys.push(key);
                 }
                 Err(e) => {
-                    complete = false;
+                    failed = true;
                     warnings.push((key, format!("无法放行例外程序 {}，稍后重试: {e:#}", app.display())));
                 }
             }
         }
-        Ok((ids, complete))
+        Ok(GlobalAdded { ids, missing, failed })
     }
 
     /// 在一个事务里让过滤器与规则一致：为缺少的程序添加、为多余的程序删除，
@@ -391,7 +419,7 @@ impl WfpFirewall {
                     warnings.push((k.clone(), format!("程序不存在，暂时跳过: {}", app.display())));
                     continue;
                 }
-                match fw.add_app_filters(app, false, &all_layers()) {
+                match fw.add_app_filters(app, false, &all_layers())? {
                     Ok(ids) => {
                         ok_keys.push(k.clone());
                         added.push((k.clone(), app.clone(), ids));
@@ -410,8 +438,9 @@ impl WfpFirewall {
                 }
                 new_global = Some(match &want_global {
                     Some(p) => {
-                        let (ids, complete) = fw.add_global_filters(p, &all_layers(), &mut warnings, &mut ok_keys)?;
-                        Some(Global { policy: p.clone(), ids, complete })
+                        let g = fw.add_global_filters(p, &all_layers(), &mut warnings, &mut ok_keys)?;
+                        let complete = g.missing.is_empty() && !g.failed;
+                        Some(Global { policy: p.clone(), ids: g.ids, complete })
                     }
                     None => None,
                 });
@@ -469,86 +498,122 @@ impl WfpFirewall {
     }
 
     /// 让「始终阻断 IPv6」的过滤器与规则一致（与阻断状态无关）。
+    ///
+    /// 在一个事务里：删除不再受控的程序、为新程序添加、全局断网规则变化时整体替换。
+    /// 已经生效的程序阻断不会被重建，新程序加不上只记下来（报告具体路径并稍后重试）；
+    /// 删除失败或全局部分的基础规则失败时回滚整个事务，原来的保护保持不变。
     fn sync_v6guard(&mut self) -> Result<()> {
-        let want = self.rules.block_ipv6.then(|| {
-            let mut apps: Vec<String> = self.rules.apps.iter().map(|p| normalize_path(p)).collect();
-            apps.sort();
-            apps.dedup();
-            (apps, self.rules.block_all.clone())
-        });
-        let stale = match (&self.v6guard, &want) {
-            (None, None) => false,
-            (Some(g), Some(k)) => g.key != *k || g.needs_retry(),
-            _ => true,
-        };
-        if !stale {
+        if !self.rules.block_ipv6 {
+            if let Some(g) = &self.v6guard {
+                let ids = g.all_ids();
+                self.in_transaction(|fw| fw.delete_ids(&ids))?;
+                log::info!("已移除「始终阻断 IPv6」的 {} 个过滤器", ids.len());
+            }
+            self.v6guard = None;
             return Ok(());
         }
-        let apps = self.rules.apps.clone();
+        let first = self.v6guard.is_none();
+        let guard = self.v6guard.get_or_insert_with(V6Guard::default);
+        let wanted: HashMap<String, PathBuf> =
+            self.rules.apps.iter().map(|p| (normalize_path(p), p.clone())).collect();
+        let to_remove: Vec<String> = guard.apps.keys().filter(|k| !wanted.contains_key(*k)).cloned().collect();
+        // 还没加上的（新程序、之前不存在的、之前添加失败的）都在这里；仍然不存在的不必进事务
+        let to_add: Vec<(String, PathBuf)> = wanted
+            .iter()
+            .filter(|(k, _)| !guard.apps.contains_key(*k))
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
+        let want_global = self.rules.block_all.clone();
+        let global_stale = match (&guard.global, &want_global) {
+            (None, None) => false,
+            (Some(g), Some(p)) => g.policy != *p || g.failed || g.missing.iter().any(|a| a.exists()),
+            _ => true,
+        };
+        let work = !to_remove.is_empty() || global_stale || to_add.iter().any(|(_, p)| p.exists());
+        if !work {
+            guard.missing = to_add.into_iter().collect();
+            guard.failed.clear();
+            return Ok(());
+        }
+
+        let old_global_ids: Vec<u64> = guard.global.as_ref().map(|g| g.ids.clone()).unwrap_or_default();
+        let remove_ids: Vec<u64> = to_remove.iter().flat_map(|k| guard.apps[k].iter().copied()).collect();
+        let mut added: Vec<(String, Vec<u64>)> = Vec::new();
+        let mut missing = HashMap::new();
+        let mut failed = HashSet::new();
         let mut warnings = Vec::new();
         let mut ok_keys = Vec::new();
-        let mut new_guard = None;
+        let mut new_global: Option<Option<V6Global>> = None;
         self.in_transaction(|fw| {
-            if let Some(g) = &fw.v6guard {
-                for id in &g.ids {
-                    check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
-                }
-            }
-            let Some(key) = want else { return Ok(()) };
+            fw.delete_ids(&remove_ids)?;
             let layers = v6_layers();
-            let mut ids = Vec::new();
-            let mut failed = false;
-            let mut missing = Vec::new();
-            let mut seen = HashSet::new();
-            for app in &apps {
-                let k = normalize_path(app);
-                if !seen.insert(k.clone()) {
-                    continue;
-                }
+            for (k, app) in &to_add {
                 if !app.exists() {
-                    missing.push(app.clone());
-                    warnings.push((k, format!("程序不存在，暂时跳过: {}", app.display())));
+                    missing.insert(k.clone(), app.clone());
+                    warnings.push((format!("v6:{k}"), format!("程序不存在，暂时跳过: {}", app.display())));
                     continue;
                 }
-                match fw.add_app_filters(app, false, &layers) {
-                    Ok(mut v) => ids.append(&mut v),
+                match fw.add_app_filters(app, false, &layers)? {
+                    Ok(ids) => {
+                        ok_keys.push(format!("v6:{k}"));
+                        added.push((k.clone(), ids));
+                    }
                     Err(e) => {
-                        failed = true;
-                        warnings.push((k, format!("无法阻断 {} 的 IPv6，稍后重试: {e:#}", app.display())));
+                        failed.insert(k.clone());
+                        warnings.push((
+                            format!("v6:{k}"),
+                            format!("无法阻断 {} 的 IPv6，稍后重试: {e:#}", app.display()),
+                        ));
                     }
                 }
             }
-            if let Some(p) = &key.1 {
-                let (mut v, c) = fw.add_global_filters(p, &layers, &mut warnings, &mut ok_keys)?;
-                ids.append(&mut v);
-                // 例外程序不存在：等它出现再重建（不必每 5 秒重试）；其余情况按添加失败处理
-                let absent: Vec<PathBuf> = p.allow_apps.iter().filter(|a| !a.exists()).cloned().collect();
-                if !c && absent.is_empty() {
-                    failed = true;
-                }
-                missing.extend(absent);
+            if global_stale {
+                fw.delete_ids(&old_global_ids)?;
+                new_global = Some(match &want_global {
+                    Some(p) => {
+                        let g = fw.add_global_filters(p, &layers, &mut warnings, &mut ok_keys)?;
+                        Some(V6Global { policy: p.clone(), ids: g.ids, missing: g.missing, failed: g.failed })
+                    }
+                    None => None,
+                });
             }
-            let complete = !failed && missing.is_empty();
-            if failed {
-                missing.clear();
-            }
-            new_guard = Some(V6Guard { key, ids, complete, missing });
             Ok(())
         })?;
+
+        for k in &ok_keys {
+            self.warned.remove(k);
+        }
         for (k, msg) in warnings {
             if self.warned.insert(k) {
                 log::warn!("{msg}");
             }
         }
-        match &new_guard {
-            Some(g) => log::info!(
-                "始终阻断 IPv6：{} 个过滤器（{}）",
-                g.ids.len(),
-                if g.key.1.is_some() { "全部 IPv6，例外同全局断网" } else { "受控应用" }
-            ),
-            None => log::info!("已移除「始终阻断 IPv6」的过滤器"),
+        let guard = self.v6guard.as_mut().expect("上面已经创建");
+        for k in &to_remove {
+            guard.apps.remove(k);
         }
-        self.v6guard = new_guard;
+        let added_n = added.len();
+        for (k, ids) in added {
+            guard.apps.insert(k, ids);
+        }
+        guard.missing = missing;
+        guard.failed = failed;
+        if let Some(g) = new_global {
+            guard.global = g;
+        }
+        if first || added_n > 0 || !to_remove.is_empty() || global_stale {
+            let n = guard.all_ids().len();
+            log::info!(
+                "始终阻断 IPv6：{n} 个过滤器（受控应用 {} 个{}{}）",
+                guard.apps.len(),
+                if guard.global.is_some() { "，全部 IPv6，例外同全局断网" } else { "" },
+                if guard.missing.is_empty() && guard.failed.is_empty() {
+                    String::new()
+                } else {
+                    format!("，{} 个暂未加上", guard.missing.len() + guard.failed.len())
+                }
+            );
+        }
         Ok(())
     }
 

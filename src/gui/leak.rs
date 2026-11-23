@@ -57,9 +57,26 @@ impl Outcome {
         }
         (!parts.is_empty()).then(|| parts.join("；"))
     }
+
+    /// 需要留意的地方（没有直接泄露、但结论不完整或有未知解析器等）。
+    pub fn warn_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        match &self.dns {
+            Ok((Level::Warn, t)) => parts.push(format!("DNS：{t}")),
+            Err(e) => parts.push(format!("DNS 测试失败：{e}")),
+            _ => {}
+        }
+        if self.webrtc.0 == Level::Warn {
+            parts.push(format!("WebRTC：{}", self.webrtc.1));
+        }
+        (!parts.is_empty()).then(|| parts.join("；"))
+    }
 }
 
 type Done = Box<dyn FnOnce(Outcome) + Send>;
+
+/// 自动测试是否仍然有效。
+pub(super) type Validity = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// 测试的进度与结果。界面（手动）和自动测试线程共用同一份，结果都显示在「泄露测试」页。
 #[derive(Clone)]
@@ -83,15 +100,19 @@ impl LeakJob {
     }
 
     /// 开始测试（DNS、WebRTC 同时进行），两项都完成后调用 `done`。已经在测试时返回 false。
+    ///
+    /// `auto`：自动测试时传入，返回 false（网络或配置已经变了、阻断了、进入模拟模式）时不再发出新的探测。
     pub(super) fn start(
         &self,
         lt: LeakTestConfig,
         judge: Judge,
         egress: Option<IpAddr>,
-        auto: bool,
+        auto: Option<Validity>,
         ctx: egui::Context,
         done: impl FnOnce(Outcome) + Send + 'static,
     ) -> bool {
+        let valid: Validity = auto.clone().unwrap_or_else(|| Arc::new(|| true));
+        let auto = auto.is_some();
         {
             // 先占住两项，避免界面和自动测试同时开始
             let mut d = self.dns.lock().unwrap();
@@ -142,7 +163,7 @@ impl LeakJob {
 
         {
             let (task, ctx, judge, lt) = (self.dns.clone(), ctx.clone(), judge.clone(), lt.clone());
-            let (remaining, done, finish) = (remaining.clone(), done.clone(), finish.clone());
+            let (remaining, done, finish, valid) = (remaining.clone(), done.clone(), finish.clone(), valid.clone());
             std::thread::Builder::new()
                 .name("dns-leak-test".into())
                 .spawn(move || {
@@ -153,7 +174,9 @@ impl LeakJob {
                         ctx.request_repaint();
                     };
                     let zone = lt.dnscheck_zone.trim().trim_matches('.').to_ascii_lowercase();
-                    let r = if leaktest::valid_zone(&zone) {
+                    let r = if !valid() {
+                        Err(anyhow::anyhow!("测试已取消（网络或设置变了）"))
+                    } else if leaktest::valid_zone(&zone) {
                         dns::run(&zone, &lt.dns_sources, egress, &judge, &progress)
                     } else {
                         Err(anyhow::anyhow!("DNS 测试服务的域名有误：{:?}", lt.dnscheck_zone))
@@ -174,7 +197,7 @@ impl LeakJob {
             std::thread::Builder::new()
                 .name("webrtc-leak-test".into())
                 .spawn(move || {
-                    let r = webrtc::run(&lt.stun_servers, egress, &judge);
+                    let r = webrtc::run(&lt.stun_servers, egress, &judge, &|| !valid());
                     log::info!("WebRTC 泄露测试：{}", leaktest::webrtc_summary(&r).1);
                     *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
                     ctx.request_repaint();
@@ -229,8 +252,8 @@ fn verdict_hint(v: Verdict) -> &'static str {
         Verdict::SameNetwork => "与当前出口 IP 属于同一个网络（同一自治系统），多半是 VPN 服务商自己的解析器",
         Verdict::Local => "局域网地址，只在本地网络可见",
         Verdict::Exposed => "网卡上的公网地址：网页获得摄像头/麦克风权限后可以通过 WebRTC 读到",
-        Verdict::Leak => "不在白名单内，也不是可信解析器",
-        Verdict::NoResponse => "STUN 服务器没有响应：从这里发不出去，也就不会暴露",
+        Verdict::Leak => "不在白名单内，也不是可信解析器（解析器本身不一定说明泄露：VPN 也可能使用公共解析器）",
+        Verdict::NoResponse => "STUN 服务器没有响应：这条路径没有验证到（只说明到这些服务器的 UDP 不通，不能证明不会暴露）",
     }
 }
 
@@ -297,7 +320,7 @@ impl App {
         let egress = self.status.lock().unwrap().egress_ip;
         let lt = self.draft.leak_test.clone();
         let judge = Judge::from_strings(&self.draft.whitelist, &lt.trusted_dns);
-        self.leak.job.start(lt, judge, egress, false, ctx.clone(), |_| {});
+        self.leak.job.start(lt, judge, egress, None, ctx.clone(), |_| {});
     }
 
     fn sync_stun(&mut self) {
@@ -607,20 +630,34 @@ impl App {
         let st = self.auto_leak.lock().unwrap().clone();
         theme::card(ui, p, |ui| {
             let lt = &mut self.draft.leak_test;
-            theme::row(ui, p, "网络变化后自动测试", Some("刚放行、或者出口 IP 变了时，等 10 秒网络稳定后测一次"), |ui| {
-                theme::toggle(ui, p, &mut lt.auto_after_change);
-            });
+            theme::row(
+                ui,
+                p,
+                "允许后台自动测试",
+                Some("测试会绕过代理直连下方的 DNS 检测源和 STUN 服务器：用系统 DNS 解析检测域名，并从默认路由和每个网卡地址发 UDP。只靠代理上网时，这些第三方会看到你直连的公网地址"),
+                |ui| {
+                    theme::toggle(ui, p, &mut lt.auto);
+                },
+            );
             theme::hairline(ui, p);
-            theme::row(ui, p, "定时测试", Some("距上次测试满这么久就再测一次；0 表示不定时测试"), |ui| {
-                ui.add(egui::DragValue::new(&mut lt.interval_mins).range(0..=1440).suffix(" 分钟"));
-            });
-            theme::hairline(ui, p);
-            theme::row(ui, p, "发现泄露时发系统通知", Some("同一出口、同样的结论只提醒一次；结果也会写进「连接记录」"), |ui| {
-                theme::toggle(ui, p, &mut lt.notify);
+            let enabled = lt.auto;
+            ui.add_enabled_ui(enabled, |ui| {
+                theme::row(ui, p, "网络变化后自动测试", Some("刚放行、或者出口 IP 变了时，等 10 秒网络稳定后测一次"), |ui| {
+                    theme::toggle(ui, p, &mut lt.auto_after_change);
+                });
+                theme::hairline(ui, p);
+                theme::row(ui, p, "定时测试", Some("距上次测试满这么久就再测一次；0 表示不定时测试"), |ui| {
+                    ui.add(egui::DragValue::new(&mut lt.interval_mins).range(0..=1440).suffix(" 分钟"));
+                });
+                theme::hairline(ui, p);
+                theme::row(ui, p, "发现泄露时发系统通知", Some("同一出口、同样的结论只提醒一次；结果也会写进「连接记录」"), |ui| {
+                    theme::toggle(ui, p, &mut lt.notify);
+                });
             });
             theme::hairline(ui, p);
             let next = match st.next {
-                _ if !lt.auto_after_change && lt.interval_mins == 0 => "已关闭".to_owned(),
+                _ if !lt.auto || (!lt.auto_after_change && lt.interval_mins == 0) => "已关闭（可以随时手动测试）".to_owned(),
+                _ if s.simulated => "模拟模式下不自动测试".to_owned(),
                 Some(t) => {
                     let secs = t.saturating_duration_since(Instant::now()).as_secs();
                     match secs {

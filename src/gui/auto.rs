@@ -77,10 +77,19 @@ pub struct AutoLeak {
 }
 
 /// 出口处于「放行」：只有这时测试才有意义（阻断时测试流量也被切断，macOS 全局断网时尤其如此）。
-fn allowed_key(s: &Status) -> Option<(IpAddr, Option<IpAddr>)> {
-    let ok = s.running && !s.blocked && s.whitelisted == Some(true) && s.v6_whitelisted != Some(false);
+/// 模拟模式下规则没有生效，测试结果说明不了保护的情况，也不测。
+/// 第三项是网络 / 配置代次：网络一变，之前的测试就作废。
+type Key = (IpAddr, Option<IpAddr>, u64);
+
+fn allowed_key(s: &Status) -> Option<Key> {
+    let ok = s.running
+        && !s.blocked
+        && !s.simulated
+        && s.apply_error.is_none()
+        && s.whitelisted == Some(true)
+        && s.v6_whitelisted != Some(false);
     ok.then_some(())?;
-    Some((s.egress_ip?, s.egress_v6))
+    Some((s.egress_ip?, s.egress_v6, s.generation))
 }
 
 pub struct LeakScheduler {
@@ -102,6 +111,7 @@ impl LeakScheduler {
     }
 
     fn run(self) {
+        // 上一次的出口（不含代次：网络抖一下而出口没变时不必重测）
         let mut last_key: Option<(IpAddr, Option<IpAddr>)> = None;
         // 网络变化后计划的那次测试；进入放行状态的时刻
         let mut change_at: Option<Instant> = None;
@@ -113,7 +123,8 @@ impl LeakScheduler {
             let s = self.status.lock().unwrap().clone();
             let cfg = self.config.lock().unwrap().clone();
             let lt = &cfg.leak_test;
-            let Some(key) = allowed_key(&s) else {
+            // 总开关关闭时不发出任何后台探测
+            let Some(key) = allowed_key(&s).filter(|_| lt.auto) else {
                 last_key = None;
                 change_at = None;
                 self.state.lock().unwrap().next = None;
@@ -121,8 +132,8 @@ impl LeakScheduler {
             };
             let now = Instant::now();
             // 刚放行、或者出口变了：等网络稳定后测一次
-            if last_key != Some(key) {
-                last_key = Some(key);
+            if last_key != Some((key.0, key.1)) {
+                last_key = Some((key.0, key.1));
                 allowed_since = now;
                 change_at = Some(now + SETTLE);
             }
@@ -145,14 +156,30 @@ impl LeakScheduler {
             change_at = None;
             let judge = Judge::from_strings(&cfg.whitelist, &lt.trusted_dns);
             let (backend, state, notified, notify_on) = (self.backend.clone(), self.state.clone(), notified.clone(), lt.notify);
-            self.job.start(lt.clone(), judge, Some(key.0), true, self.ctx.clone(), move |o| {
+            // 测试期间网络、配置或阻断状态变了：停止发出后续探测，结果作废（不记录、不通知）
+            let valid: super::leak::Validity = {
+                let (status, config) = (self.status.clone(), self.config.clone());
+                let lt0 = lt.clone();
+                Arc::new(move || {
+                    let still = allowed_key(&status.lock().unwrap()) == Some(key);
+                    let cfg = config.lock().unwrap();
+                    still && cfg.leak_test.auto && cfg.leak_test == lt0
+                })
+            };
+            let check = valid.clone();
+            self.job.start(lt.clone(), judge, Some(key.0), Some(valid), self.ctx.clone(), move |o| {
+                if !check() {
+                    log::info!("自动泄露测试期间网络或设置变了，结果作废");
+                    state.lock().unwrap().last = Some((crate::logbuf::now_hms(), "网络或设置变了，结果作废".to_owned()));
+                    return;
+                }
                 let summary = match o.leak_text() {
                     Some(t) => {
                         let mut e = ConnEvent::now(Kind::Leak, format!("自动泄露测试：{t}"));
                         e.egress = o.egress;
                         e.egress_v6 = key.1;
                         backend.record_event(e);
-                        let tag = format!("{key:?}{t}");
+                        let tag = format!("{:?}{t}", (key.0, key.1));
                         let mut n = notified.lock().unwrap();
                         if notify_on && n.as_deref() != Some(&tag) {
                             *n = Some(tag);
@@ -162,7 +189,10 @@ impl LeakScheduler {
                     }
                     None => {
                         *notified.lock().unwrap() = None;
-                        if o.dns.is_err() { "DNS 测试失败，WebRTC 未发现泄露".to_owned() } else { "未发现泄露".to_owned() }
+                        match o.warn_text() {
+                            Some(w) => format!("没有直接泄露，需要留意：{w}"),
+                            None => "未发现泄露".to_owned(),
+                        }
                     }
                 };
                 state.lock().unwrap().last = Some((crate::logbuf::now_hms(), summary));
@@ -263,5 +293,33 @@ impl UpdateChecker {
             }
             self.ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allowed() -> Status {
+        Status {
+            running: true,
+            egress_ip: Some("203.0.113.9".parse().unwrap()),
+            whitelisted: Some(true),
+            generation: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_tests_while_really_allowed() {
+        assert_eq!(allowed_key(&allowed()), Some(("203.0.113.9".parse().unwrap(), None, 3)));
+        assert!(allowed_key(&Status { blocked: true, ..allowed() }).is_none());
+        assert!(allowed_key(&Status { simulated: true, ..allowed() }).is_none(), "模拟模式不测");
+        assert!(allowed_key(&Status { apply_error: Some("放行未生效".into()), ..allowed() }).is_none());
+        assert!(allowed_key(&Status { v6_whitelisted: Some(false), ..allowed() }).is_none());
+        // 网络变了（代次不同）：之前开始的测试作废
+        assert_ne!(allowed_key(&Status { generation: 4, ..allowed() }), allowed_key(&allowed()));
+        // 默认不允许后台自动测试
+        assert!(!RawConfig::default().leak_test.auto);
     }
 }

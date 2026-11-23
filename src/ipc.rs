@@ -43,6 +43,8 @@ pub enum Request {
     Stop,
     /// macOS 网络扩展：持续接收按应用阻断的规则，直到连接断开。只接受 root。
     FilterWatch(FilterHello),
+    /// 网络扩展（在 filter_watch 连接里）确认已应用这个版本的规则。
+    FilterApplied(u64),
 }
 
 impl Request {
@@ -56,6 +58,7 @@ impl Request {
                 | Request::Logs
                 | Request::Events
                 | Request::FilterWatch(_)
+                | Request::FilterApplied(_)
         )
     }
 }
@@ -247,11 +250,13 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
                 Reply::Ok
             }
             Request::Events => Reply::Events(eventlog::recent()),
-            Request::ClearEvents => {
-                eventlog::clear();
-                log::info!("界面清空了连接记录");
-                Reply::Ok
-            }
+            Request::ClearEvents => match eventlog::clear() {
+                Ok(()) => {
+                    log::info!("界面清空了连接记录");
+                    Reply::Ok
+                }
+                Err(e) => Reply::Err(format!("无法清空连接记录：{e:#}")),
+            },
             Request::RecordEvent(e) if e.kind == eventlog::Kind::Leak => {
                 eventlog::record(*e);
                 Reply::Ok
@@ -266,7 +271,8 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
                 handler.stop();
                 return Ok(());
             }
-            Request::FilterWatch(hello) => return filter_watch(&mut w, hello),
+            Request::FilterWatch(hello) => return filter_watch(w, reader, hello),
+            Request::FilterApplied(_) => Reply::Err("filter_applied 只能在 filter_watch 连接里发送".into()),
             Request::Watch => {
                 let mut seen = 0;
                 loop {
@@ -289,24 +295,52 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
 }
 
 /// 网络扩展的连接：登记后持续推送规则，至少每 5 秒一次（心跳）。
-fn filter_watch(w: &mut impl Write, hello: FilterHello) -> std::io::Result<()> {
+/// 支持确认的扩展在同一连接上回复 `filter_applied`，由单独的线程读取。
+fn filter_watch(mut w: UnixStream, reader: BufReader<UnixStream>, hello: FilterHello) -> std::io::Result<()> {
     let hub = filterfeed::hub();
-    log::info!("网络扩展已连接（{}）", if hello.version.is_empty() { "版本未知" } else { &hello.version });
-    let _reg = hub.register(hello);
-    // 引擎还没写入过规则时先不发：扩展收到第一条规则前保持原来的状态
-    let mut seen = 0;
-    let r = loop {
-        let (v, s) = hub.wait_newer(seen, Duration::from_secs(5));
-        if v == 0 {
-            continue;
-        }
-        seen = v;
-        if let Err(e) = write_reply(w, &Reply::Filter(s)) {
-            break Err(e);
-        }
-    };
-    log::info!("网络扩展已断开");
-    r
+    log::info!(
+        "网络扩展已连接（{}{}）",
+        if hello.version.is_empty() { "版本未知" } else { &hello.version },
+        if hello.caps.is_empty() { String::new() } else { format!("，支持 {}", hello.caps.join("、")) }
+    );
+    let reg = hub.register(hello);
+    std::thread::scope(|scope| {
+        let reg = &reg;
+        scope.spawn(move || {
+            let mut reader = reader;
+            loop {
+                let mut line = String::new();
+                match std::io::Read::take(&mut reader, 4096).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Ok(Request::FilterApplied(rev)) = serde_json::from_str(&line) {
+                            hub.applied(reg, rev);
+                        }
+                    }
+                    // 旧扩展从不回复：读超时不算断开，连接是否还在由写入（心跳）判断
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        // 引擎还没写入过规则时先不发：扩展收到第一条规则前保持原来的状态
+        let mut seen = 0;
+        let r = loop {
+            let (v, mut s) = hub.wait_newer(seen, Duration::from_secs(5));
+            if v == 0 {
+                continue;
+            }
+            seen = v;
+            s.rev = v;
+            if let Err(e) = write_reply(&mut w, &Reply::Filter(s)) {
+                break Err(e);
+            }
+        };
+        // 让读取线程结束
+        let _ = w.shutdown(std::net::Shutdown::Both);
+        log::info!("网络扩展已断开");
+        r
+    })
 }
 
 /// 在后台线程中接受连接，每个连接一个线程。
@@ -421,13 +455,22 @@ impl Client {
     /// 以网络扩展的身份接收规则，直到连接断开（返回错误）。测试与 `filter-watch` 子命令使用。
     pub fn filter_watch(&self, hello: FilterHello, mut on_state: impl FnMut(FilterState) -> bool) -> Result<()> {
         let mut s = self.connect(Some(Duration::from_secs(15)))?;
+        let ack = hello.caps.iter().any(|c| c == filterfeed::CAP_ACK);
         let mut line = serde_json::to_string(&Request::FilterWatch(hello))?;
         line.push('\n');
         s.write_all(line.as_bytes())?;
+        let mut w = s.try_clone()?;
         for line in BufReader::new(s).lines() {
             match serde_json::from_str::<Reply>(&line?)? {
                 Reply::Filter(st) => {
-                    if !on_state(st) {
+                    let rev = st.rev;
+                    let more = on_state(st);
+                    if ack && rev > 0 {
+                        let mut a = serde_json::to_string(&Request::FilterApplied(rev))?;
+                        a.push('\n');
+                        w.write_all(a.as_bytes())?;
+                    }
+                    if !more {
                         return Ok(());
                     }
                 }
@@ -561,19 +604,28 @@ mod tests {
         let handler = Arc::new(TestHandler { cfg: Mutex::new(RawConfig::default()), stopped: AtomicBool::new(false) });
         serve(listener, handler, Arc::new(StatusHub::default()));
         let hub = filterfeed::hub();
-        hub.set(FilterState { blocked: true, inspect_existing: true, apps: vec!["/Applications/A.app".into()], block_ipv6: false });
+        hub.set(FilterState { blocked: true, inspect_existing: true, apps: vec!["/Applications/A.app".into()], block_ipv6: false, rev: 0 });
 
         let (tx, rx) = std::sync::mpsc::channel();
         let c = Client::new(&path);
         let t = std::thread::spawn(move || {
-            c.filter_watch(FilterHello { version: "9.9.9".into() }, |s| {
+            c.filter_watch(FilterHello { version: "9.9.9".into(), protocol: 1, caps: vec!["ack".into()] }, |s| {
                 let _ = tx.send(s.clone());
                 s.blocked // 收到放行后退出
             })
         });
         let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(first.blocked && first.apps == ["/Applications/A.app"]);
+        assert!(first.rev > 0, "规则带版本号");
         assert_eq!(hub.connected().as_deref(), Some("9.9.9"));
+        // 支持确认的扩展回复已应用的版本
+        for _ in 0..100 {
+            if hub.connected_hello().is_some_and(|h| h.applied == first.rev) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(hub.connected_hello().unwrap().applied, first.rev);
         hub.set(FilterState::default());
         assert!(!rx.recv_timeout(Duration::from_secs(5)).unwrap().blocked);
         t.join().unwrap().unwrap();
@@ -594,8 +646,9 @@ mod tests {
         assert_eq!(serde_json::to_string(&Request::Watch).unwrap(), "{\"cmd\":\"watch\"}");
         assert_eq!(serde_json::to_string(&Request::SetAutostart(true)).unwrap(), "{\"cmd\":\"set_autostart\",\"arg\":true}");
         assert!(Request::Stop.mutating() && !Request::Logs.mutating());
+        assert_eq!(serde_json::to_string(&Request::FilterApplied(3)).unwrap(), "{\"cmd\":\"filter_applied\",\"arg\":3}");
         assert_eq!(
-            serde_json::to_string(&Request::FilterWatch(FilterHello { version: "0.7.0".into() })).unwrap(),
+            serde_json::to_string(&Request::FilterWatch(FilterHello { version: "0.7.0".into(), ..Default::default() })).unwrap(),
             "{\"cmd\":\"filter_watch\",\"arg\":{\"version\":\"0.7.0\"}}"
         );
         assert_eq!(

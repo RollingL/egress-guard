@@ -21,6 +21,10 @@ enum FeedError: Error, CustomStringConvertible {
 }
 
 final class DaemonFeed {
+    /// 与后台服务的协议版本，以及支持的功能（见 Rust 一侧 filterfeed 的 CAP_*）。
+    static let protocolVersion = 1
+    static let capabilities = ["block_ipv6", "ack"]
+
     let socketPath: String
     let markerPath: String
     let version: String
@@ -128,6 +132,19 @@ final class DaemonFeed {
         return s
     }
 
+    private func sendLine(_ s: Int32, _ text: String) throws {
+        let bytes = Array((text + "\n").utf8)
+        var sent = 0
+        while sent < bytes.count {
+            let n = bytes[sent...].withUnsafeBytes { write(s, $0.baseAddress, $0.count) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw FeedError.sys("发送", errno)
+            }
+            sent += n
+        }
+    }
+
     private func session() throws {
         let s = try connectSocket()
         locked { fd = s }
@@ -144,24 +161,19 @@ final class DaemonFeed {
         // 服务端至少每 5 秒发一次；15 秒收不到视为断开
         var tv = timeval(tv_sec: 15, tv_usec: 0)
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         var one: Int32 = 1
         setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
 
         let v = version.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        let hello = Array("{\"cmd\":\"filter_watch\",\"arg\":{\"version\":\"\(v)\"}}\n".utf8)
-        var sent = 0
-        while sent < hello.count {
-            let n = hello[sent...].withUnsafeBytes { write(s, $0.baseAddress, $0.count) }
-            if n < 0 {
-                if errno == EINTR { continue }
-                throw FeedError.sys("发送", errno)
-            }
-            sent += n
-        }
+        // protocol / caps：告诉后台服务这个扩展支持哪些规则，以及会确认已应用的规则版本
+        let caps = DaemonFeed.capabilities.map { "\"\($0)\"" }.joined(separator: ",")
+        try sendLine(s, "{\"cmd\":\"filter_watch\",\"arg\":{\"version\":\"\(v)\",\"protocol\":\(DaemonFeed.protocolVersion),\"caps\":[\(caps)]}}")
 
         var buf = Data()
         var chunk = [UInt8](repeating: 0, count: 64 * 1024)
         var first = true
+        var acked: UInt64 = 0
         while isRunning {
             let n = chunk.withUnsafeMutableBytes { read(s, $0.baseAddress, $0.count) }
             if n == 0 { throw FeedError.msg("后台服务关闭了连接") }
@@ -181,6 +193,12 @@ final class DaemonFeed {
                         log("已连接后台服务，收到规则：\(r.blocked ? "阻断" : "放行") \(r.apps.count) 个程序")
                     }
                     set(r)
+                    // 规则已经生效（之后的连接都按它判断）：确认版本。心跳重发的同一版本不再确认；
+                    // 0.9.0 及以前的服务不带版本号，也就不会收到确认（它们不读这些回复）
+                    if let rev = FilterRules.parseRev(line: line), rev > acked {
+                        acked = rev
+                        try sendLine(s, "{\"cmd\":\"filter_applied\",\"arg\":\(rev)}")
+                    }
                 } else if let e = FilterRules.parseError(line: line) {
                     throw FeedError.msg("后台服务拒绝：\(e)")
                 }
