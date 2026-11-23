@@ -32,6 +32,9 @@ pub struct PfFirewall {
     synced_once: bool,
     /// 上次同步 pf 规则失败：引擎会定时重试（见 has_pending），直到规则真正装上。
     dirty: bool,
+    /// 本进程上次清空锚点之后没有再装过规则：放行时不必再运行一次 `pfctl -F`。
+    /// 启动时为 false（上次异常退出可能留下了规则），第一次放行一定清空一次。
+    anchor_empty: bool,
     /// 锚点的所有权锁，随本对象（进程）存在。
     _lock: std::fs::File,
 }
@@ -137,6 +140,7 @@ impl PfFirewall {
             warned_allow_apps: false,
             synced_once: false,
             dirty: false,
+            anchor_empty: false,
             _lock: lock,
         })
     }
@@ -182,6 +186,7 @@ impl PfFirewall {
                 let text = pfrules::render(&policy);
                 log::debug!("装入 pf 规则:\n{text}");
                 // 先装规则再启用，避免 pf 已启用但规则还没到位的空档
+                self.anchor_empty = false;
                 pfctl(&["-a", ANCHOR, "-f", "-"], Some(&text))?;
                 self.enable()?;
                 log::info!("pf 规则已生效（{}）", pfrules::summary(&policy));
@@ -191,13 +196,18 @@ impl PfFirewall {
             (Some(policy), false) if self.rules.block_ipv6 => {
                 let text = pfrules::render_v6(&policy, self.rules.v6_probe);
                 log::debug!("装入 pf 规则:\n{text}");
+                self.anchor_empty = false;
                 pfctl(&["-a", ANCHOR, "-f", "-"], Some(&text))?;
                 self.enable()?;
                 log::info!("pf 规则已生效：始终阻断 IPv6（{}）", pfrules::summary(&policy));
                 Ok(())
             }
             _ => {
-                flush_anchor()?;
+                // 没有全局断网规则时，每次阻断、放行都会走到这里：锚点已经是空的就不再运行 pfctl
+                if !self.anchor_empty {
+                    flush_anchor()?;
+                    self.anchor_empty = true;
+                }
                 self.release();
                 Ok(())
             }
