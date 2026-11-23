@@ -27,7 +27,8 @@ pub enum Event {
     /// 立即检测一次出口 IP。
     CheckNow,
     /// 应用新配置。
-    Reconfigure(Box<Config>),
+    /// 应用新配置；第二项是保存时分配的配置版本（单调递增），应用后写入 [`Status::config_version`]。
+    Reconfigure(Box<Config>, u64),
     /// 退出（移除全部阻断规则）。
     Shutdown,
     /// 内部：检测线程返回结果。
@@ -90,6 +91,10 @@ pub struct Status {
     pub running: bool,
     /// 自动识别到、一并阻断的关联程序。
     pub extra_apps: Vec<ExtraApp>,
+    /// 引擎已经处理到的配置版本（界面保存后据此判断规则是否已应用）。
+    pub config_version: u64,
+    /// 应用这个版本的配置时出错（配置已保存，但规则没有按它更新）。
+    pub config_apply_error: Option<String>,
 }
 
 pub type Reporter = Arc<dyn Fn(&Status) + Send + Sync>;
@@ -102,6 +107,11 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub fn send(&self, e: Event) {
         let _ = self.tx.send(e);
+    }
+
+    /// 发送事件；引擎已经停止时返回错误。
+    pub fn try_send(&self, e: Event) -> Result<()> {
+        self.tx.send(e).map_err(|_| anyhow!("引擎已经停止"))
     }
 
     pub fn sender(&self) -> Sender<Event> {
@@ -309,7 +319,7 @@ fn run(
                 next_check = None;
                 start_check(&mut checking, &detector, generation);
             }
-            Ok(Event::Reconfigure(new_cfg)) => {
+            Ok(Event::Reconfigure(new_cfg, version)) => {
                 log::info!(
                     "应用新配置：受控应用 {} 个，白名单 {} 条",
                     new_cfg.apps.len(),
@@ -323,9 +333,14 @@ fn run(
                     *w = WatchSettings::from_config(&new_cfg, watch_version);
                     w.clear_learned = clear;
                 }
-                if let Err(e) = ctrl.reconfigure(*new_cfg) {
-                    log::error!("应用新配置失败: {e:#}");
-                }
+                status.config_version = version;
+                status.config_apply_error = match ctrl.reconfigure(*new_cfg) {
+                    Ok(()) => None,
+                    Err(e) => {
+                        log::error!("应用新配置失败: {e:#}");
+                        Some(format!("{e:#}"))
+                    }
+                };
                 // 守护的网卡设置可能变了：不再算 VPN 的网卡不再守护（而不是当作断开）
                 status.vpn_connected = vpn::connected(&adapters, &ctrl.config().vpn);
                 if !ctrl.config().vpn.guard {

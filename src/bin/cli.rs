@@ -213,7 +213,7 @@ fn real_main(cli: Cli) -> Result<()> {
             Some(Command::Apply { file }) => {
                 let text = std::fs::read_to_string(file).with_context(|| format!("无法读取 {}", file.display()))?;
                 let cfg = Config::parse(&text).with_context(|| format!("{} 有误", file.display()))?;
-                client.command(&Request::SetConfig(Box::new(cfg.to_raw())), t)?;
+                client.set_config(cfg.to_raw(), t)?;
                 println!("已应用 {}", file.display());
                 return Ok(());
             }

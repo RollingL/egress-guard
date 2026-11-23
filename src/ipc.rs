@@ -85,6 +85,8 @@ pub enum Reply {
     Events(Vec<ConnEvent>),
     /// 推送给网络扩展的规则。
     Filter(FilterState),
+    /// 配置已保存，值是分配的配置版本（引擎应用后出现在状态的 config_version 里）。
+    Saved(u64),
     Ok,
     Err(String),
 }
@@ -93,7 +95,8 @@ pub enum Reply {
 pub trait Handler: Send + Sync + 'static {
     fn hello(&self) -> HelloInfo;
     fn get_config(&self) -> RawConfig;
-    fn set_config(&self, raw: RawConfig) -> Result<()>;
+    /// 保存并应用配置，返回分配的配置版本。
+    fn set_config(&self, raw: RawConfig) -> Result<u64>;
     fn check_now(&self);
     fn clear_learned(&self);
     fn set_autostart(&self, on: bool) -> Result<()>;
@@ -236,7 +239,7 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
             Request::GetStatus => Reply::Status(Box::new(hub.state.lock().unwrap().1.clone())),
             Request::GetConfig => Reply::Config(Box::new(config_for(handler.get_config(), uid.is_some_and(may_modify)))),
             Request::SetConfig(raw) => match handler.set_config(*raw) {
-                Ok(()) => Reply::Ok,
+                Ok(v) => Reply::Saved(v),
                 Err(e) => Reply::Err(format!("{e:#}")),
             },
             Request::CheckNow => {
@@ -419,6 +422,16 @@ impl Client {
         }
     }
 
+    /// 保存配置，返回配置版本（旧版本的服务不返回版本，这时为 0）。
+    pub fn set_config(&self, raw: RawConfig, timeout: Duration) -> Result<u64> {
+        match self.request(&Request::SetConfig(Box::new(raw)), timeout)? {
+            Reply::Saved(v) => Ok(v),
+            Reply::Ok => Ok(0),
+            Reply::Err(e) => Err(anyhow!(e)),
+            other => bail!("意外的回复: {other:?}"),
+        }
+    }
+
     pub fn hello(&self) -> Result<HelloInfo> {
         match self.request(&Request::Hello, Duration::from_secs(5))? {
             Reply::Hello(h) => Ok(h),
@@ -531,10 +544,10 @@ mod tests {
         fn get_config(&self) -> RawConfig {
             self.cfg.lock().unwrap().clone()
         }
-        fn set_config(&self, raw: RawConfig) -> Result<()> {
+        fn set_config(&self, raw: RawConfig) -> Result<u64> {
             crate::config::Config::from_raw(raw.clone())?;
             *self.cfg.lock().unwrap() = raw;
-            Ok(())
+            Ok(7)
         }
         fn check_now(&self) {}
         fn clear_learned(&self) {}
@@ -562,12 +575,12 @@ mod tests {
         assert!(c.status().unwrap().running);
 
         let raw = RawConfig { whitelist: vec!["198.51.100.0/24".into()], ..Default::default() };
-        c.command(&Request::SetConfig(Box::new(raw.clone())), Duration::from_secs(5)).unwrap();
+        assert_eq!(c.set_config(raw.clone(), Duration::from_secs(5)).unwrap(), 7);
         assert_eq!(c.get_config().unwrap().whitelist, raw.whitelist);
         // 校验失败的配置被拒绝，原配置不变
         let mut bad = raw.clone();
         bad.whitelist = vec!["1.2.3".into()];
-        assert!(c.command(&Request::SetConfig(Box::new(bad)), Duration::from_secs(5)).is_err());
+        assert!(c.set_config(bad, Duration::from_secs(5)).is_err());
         assert_eq!(c.get_config().unwrap().whitelist, raw.whitelist);
 
         // 状态推送：先收到当前状态，再收到新状态
