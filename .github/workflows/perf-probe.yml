@@ -1,0 +1,36 @@
+name: 性能测量（临时）
+
+# 只在审查用的临时分支上运行，不会合并
+on:
+  push:
+    branches: [claude/project-thread-v3vnrk]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --example perfprobe
+        shell: bash
+        env:
+          EGRESS_GUARD_NO_NETEXT: "1"
+      - name: 测量（Windows）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./target/release/examples/perfprobe.exe 30 "C:/Program Files/Git"
+          ./target/release/examples/perfprobe.exe 30 "C:/Program Files/Git" | grep -E "scan\(\)|进程快照" || true
+      - name: 测量（macOS）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app | head -1)
+          sudo ./target/release/examples/perfprobe 30 "$XC"
+          sudo ./target/release/examples/perfprobe 30 /Applications/Safari.app | grep -E "scan\(\)|进程快照|scan_dir" || true
