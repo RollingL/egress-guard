@@ -1313,6 +1313,11 @@ impl App {
             warning_card(ui, p, title, e);
             ui.add_space(4.0);
         }
+        // 保护范围的已知限制（不是故障）
+        if let (true, Some(e)) = (s.running && !s.simulated, &s.limitation) {
+            info_card(ui, p, "受控应用的保护范围", e);
+            ui.add_space(4.0);
+        }
         if no_ext {
             let mut go = None;
             let body = if self.applied.apps.is_empty() {

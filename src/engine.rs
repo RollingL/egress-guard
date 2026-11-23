@@ -79,6 +79,8 @@ pub struct Status {
     pub apply_error: Option<String>,
     /// 拦截后端的其他问题（例如 macOS 网络扩展版本太旧，不支持当前设置）。
     pub degraded: Option<String>,
+    /// 保护范围的已知限制（不是故障）：例如 macOS 没有网络扩展时，全局断网的例外对受控应用同样放行。
+    pub limitation: Option<String>,
     /// 网络 / 配置代次：网络变化、VPN 网卡增减、应用新配置时加一。界面的后台任务据此丢弃过期的结果。
     pub generation: u64,
     /// 最近一次检测结果所属的代次（这一代上真正测过出口）。与 `generation` 不同时，
@@ -569,6 +571,7 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.failures = ctrl.failures();
     s.apply_error = ctrl.apply_error().map(str::to_owned);
     s.degraded = ctrl.degraded();
+    s.limitation = ctrl.limitation();
 }
 
 fn make_detector(cfg: &Config) -> Detectors {

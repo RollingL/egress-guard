@@ -38,6 +38,8 @@ impl Handler for Daemon {
             log_path: self.log_path.display().to_string(),
             autostart: autostart_enabled(),
             config_error: self.config_error.lock().unwrap().clone(),
+            // 由 ipc::serve 填写
+            features: Vec::new(),
         }
     }
 

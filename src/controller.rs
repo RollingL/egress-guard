@@ -85,6 +85,11 @@ pub trait Firewall {
     fn degraded(&self) -> Option<String> {
         None
     }
+    /// 保护范围的已知限制（不是故障，不影响自动诊断）：例如 macOS 没有网络扩展时，
+    /// 受控应用只由 pf 全局断网覆盖，全局断网的例外对它们同样放行。
+    fn limitation(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 出口是否通过白名单：主出口在白名单内，并且（检测 IPv6 出口时）IPv6 出口也在白名单内。
@@ -274,6 +279,11 @@ impl Controller {
     /// 拦截后端的其他问题。
     pub fn degraded(&self) -> Option<String> {
         self.fw.degraded()
+    }
+
+    /// 保护范围的已知限制。
+    pub fn limitation(&self) -> Option<String> {
+        self.fw.limitation()
     }
 
     /// 阻断范围的描述，用于日志。

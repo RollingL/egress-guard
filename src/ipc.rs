@@ -26,8 +26,10 @@ pub enum Request {
     /// 持续推送状态，直到连接断开。
     Watch,
     GetConfig,
-    /// 校验、保存并应用配置。
+    /// 校验、保存并应用配置，回复 `Ok`（0.9.5 之前的界面只认这个回复）。
     SetConfig(Box<RawConfig>),
+    /// 同上，回复 `Saved(配置版本)`。服务在 Hello 里声明支持 [`FEATURE_SAVE_CONFIG`] 时才发送。
+    SaveConfig(Box<RawConfig>),
     CheckNow,
     ClearLearned,
     Logs,
@@ -73,7 +75,12 @@ pub struct HelloInfo {
     pub autostart: bool,
     /// 配置文件损坏、服务正在用默认设置（全局断网）运行时的原因。
     pub config_error: Option<String>,
+    /// 服务支持的新请求（新旧版本的界面和服务混用时据此选择请求）。
+    pub features: Vec<String>,
 }
+
+/// 支持 [`Request::SaveConfig`]（回复配置版本）。
+pub const FEATURE_SAVE_CONFIG: &str = "save_config";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -235,10 +242,19 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
             return Ok(());
         }
         let reply = match req {
-            Request::Hello => Reply::Hello(handler.hello()),
+            Request::Hello => {
+                let mut h = handler.hello();
+                h.features = vec![FEATURE_SAVE_CONFIG.into()];
+                Reply::Hello(h)
+            }
             Request::GetStatus => Reply::Status(Box::new(hub.state.lock().unwrap().1.clone())),
             Request::GetConfig => Reply::Config(Box::new(config_for(handler.get_config(), uid.is_some_and(may_modify)))),
+            // 旧请求保留旧回复：旧版本的界面不认识 Saved，会把已经保存的配置报成保存失败
             Request::SetConfig(raw) => match handler.set_config(*raw) {
+                Ok(_) => Reply::Ok,
+                Err(e) => Reply::Err(format!("{e:#}")),
+            },
+            Request::SaveConfig(raw) => match handler.set_config(*raw) {
                 Ok(v) => Reply::Saved(v),
                 Err(e) => Reply::Err(format!("{e:#}")),
             },
@@ -338,10 +354,12 @@ fn filter_watch(mut w: UnixStream, reader: BufReader<UnixStream>, hello: FilterH
             }
             seen = v;
             s.rev = v;
+            // 先登记再写：扩展可能在写入返回之前就回复确认，由另一个线程读到。
+            // 写入失败时这个连接随之结束、登记被移除，不会接受没发出去的版本
+            hub.sent(reg, v);
             if let Err(e) = write_reply(&mut w, &Reply::Filter(s)) {
                 break Err(e);
             }
-            hub.sent(reg, v);
         };
         // 让读取线程结束
         let _ = w.shutdown(std::net::Shutdown::Both);
@@ -424,8 +442,11 @@ impl Client {
     }
 
     /// 保存配置，返回配置版本（旧版本的服务不返回版本，这时为 0）。
+    /// 服务声明支持时用带版本的新请求，否则用旧请求（旧服务不认识新请求）。
     pub fn set_config(&self, raw: RawConfig, timeout: Duration) -> Result<u64> {
-        match self.request(&Request::SetConfig(Box::new(raw)), timeout)? {
+        let versioned = self.hello().is_ok_and(|h| h.features.iter().any(|f| f == FEATURE_SAVE_CONFIG));
+        let req = if versioned { Request::SaveConfig(Box::new(raw)) } else { Request::SetConfig(Box::new(raw)) };
+        match self.request(&req, timeout)? {
             Reply::Saved(v) => Ok(v),
             Reply::Ok => Ok(0),
             Reply::Err(e) => Err(anyhow!(e)),
@@ -578,6 +599,15 @@ mod tests {
         let raw = RawConfig { whitelist: vec!["198.51.100.0/24".into()], ..Default::default() };
         assert_eq!(c.set_config(raw.clone(), Duration::from_secs(5)).unwrap(), 7);
         assert_eq!(c.get_config().unwrap().whitelist, raw.whitelist);
+        // 旧版本的界面发的旧请求：照旧回复 Ok（它不认识 Saved），配置照样保存
+        let old = RawConfig { whitelist: vec!["192.0.2.0/24".into()], ..Default::default() };
+        assert!(matches!(c.request(&Request::SetConfig(Box::new(old.clone())), Duration::from_secs(5)).unwrap(), Reply::Ok));
+        assert_eq!(c.get_config().unwrap().whitelist, old.whitelist);
+        // 旧版本的 Reply 只有 ok，没有 saved：旧请求的回复必须能被它解析
+        let text = serde_json::to_string(&Reply::Ok).unwrap();
+        assert_eq!(text, r#"{"kind":"ok"}"#);
+        assert!(c.hello().unwrap().features.iter().any(|f| f == FEATURE_SAVE_CONFIG));
+        c.set_config(raw.clone(), Duration::from_secs(5)).unwrap();
         // 校验失败的配置被拒绝，原配置不变
         let mut bad = raw.clone();
         bad.whitelist = vec!["1.2.3".into()];
