@@ -1,7 +1,7 @@
 //! 进程枚举与进程路径查询（libproc）。
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::c_void;
 
 pub use crate::discovery::normalize as normalize_path;
@@ -49,40 +49,25 @@ fn parent_and_start(pid: i32) -> Option<(u32, u64)> {
 }
 
 thread_local! {
-    /// PID → (父 PID, 创建时间, 路径)：父进程和创建时间都没变时直接复用路径，不再调用 proc_pidpath。
-    static CACHE: RefCell<HashMap<u32, (u32, u64, String)>> = RefCell::new(HashMap::new());
+    /// 查路径用的缓冲区，每次扫描复用（以前每个进程分配一次 4KB）。
+    static PATH_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; PATH_MAX]);
 }
 
 /// 进程树快照（含父进程 ID、创建时间、可执行文件路径），用于识别子进程。
 ///
-/// 每秒调用一次。父 PID 与创建时间每次都查（判断 PID 复用要用），路径只对新进程查；
-/// 已退出进程的缓存项随之清掉。
+/// 每次都查每个进程的路径：exec 换了程序映像时 PID 和启动时间都不变，不能按它们缓存路径。
 pub fn snapshot() -> Vec<ProcEntry> {
-    CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        let mut next = HashMap::with_capacity(cache.len());
-        let mut buf = Vec::new();
-        let out = all_pids()
+    PATH_BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        all_pids()
             .into_iter()
             .filter(|&pid| pid > 1)
             .filter_map(|pid| {
                 let (ppid, created) = parent_and_start(pid)?;
-                let pid = pid as u32;
-                let path = match cache.remove(&pid) {
-                    Some((pp, cr, path)) if pp == ppid && cr == created => path,
-                    _ => {
-                        if buf.is_empty() {
-                            buf = vec![0u8; PATH_MAX];
-                        }
-                        image_path(pid, &mut buf).unwrap_or_default()
-                    }
-                };
-                next.insert(pid, (ppid, created, path.clone()));
-                Some(ProcEntry { pid, ppid, created, path })
+                let path = image_path(pid as u32, &mut buf).unwrap_or_default();
+                Some(ProcEntry { pid: pid as u32, ppid, created, path })
             })
-            .collect();
-        *cache = next;
-        out
+            .collect()
     })
 }
 
@@ -111,15 +96,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_reuses_paths_for_unchanged_processes() {
+    fn snapshot_finds_this_process() {
         let me = std::process::id();
-        let first = snapshot();
-        let e = first.iter().find(|e| e.pid == me).expect("找不到本进程");
+        let snap = snapshot();
+        let e = snap.iter().find(|e| e.pid == me).expect("找不到本进程");
         let exe = std::env::current_exe().unwrap();
         assert_eq!(normalize_path(&e.path), normalize_path(&exe.to_string_lossy()));
-        let second = snapshot();
-        let e2 = second.iter().find(|e| e.pid == me).unwrap();
-        assert_eq!((e2.ppid, e2.created, &e2.path), (e.ppid, e.created, &e.path));
-        assert!(CACHE.with(|c| c.borrow().contains_key(&me)));
+        assert!(e.ppid > 0 && e.created > 0);
     }
 }

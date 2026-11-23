@@ -381,8 +381,6 @@ impl WatchSettings {
 pub type SnapshotFn = fn() -> Vec<ProcEntry>;
 
 const POLL: Duration = Duration::from_millis(1000);
-/// 没有任何受控应用（及已识别程序）在运行时的扫描间隔：受控应用刚启动时，它的子进程最多晚这么久被识别。
-const IDLE_POLL: Duration = Duration::from_secs(3);
 /// 多久看一次应用目录有没有变化（只看根目录和一级子目录的修改时间）。
 const DIR_RESCAN: Duration = Duration::from_secs(30);
 /// 不管有没有看到变化，最多隔这么久完整重扫一次（更深层的目录里增删了程序时也能发现）。
@@ -496,7 +494,7 @@ fn any_target_running(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> 
 }
 
 /// 根据一次进程快照记下受控应用（及已识别程序）启动的子程序和它们的来源。
-/// 返回是否有目标进程正在运行（没有时可以放慢扫描）。
+/// 返回是否有目标进程正在运行（没有时不必找后代）。
 fn learn_children(
     s: &WatchSettings,
     learned: &mut Learned,
@@ -582,10 +580,10 @@ fn run(
             last_stamp_check = Instant::now();
         }
 
-        // 子进程识别。没有任何目标进程在运行时放慢扫描（它一启动，最多晚 IDLE_POLL 被发现）
-        let busy = s.mode == ChildMode::Tree
-            && !s.apps.is_empty()
-            && learn_children(&s, &mut learned, &dir_exes, &snapshot(), &system_dirs);
+        // 子进程识别
+        if s.mode == ChildMode::Tree && !s.apps.is_empty() {
+            learn_children(&s, &mut learned, &dir_exes, &snapshot(), &system_dirs);
+        }
 
         let extra = collect(&s, &learned, &dir_exes);
         if last_sent.as_ref() != Some(&extra) {
@@ -595,19 +593,7 @@ fn run(
             last_sent = Some(extra);
         }
 
-        // 放慢时仍每 POLL 看一次设置：改了配置或要求清空记录时立即重新扫描
-        let wait = if busy { POLL } else { IDLE_POLL };
-        let since = Instant::now();
-        loop {
-            std::thread::sleep(POLL);
-            if since.elapsed() >= wait || Arc::strong_count(&settings) == 1 {
-                break;
-            }
-            let g = settings.lock().unwrap();
-            if g.version != s.version || g.clear_learned {
-                break;
-            }
-        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -726,7 +712,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 没有目标进程在运行时报告空闲（识别线程据此放慢扫描）；受控应用或已识别程序在运行时不空闲。
+    /// 没有目标进程在运行时直接返回（不找后代）；受控应用或已识别程序在运行时照常识别。
     #[test]
     fn reports_whether_any_target_is_running() {
         let sys = vec![normalize(r"C:\Windows")];
@@ -737,7 +723,7 @@ mod tests {
         assert_eq!(learned.iter().count(), 0);
         assert!(learn_children(&s, &mut learned, &[], &[p(20, 1, 3, r"C:\Apps\A\A.EXE"), p(21, 20, 4, r"D:\h.exe")], &sys));
         assert_eq!(learned.iter().count(), 1);
-        // 只剩已识别的辅助程序在运行：仍然要按 1 秒扫描（它的子进程也要识别）
+        // 只剩已识别的辅助程序在运行：它的子进程也要识别
         assert!(learn_children(&s, &mut learned, &[], &[p(30, 1, 5, r"D:\h.exe")], &sys));
     }
 
