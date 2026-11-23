@@ -23,7 +23,6 @@ pub mod logbuf;
 pub mod mac;
 pub mod netext;
 pub mod pfrules;
-pub mod trustedpath;
 pub mod update;
 pub mod vpn;
 #[cfg(windows)]
