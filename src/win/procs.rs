@@ -71,7 +71,7 @@ thread_local! {
 
 /// 进程树快照（含父进程 ID、创建时间、exe 路径），用于识别子进程。
 ///
-/// 每秒调用一次。用 NtQuerySystemInformation 一次取到全部进程的 PID、父 PID 和创建时间；
+/// 每 2 秒调用一次。用 NtQuerySystemInformation 一次取到全部进程的 PID、父 PID 和创建时间；
 /// 三项都没变的进程直接用缓存，只对新进程调用 OpenProcess 查路径。已退出进程的缓存项随之清掉。
 /// 系统调用失败时退回逐个打开进程的旧做法。
 pub fn snapshot() -> Vec<ProcEntry> {

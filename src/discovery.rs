@@ -405,10 +405,11 @@ impl WatchSettings {
 /// 进程快照函数：Windows 上为真实实现，其他平台返回空。
 pub type SnapshotFn = fn() -> Vec<ProcEntry>;
 
-const POLL: Duration = Duration::from_millis(1000);
+/// 子进程识别的扫描间隔：受控应用启动的子进程最多晚这么久被识别并加入阻断。
+const POLL: Duration = Duration::from_secs(2);
 /// 上一轮应用目录核对完成后，隔多久开始下一轮。
 const DIR_RESCAN: Duration = Duration::from_secs(30);
-/// 定期核对应用目录时，每次（每秒）最多查看的条目数和花的时间：大目录分几秒走完，
+/// 定期核对应用目录时，每次（每个扫描间隔）最多查看的条目数和花的时间：大目录分几秒走完，
 /// 不会把同一线程里的子进程识别推迟几秒。
 const DIR_STEP_ENTRIES: usize = 2000;
 const DIR_STEP_TIME: Duration = Duration::from_millis(50);
@@ -914,7 +915,10 @@ mod tests {
 
         // 清空记录
         settings.lock().unwrap().clear_learned = true;
-        std::thread::sleep(Duration::from_millis(1500));
+        let t = Instant::now();
+        while std::fs::read_to_string(&learned).unwrap().contains("helper.exe") && t.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(!std::fs::read_to_string(&learned).unwrap().contains("helper.exe"));
 
         std::fs::remove_dir_all(dir).unwrap();
