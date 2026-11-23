@@ -487,7 +487,8 @@ mod tests {
 
     #[test]
     fn ipv6_egress_is_checked() {
-        let mut c = Controller::new(cfg(""), Box::new(DryRunFirewall { blocked: true }));
+        let check = "[ipv6]\nmode=\"check\"";
+        let mut c = Controller::new(cfg(check), Box::new(DryRunFirewall { blocked: true }));
         // IPv4 走白名单出口（VPN），IPv6 直连运营商：阻断
         c.on_detection(Ok(eg("203.0.113.9", Some("2001:db8::9")))).unwrap();
         assert!(c.is_blocked());
@@ -497,7 +498,7 @@ mod tests {
         c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
         assert!(!c.is_blocked());
         // IPv6 出口加进白名单后放行
-        let wl = cfg("").to_raw();
+        let wl = cfg(check).to_raw();
         let mut raw = wl.clone();
         raw.whitelist.push("2001:db8::/32".into());
         c.reconfigure(Config::from_raw(raw).unwrap()).unwrap();
@@ -515,6 +516,8 @@ mod tests {
         assert!(!c.rules().block_ipv6);
         let c = Controller::new(cfg("[ipv6]\nmode=\"block\""), Box::new(DryRunFirewall::default()));
         assert!(c.rules().block_ipv6);
+        // 默认就是始终阻断
+        assert!(Controller::new(cfg(""), Box::new(DryRunFirewall::default())).rules().block_ipv6);
     }
 
     #[test]

@@ -55,6 +55,10 @@ pub struct EgressDetector {
     agent: Agent,
     services: Vec<String>,
     family: Family,
+    /// 用户在设置里明确填写的代理（默认没有：检测直连）。
+    proxy: Option<String>,
+    /// 代理地址无法解析时的错误：检测一律失败，而不是悄悄改为直连。
+    proxy_error: Option<String>,
     #[cfg_attr(windows, allow(dead_code))]
     timeout: Duration,
 }
@@ -65,25 +69,43 @@ impl EgressDetector {
     }
 
     pub fn with_family(services: Vec<String>, timeout: Duration, family: Family) -> Self {
+        Self::with_proxy(services, timeout, family, None)
+    }
+
+    /// `proxy` 为用户明确填写的代理地址（`http://`、`https://`、`socks5://` 等）；`None` 或空串时直连。
+    pub fn with_proxy(services: Vec<String>, timeout: Duration, family: Family, proxy: Option<&str>) -> Self {
+        let proxy = proxy.map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned);
+        let (parsed, proxy_error) = match proxy.as_deref().map(ureq::Proxy::new) {
+            None => (None, None),
+            Some(Ok(p)) => (Some(p), None),
+            Some(Err(e)) => (None, Some(format!("代理地址有误（{}）：{e}", proxy.as_deref().unwrap_or_default()))),
+        };
         let agent: Agent = Agent::config_builder()
             // 使用系统 TLS（Windows 上为 SChannel，macOS 上为 Security.framework），无需额外证书
             .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
             .timeout_global(Some(timeout))
-            .ip_family(match family {
-                Family::Any => IpFamily::Any,
-                Family::V4 => IpFamily::Ipv4Only,
-                Family::V6 => IpFamily::Ipv6Only,
+            // 走代理时这里限制的是连到代理的地址族（代理多半在 127.0.0.1），出口的地址族由返回的地址校验
+            .ip_family(match (family, proxy.is_some()) {
+                (_, true) | (Family::Any, _) => IpFamily::Any,
+                (Family::V4, false) => IpFamily::Ipv4Only,
+                (Family::V6, false) => IpFamily::Ipv6Only,
             })
             .user_agent(concat!("egress-guard/", env!("CARGO_PKG_VERSION")))
-            // 出口检测决定是否放行直连的受控应用，必须看本机直连的出口：
-            // 不能用环境变量里的代理（ureq 默认会读 HTTP(S)_PROXY / ALL_PROXY），否则可能测到的是代理的出口
-            .proxy(None)
+            // 出口检测决定是否放行直连的受控应用，默认必须看本机直连的出口：
+            // 不能用环境变量里的代理（ureq 默认会读 HTTP(S)_PROXY / ALL_PROXY），否则可能测到的是代理的出口。
+            // 只有用户在设置里明确填写代理时才走代理
+            .proxy(parsed)
             // 不复用连接：网络变化后旧连接可能还走着原来的路由
             .max_idle_connections(0)
             .max_idle_connections_per_host(0)
             .build()
             .into();
-        Self { agent, services, family, timeout }
+        Self { agent, services, family, proxy, proxy_error, timeout }
+    }
+
+    /// 是否通过代理检测。
+    pub fn via_proxy(&self) -> bool {
+        self.proxy.is_some()
     }
 
     /// 检测出口 IP。
@@ -91,11 +113,22 @@ impl EgressDetector {
     /// macOS 上以 root 运行时（后台服务），检测放在以 `nobody` 身份运行的子进程中进行：
     /// 全局断网的 pf 规则按套接字所属用户放行它，而不必放行所有 root 进程。
     pub fn detect(&self) -> Result<IpAddr> {
+        if let Some(e) = &self.proxy_error {
+            return Err(anyhow!("{e}"));
+        }
         #[cfg(target_os = "macos")]
         if unsafe { libc::geteuid() } == 0 {
-            return self.detect_unprivileged();
+            return self.detect_unprivileged().map_err(|e| self.label(e));
         }
-        self.detect_direct()
+        self.detect_direct().map_err(|e| self.label(e))
+    }
+
+    /// 走代理时在错误前注明代理，便于用户分辨是代理的问题。
+    fn label(&self, e: anyhow::Error) -> anyhow::Error {
+        match &self.proxy {
+            Some(p) => anyhow!("通过代理 {p} 检测：{e:#}"),
+            None => e,
+        }
     }
 
     /// 在子进程中以 nobody 身份检测（子进程运行 `egress-guard probe`）。
@@ -119,6 +152,8 @@ impl EgressDetector {
             .arg(self.timeout.as_secs().max(1).to_string())
             .arg("--family")
             .arg(self.family.name())
+            .args(self.proxy.iter().flat_map(|p| ["--proxy", p.as_str()]))
+            .arg("--")
             .args(&self.services)
             .uid(uid)
             .gid(gid)
@@ -167,7 +202,8 @@ impl EgressDetector {
                 }
             }
         };
-        if !has_route(v6) {
+        // 走代理时本机路由无关：要验证的是代理的出口，连不上代理、代理没有这个地址族的出口都算失败
+        if !self.via_proxy() && !has_route(v6) {
             return Probe::NoRoute;
         }
         match self.detect() {
@@ -178,6 +214,9 @@ impl EgressDetector {
 
     /// 依次尝试各服务（IPv6 时同时请求），返回第一个成功解析的出口 IP。
     pub fn detect_direct(&self) -> Result<IpAddr> {
+        if let Some(e) = &self.proxy_error {
+            return Err(anyhow!("{e}"));
+        }
         if self.family == Family::V6 {
             return self.detect_parallel();
         }
@@ -283,10 +322,10 @@ pub fn combine(v4: Probe, v6: Probe, whitelisted: impl Fn(IpAddr) -> bool) -> Re
         (Verified(a), Failed(_)) if !whitelisted(a) => Ok(Egress { ip: a, v6: None }),
         (Failed(_), Verified(b)) if !whitelisted(b) => Ok(Egress { ip: b, v6: None }),
         (Verified(_), Failed(e)) => Err(anyhow!(
-            "IPv6 出口检测失败（本机有 IPv6 路由，无法确认 IPv6 流量从哪里出去）：{e}。\
-             如果 VPN 不支持 IPv6，可以在设置里把 IPv6 改为「始终阻断」"
+            "IPv6 出口检测失败，无法确认 IPv6 流量从哪里出去：{e}。\
+             如果 VPN 或代理不支持 IPv6，可以在设置里把 IPv6 改为「始终阻断」"
         )),
-        (Failed(e), Verified(_)) => Err(anyhow!("IPv4 出口检测失败（本机有 IPv4 路由）：{e}")),
+        (Failed(e), Verified(_)) => Err(anyhow!("IPv4 出口检测失败，无法确认 IPv4 流量从哪里出去：{e}")),
         (Failed(e), NoRoute) | (NoRoute, Failed(e)) => Err(anyhow!("{e}")),
         (Failed(a), Failed(b)) => Err(anyhow!("IPv4：{a}；IPv6：{b}")),
         (NoRoute, NoRoute) => Err(anyhow!("本机没有可用的 IPv4、IPv6 网络")),
@@ -312,9 +351,9 @@ impl Detectors {
         };
         Self {
             mode,
-            main: EgressDetector::with_family(cfg.detect.services.clone(), timeout, main_family),
+            main: EgressDetector::with_proxy(cfg.detect.services.clone(), timeout, main_family, Some(&cfg.detect.proxy)),
             v6: (mode == Ipv6Mode::Check)
-                .then(|| EgressDetector::with_family(cfg.ipv6.services.clone(), timeout, Family::V6)),
+                .then(|| EgressDetector::with_proxy(cfg.ipv6.services.clone(), timeout, Family::V6, Some(&cfg.detect.proxy))),
             whitelist: cfg.whitelist.clone(),
         }
     }
@@ -464,5 +503,60 @@ mod tests {
         }
         assert_eq!(got.unwrap(), ip("198.51.100.1"));
         assert_eq!(proxy_hits.load(std::sync::atomic::Ordering::SeqCst), 0, "不应经过代理");
+    }
+
+    /// 设置里明确填了代理时才走代理：测到的是代理的出口；不看本机路由；代理地址有误时检测失败而不是改为直连。
+    #[test]
+    fn uses_configured_proxy() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        // 假代理：CONNECT 时先回「已建立」再读隧道里的请求；直接收到请求时直接回答
+        fn fake_proxy(body: &'static str) -> String {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    let mut r = BufReader::new(c.try_clone().unwrap());
+                    let mut c = c;
+                    let read_head = |r: &mut BufReader<std::net::TcpStream>| {
+                        let mut first = String::new();
+                        let _ = r.read_line(&mut first);
+                        let mut line = String::new();
+                        while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                            line.clear();
+                        }
+                        first
+                    };
+                    if read_head(&mut r).starts_with("CONNECT") {
+                        let _ = write!(c, "HTTP/1.1 200 Connection established\r\n\r\n");
+                        read_head(&mut r);
+                    }
+                    let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                }
+            });
+            format!("http://{addr}")
+        }
+        // 目标地址不会被真正连接（由代理回答）
+        let svc = vec!["http://192.0.2.1/ip".to_owned()];
+        let t = Duration::from_secs(5);
+
+        let p4 = fake_proxy("203.0.113.9");
+        let d = EgressDetector::with_proxy(svc.clone(), t, Family::V4, Some(&p4));
+        assert!(d.via_proxy());
+        assert_eq!(d.probe(), Probe::Verified(ip("203.0.113.9")));
+
+        // IPv6：代理在 127.0.0.1 也能连上，不看本机有没有 IPv6 路由；返回的地址族照样校验
+        let p6 = fake_proxy("2001:db8::9");
+        let d = EgressDetector::with_proxy(svc.clone(), t, Family::V6, Some(&p6));
+        assert_eq!(d.probe(), Probe::Verified(ip("2001:db8::9")));
+        let d = EgressDetector::with_proxy(svc.clone(), t, Family::V6, Some(&p4));
+        assert!(matches!(d.probe(), Probe::Failed(e) if e.contains("通过代理") && e.contains("不是 IPv6")));
+
+        // 空白 = 直连
+        assert!(!EgressDetector::with_proxy(svc.clone(), t, Family::V4, Some("  ")).via_proxy());
+        // 地址有误：失败，不悄悄直连
+        let d = EgressDetector::with_proxy(svc, t, Family::V4, Some("ftp://127.0.0.1:1"));
+        assert!(d.detect().unwrap_err().to_string().contains("代理地址有误"));
     }
 }
