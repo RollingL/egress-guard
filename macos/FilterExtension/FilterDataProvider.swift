@@ -25,9 +25,18 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
     }()
 
-    /// 正在持续检查的连接 → 发起程序的路径（规则里去掉某个应用后，它的连接不应再被切断）、远端是否为 IPv6。
+    /// 正在持续检查的连接 → 发起程序的路径（规则里去掉某个应用后，它的连接不应再被切断）、远端是否为 IPv6，
+    /// 以及两个方向是否都已结束（TCP 半关闭时另一个方向还在传数据，不能提前忘掉）。
+    private struct Watched {
+        var paths: [String]
+        var v6: Bool
+        var inboundDone = false
+        var outboundDone = false
+    }
+    /// 条目上限：超过时只淘汰已经有一个方向结束的连接；缓存里找不到的连接会重新求值，不会因此放行。
+    private static let maxWatched = 20000
     private let watchedLock = NSLock()
-    private var watched: [UUID: (paths: [String], v6: Bool)] = [:]
+    private var watched: [UUID: Watched] = [:]
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
         // 所有 TCP/UDP、进出两个方向都交给 handleNewFlow 决定
@@ -67,8 +76,12 @@ final class FilterDataProvider: NEFilterDataProvider {
             return .drop()
         case .watch:
             watchedLock.lock()
-            if watched.count > 20000 { watched.removeAll() } // 兜底：没收到结束回调的连接
-            watched[flow.identifier] = (paths, v6)
+            if watched.count >= Self.maxWatched {
+                // 兜底：没收到结束回调的连接。先淘汰半关闭的；仍然太多时清空——之后的数据回调会重新求值
+                for (k, w) in watched where w.inboundDone || w.outboundDone { watched.removeValue(forKey: k) }
+                if watched.count >= Self.maxWatched { watched.removeAll() }
+            }
+            watched[flow.identifier] = Watched(paths: paths, v6: v6)
             watchedLock.unlock()
             return .filterDataVerdict(
                 withFilterInbound: true, peekInboundBytes: Self.peekBytes,
@@ -86,22 +99,35 @@ final class FilterDataProvider: NEFilterDataProvider {
     }
 
     override func handleInboundDataComplete(for flow: NEFilterFlow) -> NEFilterDataVerdict {
-        finish(flow)
+        finish(flow, inbound: true)
     }
 
     override func handleOutboundDataComplete(for flow: NEFilterFlow) -> NEFilterDataVerdict {
-        finish(flow)
+        finish(flow, inbound: false)
+    }
+
+    /// 连接的程序与地址族：优先用缓存；缓存里没有（被淘汰）时重新求值并放回，而不是当作「不受控」放行。
+    private func watchedEntry(_ flow: NEFilterFlow) -> Watched {
+        watchedLock.lock()
+        if let e = watched[flow.identifier] {
+            watchedLock.unlock()
+            return e
+        }
+        watchedLock.unlock()
+        let e = Watched(paths: Self.sourcePaths(of: flow), v6: Self.remoteIsIPv6(flow))
+        watchedLock.lock()
+        if watched[flow.identifier] == nil { watched[flow.identifier] = e }
+        watchedLock.unlock()
+        return e
     }
 
     private func dataVerdict(_ flow: NEFilterFlow, passing n: Int) -> NEFilterDataVerdict {
         let rules = feed.rules
-        watchedLock.lock()
-        let entry = watched[flow.identifier]
-        watchedLock.unlock()
-        switch rules.decide(entry?.paths ?? [], remoteIPv6: entry?.v6 ?? false) {
+        let entry = watchedEntry(flow)
+        switch rules.decide(entry.paths, remoteIPv6: entry.v6) {
         case .block:
             forget(flow)
-            logger.log("切断已有连接 \(entry?.paths.first ?? "", privacy: .public) → \(Self.remote(of: flow), privacy: .public)")
+            logger.log("切断已有连接 \(entry.paths.first ?? "", privacy: .public) → \(Self.remote(of: flow), privacy: .public)")
             return .drop()
         case .watch:
             return NEFilterDataVerdict(passBytes: n, peekBytes: Self.peekBytes)
@@ -112,13 +138,21 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
     }
 
-    private func finish(_ flow: NEFilterFlow) -> NEFilterDataVerdict {
+    /// 一个方向的数据结束。两个方向都结束后才忘掉这个连接（TCP 半关闭时另一个方向还会有数据回调）。
+    private func finish(_ flow: NEFilterFlow, inbound: Bool) -> NEFilterDataVerdict {
         let rules = feed.rules
+        let e = watchedEntry(flow)
         watchedLock.lock()
-        let v6 = watched[flow.identifier]?.v6 ?? false
+        if var w = watched[flow.identifier] {
+            if inbound { w.inboundDone = true } else { w.outboundDone = true }
+            if w.inboundDone && w.outboundDone {
+                watched.removeValue(forKey: flow.identifier)
+            } else {
+                watched[flow.identifier] = w
+            }
+        }
         watchedLock.unlock()
-        forget(flow)
-        return rules.blocked || (rules.blockIPv6 && v6) ? .drop() : .allow()
+        return rules.decide(e.paths, remoteIPv6: e.v6) == .block ? .drop() : .allow()
     }
 
     private func forget(_ flow: NEFilterFlow) {
@@ -149,11 +183,11 @@ final class FilterDataProvider: NEFilterDataProvider {
         return String(cString: buf)
     }
 
-    /// 连接的远端是不是 IPv6 地址（IPv4 映射地址不算）。
+    /// 连接的远端是不是 IPv6 地址（IPv4 映射地址不算）。远端是主机名（不是 IP 地址）时按套接字的地址族判断。
     static func remoteIsIPv6(_ flow: NEFilterFlow) -> Bool {
         guard let s = flow as? NEFilterSocketFlow else { return false }
-        if let ep = s.remoteEndpoint as? NWHostEndpoint {
-            return FilterRules.isIPv6(host: ep.hostname)
+        if let ep = s.remoteEndpoint as? NWHostEndpoint, let v6 = FilterRules.ipv6Literal(host: ep.hostname) {
+            return v6
         }
         return s.socketFamily == AF_INET6
     }

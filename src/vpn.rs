@@ -8,15 +8,20 @@
 //! macOS 自带的几个 utun（iCloud 专用代理、接力等）只有 fe80:: 地址，不会被当成 VPN。
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::VpnConfig;
 use crate::leaktest::ifaces::{self, Adapter};
 
-/// 轮询网卡的间隔。Windows、macOS 上网卡一变化系统就会通知引擎、立即检查（毫秒级），
-/// 轮询只是兜底（通知没来、或者本平台没有通知时）；列一次网卡只需几毫秒，所以可以轮询得很勤。
+/// 正在通过 VPN 放行（有守护中的网卡）时轮询网卡的间隔。Windows、macOS 上网卡一变化系统就会通知引擎、
+/// 立即检查（毫秒级），轮询只是兜底（通知没来、或者本平台没有通知时）。
+/// 这不是漏放窗口的上限：断线到规则生效还要加上网卡状态变化本身的延迟和防火墙提交的耗时。
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// 没有守护中的网卡（阻断中、没有 VPN、关闭了守护）时的轮询间隔：只用来刷新界面上的 VPN 状态。
+pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Windows 接口类型（IF_TYPE_*）。
 const IF_TYPE_PPP: u32 = 23;
@@ -80,9 +85,9 @@ pub fn connected(adapters: &[Adapter], cfg: &VpnConfig) -> Vec<String> {
     v
 }
 
-/// 当前已启用的网卡。
-pub fn scan() -> Vec<Adapter> {
-    ifaces::adapters()
+/// 当前已启用的网卡；枚举失败时为 None（不知道现在的情况，不能当作「全部断开」或「全部还在」）。
+pub fn scan() -> Option<Vec<Adapter>> {
+    ifaces::try_adapters()
 }
 
 /// 有可用地址的网卡名称（供界面选择要守护的网卡），按名称排序。
@@ -104,30 +109,70 @@ fn fingerprint(adapters: &[Adapter]) -> Vec<(String, bool)> {
     v
 }
 
-/// 在后台线程中每 [`POLL_INTERVAL`] 检查一次网卡；有变化时调用 `send`（返回 false 时结束线程）。
-pub fn spawn_watch(send: impl Fn(Vec<Adapter>) -> bool + Send + 'static) {
+/// 网卡检查线程的控制：轮询间隔与停止信号。引擎退出时丢弃，线程随即结束。
+pub struct Watch {
+    interval_ms: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Watch {
+    /// 有守护中的网卡时勤一些，否则放慢。
+    pub fn set_active(&self, active: bool) {
+        let d = if active { POLL_INTERVAL } else { IDLE_POLL_INTERVAL };
+        self.interval_ms.store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 在后台线程中按 [`Watch::set_active`] 设定的间隔检查网卡；有变化时调用 `send`（返回 false 时结束线程）。
+/// 枚举失败的那一次跳过（不当作网卡全部消失）。
+pub fn spawn_watch(send: impl Fn(Vec<Adapter>) -> bool + Send + 'static) -> Watch {
+    let interval_ms = Arc::new(AtomicU64::new(IDLE_POLL_INTERVAL.as_millis() as u64));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (iv, st) = (interval_ms.clone(), stop.clone());
     let r = std::thread::Builder::new().name("vpn-watch".into()).spawn(move || {
         let mut last = None;
-        loop {
-            let now = scan();
-            let fp = fingerprint(&now);
-            if last.as_ref() != Some(&fp) {
-                last = Some(fp);
-                if !send(now) {
-                    break;
+        let mut warned = false;
+        while !st.load(Ordering::Relaxed) {
+            match scan() {
+                Some(now) => {
+                    warned = false;
+                    let fp = fingerprint(&now);
+                    if last.as_ref() != Some(&fp) {
+                        last = Some(fp);
+                        if !send(now) {
+                            break;
+                        }
+                    }
                 }
+                None if !warned => {
+                    warned = true;
+                    log::warn!("无法列出网卡，VPN 守护暂时依赖系统的网络变化通知");
+                }
+                None => {}
             }
-            std::thread::sleep(POLL_INTERVAL);
+            // 分段睡眠：放慢期间切换为勤查、或者要求停止时能尽快生效
+            let mut slept = 0;
+            while slept < iv.load(Ordering::Relaxed) && !st.load(Ordering::Relaxed) {
+                std::thread::sleep(POLL_INTERVAL);
+                slept += POLL_INTERVAL.as_millis() as u64;
+            }
         }
     });
     if let Err(e) = r {
         log::warn!("无法启动 VPN 网卡检查线程: {e}");
     }
+    Watch { interval_ms, stop }
 }
 
 /// 便捷封装：把网卡变化发给引擎。
-pub fn spawn_engine_watch(tx: Sender<crate::engine::Event>) {
-    spawn_watch(move |a| tx.send(crate::engine::Event::Adapters(a)).is_ok());
+pub fn spawn_engine_watch(tx: Sender<crate::engine::Event>) -> Watch {
+    spawn_watch(move |a| tx.send(crate::engine::Event::Adapters(a)).is_ok())
 }
 
 /// 守护中的网卡里，现在已经断开的那些。

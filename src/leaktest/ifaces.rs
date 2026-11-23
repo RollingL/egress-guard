@@ -34,8 +34,14 @@ pub fn list() -> Vec<IfAddr> {
         .collect()
 }
 
-#[cfg(unix)]
+/// 已启用的网卡；枚举失败时返回空列表（泄露测试等用途）。
 pub fn adapters() -> Vec<Adapter> {
+    try_adapters().unwrap_or_default()
+}
+
+/// 已启用的网卡；系统调用失败时返回 None（「不知道」，而不是「没有网卡」）。
+#[cfg(unix)]
+pub fn try_adapters() -> Option<Vec<Adapter>> {
     use std::ffi::CStr;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -44,7 +50,7 @@ pub fn adapters() -> Vec<Adapter> {
     // SAFETY: getifaddrs 分配的链表在 freeifaddrs 之前一直有效；只读取其中的地址结构。
     unsafe {
         if libc::getifaddrs(&mut ifap) != 0 {
-            return out;
+            return None;
         }
         let mut p = ifap;
         while !p.is_null() {
@@ -73,11 +79,11 @@ pub fn adapters() -> Vec<Adapter> {
         }
         libc::freeifaddrs(ifap);
     }
-    out
+    Some(out)
 }
 
 #[cfg(windows)]
-pub fn adapters() -> Vec<Adapter> {
+pub fn try_adapters() -> Option<Vec<Adapter>> {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -109,7 +115,7 @@ pub fn adapters() -> Vec<Adapter> {
             }
             if r != 0 {
                 log::warn!("GetAdaptersAddresses 失败：{r}");
-                return out;
+                return None;
             }
             break;
         }
@@ -148,12 +154,12 @@ pub fn adapters() -> Vec<Adapter> {
             out.push(adapter);
         }
     }
-    out
+    Some(out)
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn adapters() -> Vec<Adapter> {
-    Vec::new()
+pub fn try_adapters() -> Option<Vec<Adapter>> {
+    Some(Vec::new())
 }
 
 #[cfg(test)]

@@ -843,7 +843,7 @@ impl App {
     fn vpn_section(&mut self, ui: &mut egui::Ui, p: &Palette, s: &Status) {
         theme::section(ui, p, "VPN 守护");
         if self.adapters.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
-            self.adapters = (Some(Instant::now()), crate::vpn::candidates(&crate::vpn::scan()));
+            self.adapters = (Some(Instant::now()), crate::vpn::candidates(&crate::vpn::scan().unwrap_or_default()));
         }
         let mut add = None;
         theme::card(ui, p, |ui| {

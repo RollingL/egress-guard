@@ -66,6 +66,10 @@ pub trait Firewall {
     fn needs_initial_commit(&self) -> bool {
         false
     }
+    /// 只是模拟（--dry-run 或拦截后端打不开），规则没有真正生效。
+    fn simulated(&self) -> bool {
+        false
+    }
     /// 拦截后端的其他问题（例如网络扩展不支持当前规则用到的功能），界面上提示。
     fn degraded(&self) -> Option<String> {
         None
@@ -248,7 +252,13 @@ impl Controller {
             let mut e = ConnEvent::now(if block { Kind::Block } else { Kind::Restore }, reason.clone());
             e.egress = self.last_ip;
             e.egress_v6 = self.last_v6;
+            // 记录里区分：模拟模式（规则没有真正生效）、阻断时有程序暂未加上规则
             e.scope = self.scope().to_owned();
+            if self.fw.simulated() {
+                e.scope.push_str("（模拟模式，未生效）");
+            } else if block && self.fw.has_pending() {
+                e.scope.push_str("（部分程序暂未加上规则）");
+            }
             eventlog::record(e);
         }
         self.reason = Some(reason);
@@ -435,6 +445,9 @@ impl Firewall for DryRunFirewall {
     }
     fn is_blocked(&self) -> bool {
         self.blocked
+    }
+    fn simulated(&self) -> bool {
+        true
     }
     fn set_rules(&mut self, rules: Rules) -> Result<()> {
         log::info!(

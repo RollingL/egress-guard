@@ -44,6 +44,11 @@ func unitTests() {
     check(FilterRules.isIPv6(host: "2001:db8::1"), "IPv6 地址")
     check(!FilterRules.isIPv6(host: "::ffff:192.0.2.1"), "IPv4 映射地址不算 IPv6")
     check(!FilterRules.isIPv6(host: "192.0.2.1"), "IPv4 地址")
+    check(!FilterRules.isIPv6(host: "0:0:0:0:0:FFFF:192.0.2.1"), "另一种写法的 IPv4 映射地址")
+    check(FilterRules.isIPv6(host: "[2001:db8::1]"), "带方括号的 IPv6 地址")
+    check(FilterRules.isIPv6(host: "fe80::1%en0"), "带网卡的链路本地地址")
+    check(FilterRules.ipv6Literal(host: "example.com") == nil, "主机名交给套接字地址族判断")
+    check(FilterRules.ipv6Literal(host: "fe80:zz::1") == nil, "无法解析的地址不当作 IPv6")
 
     let line = Data(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":["/Applications/A.app"]}}"#.utf8)
     let p = FilterRules.parse(line: line)

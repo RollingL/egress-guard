@@ -5,9 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # 发布工作流在打包前调用一次，保证发布的提交本身通过了全部测试
+  workflow_call:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # 被发布工作流调用时 github.workflow 是「发布」，不会与 main 上的 CI 互相取消
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -45,12 +48,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest
-          $asset = $rel.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+          # 固定版本（不用 latest），避免第三方发布新版本改变测试环境；下载后按 GitHub 记录的摘要校验
+          $tag = '26.3.1'
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } "https://api.github.com/repos/pal1000/mesa-dist-win/releases/tags/$tag"
+          $asset = $rel.assets | Where-Object { $_.name -eq "mesa3d-$tag-release-msvc.7z" } | Select-Object -First 1
           if (-not $asset) { $rel.assets.name; Write-Error '找不到 Mesa 发布包' }
-          "Mesa $($rel.tag_name)：$($asset.name)"
+          "Mesa $($rel.tag_name)：$($asset.name)（$($asset.digest)）"
           $dir = Join-Path $env:RUNNER_TEMP 'mesa'
           Invoke-WebRequest $asset.browser_download_url -OutFile "$dir.7z"
+          if ($asset.digest) {
+            $sha = (Get-FileHash -Algorithm SHA256 "$dir.7z").Hash.ToLower()
+            if ("sha256:$sha" -ne $asset.digest) { Write-Error "Mesa 发布包摘要不符：$sha" }
+          }
           7z x "$dir.7z" "-o$dir" -y | Out-Null
           $gui = Join-Path $env:RUNNER_TEMP 'gui'
           New-Item -ItemType Directory -Force $gui | Out-Null

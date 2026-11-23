@@ -189,7 +189,10 @@ impl LeakScheduler {
                     }
                     None => {
                         *notified.lock().unwrap() = None;
-                        if o.dns.is_err() { "DNS 测试失败，WebRTC 未发现泄露".to_owned() } else { "未发现泄露".to_owned() }
+                        match o.warn_text() {
+                            Some(w) => format!("没有直接泄露，需要留意：{w}"),
+                            None => "未发现泄露".to_owned(),
+                        }
                     }
                 };
                 state.lock().unwrap().last = Some((crate::logbuf::now_hms(), summary));

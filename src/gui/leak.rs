@@ -57,6 +57,20 @@ impl Outcome {
         }
         (!parts.is_empty()).then(|| parts.join("；"))
     }
+
+    /// 需要留意的地方（没有直接泄露、但结论不完整或有未知解析器等）。
+    pub fn warn_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        match &self.dns {
+            Ok((Level::Warn, t)) => parts.push(format!("DNS：{t}")),
+            Err(e) => parts.push(format!("DNS 测试失败：{e}")),
+            _ => {}
+        }
+        if self.webrtc.0 == Level::Warn {
+            parts.push(format!("WebRTC：{}", self.webrtc.1));
+        }
+        (!parts.is_empty()).then(|| parts.join("；"))
+    }
 }
 
 type Done = Box<dyn FnOnce(Outcome) + Send>;
@@ -238,8 +252,8 @@ fn verdict_hint(v: Verdict) -> &'static str {
         Verdict::SameNetwork => "与当前出口 IP 属于同一个网络（同一自治系统），多半是 VPN 服务商自己的解析器",
         Verdict::Local => "局域网地址，只在本地网络可见",
         Verdict::Exposed => "网卡上的公网地址：网页获得摄像头/麦克风权限后可以通过 WebRTC 读到",
-        Verdict::Leak => "不在白名单内，也不是可信解析器",
-        Verdict::NoResponse => "STUN 服务器没有响应：从这里发不出去，也就不会暴露",
+        Verdict::Leak => "不在白名单内，也不是可信解析器（解析器本身不一定说明泄露：VPN 也可能使用公共解析器）",
+        Verdict::NoResponse => "STUN 服务器没有响应：这条路径没有验证到（只说明到这些服务器的 UDP 不通，不能证明不会暴露）",
     }
 }
 

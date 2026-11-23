@@ -130,28 +130,51 @@ pub enum Level {
 }
 
 /// DNS 测试的一句话结论。
+///
+/// 权威服务器看到的是递归解析器，不是本机：解析器不在白名单、也不可信，只说明「不认识它」
+/// （可能是本地网络的解析器绕过了出口，也可能是 VPN 合法使用的公共解析器），记为「需要留意」。
+/// 解析器转发的客户端网段（ECS）不在白名单，才是直接观察到的白名单以外的地址，记为泄露。
 pub fn dns_summary(r: &dns::DnsReport) -> (Level, String) {
-    let leaky = r.resolvers.iter().filter(|x| x.verdict.is_leak()).count();
+    let unknown = r.resolvers.iter().filter(|x| x.verdict.is_leak()).count();
     let ecs = r.client_subnets.iter().filter(|x| x.verdict.is_leak()).count();
-    match (leaky, ecs) {
-        (0, 0) => (Level::Ok, format!("未发现泄露：{} 个解析器都经白名单出口或可信", r.resolvers.len())),
-        (n, 0) => (Level::Leak, format!("发现 {n} 个白名单以外的解析器，域名查询可能绕过了白名单出口")),
-        (0, m) => (Level::Leak, format!("解析器向外透露了 {m} 个白名单以外的客户端网段（ECS）")),
-        (n, m) => (Level::Leak, format!("发现 {n} 个白名单以外的解析器，并透露了 {m} 个客户端网段（ECS）")),
+    let failed = r.sources.iter().filter(|x| !x.ok).count();
+    let coverage = if failed > 0 && failed == r.sources.len() {
+        "（所有检测源都失败，结论不完整）"
+    } else if failed > 0 {
+        "（部分检测源失败）"
+    } else {
+        ""
+    };
+    match (unknown, ecs) {
+        (_, m) if m > 0 => (Level::Leak, format!("解析器向外透露了 {m} 个白名单以外的客户端网段（ECS）：域名查询来自白名单以外的出口{coverage}")),
+        (0, _) if r.resolvers.is_empty() => (Level::Warn, format!("没有观察到任何解析器，无法判断{coverage}")),
+        (0, _) => (Level::Ok, format!("未发现泄露：{} 个解析器都经白名单出口或可信{coverage}", r.resolvers.len())),
+        (n, _) => (
+            Level::Warn,
+            format!("发现 {n} 个未知的递归解析器（不在白名单、不可信、与出口不同网络）：可能绕过了白名单出口，也可能是 VPN 使用的公共解析器，确认后可以加入可信列表{coverage}"),
+        ),
     }
 }
 
 /// WebRTC 测试的一句话结论。
+///
+/// STUN 服务器没有响应只说明「到这几个服务器的 UDP 不通」，不能证明其他 UDP 目的地也不通，
+/// 所以全部无响应记为「需要留意（覆盖不足）」，而不是「不会暴露」。
 pub fn webrtc_summary(r: &webrtc::WebRtcReport) -> (Level, String) {
     let leaked = r.leaked_ips();
     let exposed = r.exposed_hosts();
+    let silent = r.paths.iter().filter(|p| p.mapped.is_none()).count();
     if !leaked.is_empty() {
         let ips = leaked.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("、");
         (Level::Leak, format!("WebRTC 会暴露白名单以外的公网 IP：{ips}"))
     } else if exposed > 0 {
         (Level::Warn, format!("网卡上有 {exposed} 个白名单以外的公网地址，网页获得摄像头/麦克风权限后可以读到"))
+    } else if r.paths.is_empty() {
+        (Level::Warn, "没有可以测试的路径，无法判断".into())
     } else if !r.any_response() {
-        (Level::Ok, "STUN 服务器都没有响应：UDP 无法直接连到外网，WebRTC 不会暴露公网 IP".into())
+        (Level::Warn, "STUN 服务器都没有响应，无法确认：只说明到这几个服务器的 UDP 不通，不能证明 WebRTC 不会暴露公网 IP".into())
+    } else if silent > 0 {
+        (Level::Ok, format!("未发现泄露：有响应的路径看到的公网 IP 都在白名单内（另有 {silent} 条路径没有响应，未覆盖）"))
     } else {
         (Level::Ok, "未发现泄露：WebRTC 能看到的公网 IP 都在白名单内".into())
     }
@@ -441,7 +464,27 @@ mod tests {
     fn summaries() {
         use super::webrtc::{HostAddr, StunPath, WebRtcReport};
         let mut r = WebRtcReport { paths: vec![], hosts: vec![], egress: None, unresolved: vec![] };
-        assert_eq!(webrtc_summary(&r).0, Level::Ok);
+        assert_eq!(webrtc_summary(&r).0, Level::Warn, "没有路径时不能下结论");
+        let silent = |local: &str| StunPath {
+            iface: None,
+            local: ip(local),
+            mapped: None,
+            server: None,
+            error: Some("超时".into()),
+            verdict: Verdict::NoResponse,
+        };
+        // 全部超时：覆盖不足，不是「不会暴露」
+        r.paths = vec![silent("0.0.0.0"), silent("::")];
+        let (l, t) = webrtc_summary(&r);
+        assert_eq!(l, Level::Warn);
+        assert!(t.contains("无法确认"), "{t}");
+        // 只有 IPv4 回包：IPv4 在白名单，IPv6 未覆盖
+        r.paths[0].mapped = Some("203.0.113.7:4000".parse().unwrap());
+        r.paths[0].verdict = Verdict::Whitelisted;
+        let (l, t) = webrtc_summary(&r);
+        assert_eq!(l, Level::Ok);
+        assert!(t.contains("1 条路径没有响应"), "{t}");
+        r.paths.clear();
         r.hosts.push(HostAddr { iface: "en0".into(), ip: ip("2001:db8::9"), verdict: Verdict::Exposed });
         assert_eq!(webrtc_summary(&r).0, Level::Warn);
         r.paths.push(StunPath {
@@ -455,6 +498,43 @@ mod tests {
         let (l, t) = webrtc_summary(&r);
         assert_eq!(l, Level::Leak);
         assert!(t.contains("198.51.100.9"), "{t}");
+    }
+
+    #[test]
+    fn dns_summaries() {
+        use super::dns::{ClientSubnet, DnsReport, Resolver, SourceStatus};
+        let resolver = |a: &str, v: Verdict| Resolver {
+            ip: ip(a),
+            queries: 1,
+            sources: vec!["dnscheck".into()],
+            protos: vec![],
+            info: None,
+            verdict: v,
+        };
+        let mut r = DnsReport {
+            resolvers: vec![resolver("203.0.113.53", Verdict::Whitelisted)],
+            client_subnets: vec![],
+            egress: Some(ip("203.0.113.7")),
+            egress_info: None,
+            queries: 1,
+            sources: vec![SourceStatus { name: "dnscheck".into(), ok: true, detail: String::new() }],
+        };
+        assert_eq!(dns_summary(&r).0, Level::Ok);
+        // VPN 合法使用公共 DNS（不在白名单、没有加入可信列表、不同网络）：需要留意，不算泄露
+        r.resolvers.push(resolver("8.8.8.8", Verdict::Leak));
+        let (l, t) = dns_summary(&r);
+        assert_eq!(l, Level::Warn);
+        assert!(t.contains("未知的递归解析器"), "{t}");
+        // 解析器透露了白名单以外的客户端网段：直接观察到，算泄露
+        r.client_subnets.push(ClientSubnet { subnet: "198.51.100.0/24".parse().unwrap(), info: None, verdict: Verdict::Leak });
+        assert_eq!(dns_summary(&r).0, Level::Leak);
+        // 什么也没观察到
+        r.resolvers.clear();
+        r.client_subnets.clear();
+        r.sources[0].ok = false;
+        let (l, t) = dns_summary(&r);
+        assert_eq!(l, Level::Warn);
+        assert!(t.contains("所有检测源都失败"), "{t}");
     }
 
     #[test]

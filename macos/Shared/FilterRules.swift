@@ -35,9 +35,24 @@ struct FilterRules: Equatable {
         self.apps = apps.map(FilterRules.normalize).filter { !$0.isEmpty }
     }
 
-    /// 远端地址是不是真正的 IPv6（IPv4 映射地址 ::ffff:a.b.c.d 走的是 IPv4，不算）。
+    /// 远端地址是不是真正的 IPv6（IPv4 映射地址 ::ffff:a.b.c.d 走的是 IPv4，不算）。不是 IP 地址时为 false。
     static func isIPv6(host: String) -> Bool {
-        host.contains(":") && !host.lowercased().hasPrefix("::ffff:")
+        ipv6Literal(host: host) ?? false
+    }
+
+    /// 按地址解析判断：IPv6 地址返回 true，IPv4 地址和 IPv4 映射地址（任何写法）返回 false，
+    /// 不是 IP 地址（主机名）时返回 nil，由调用方按套接字的地址族判断。
+    static func ipv6Literal(host: String) -> Bool? {
+        var h = host
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        if let pct = h.firstIndex(of: "%") { h = String(h[..<pct]) } // fe80::1%en0
+        var v4 = in_addr()
+        if inet_pton(AF_INET, h, &v4) == 1 { return false }
+        var v6 = in6_addr()
+        guard inet_pton(AF_INET6, h, &v6) == 1 else { return nil }
+        let b = withUnsafeBytes(of: &v6) { Array($0) }
+        let mapped = b[0..<10].allSatisfy { $0 == 0 } && b[10] == 0xff && b[11] == 0xff
+        return !mapped
     }
 
     static func normalize(_ path: String) -> String {

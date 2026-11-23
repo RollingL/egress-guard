@@ -91,7 +91,7 @@ Windows 版提供两个程序：
 
 ## VPN 断线保护、IPv6 防护
 
-**VPN 守护**：放行时记下正在使用的 VPN 网卡，之后它断开（网卡消失、关闭或失去地址）就**立即阻断**，不等下一次出口 IP 检测，也不受「网络变化时先阻断」开关影响。Windows、macOS 上网卡或地址一变化，系统就会通知本程序立即检查，通常几毫秒内就会阻断；另外每 0.25 秒轮询一次网卡作为兜底。VPN 掉线到阻断之间仍有这几毫秒的空档，系统可能已经把少量流量改走物理网卡。VPN 重新连上、出口 IP 再次通过检查后自动放行。
+**VPN 守护**：放行时记下正在使用的 VPN 网卡，之后它断开（网卡消失、关闭或失去地址）就**立即阻断**，不等下一次出口 IP 检测，也不受「网络变化时先阻断」开关影响。Windows、macOS 上网卡或地址一变化，系统就会通知本程序立即检查，通常几毫秒内就会阻断；另外轮询网卡作为兜底：通过 VPN 放行期间每 0.25 秒一次，其余时候每 2 秒一次（只用来刷新界面）。0.25 秒不是漏放窗口的上限：VPN 掉线到阻断之间还要加上系统更新网卡状态和防火墙提交规则的时间，系统可能已经把少量流量改走物理网卡。阻断没能生效（例如 WFP 事务失败）时界面显示「未生效」，每 5 秒重试，直到生效或有新的检测结果。VPN 重新连上、出口 IP 再次通过检查后自动放行。
 
 - 默认自动识别 VPN 网卡：macOS 上是 `utun`、`tun`、`tap`、`ppp`、`ipsec`、`wg`、`tailscale` 等名称，Windows 上看接口类型（隧道、PPP、虚拟网卡）以及名称和描述（WireGuard、OpenVPN、TAP-Windows、Wintun、Clash、sing-box 等）。只算有可用地址（不只是 `fe80::`）的网卡，所以 macOS 自带的几个 utun（iCloud 专用代理等）不会被当成 VPN。
 - 识别不准时，在 **设置 → VPN 守护** 里点本机网卡把它加入列表，就只守护列出的网卡。
@@ -113,7 +113,7 @@ Windows 版提供两个程序：
 
 界面启动 20 秒后、之后每天检查一次 GitHub Releases，有新版本时在概览页顶部提示，并发一次系统通知。只提醒，不会自动下载安装：点「下载」打开对应平台的安装包。在 **设置 → 检查更新** 里可以关闭或立即检查。仓库是私有的时候需要填一个只有读取权限的 GitHub 令牌。
 
-发布：合并到 `main` 后，如果 `Cargo.toml` 里的版本还没有发布过，`.github/workflows/release.yml` 会构建 Windows、macOS 两个安装包（`egress-guard-v<版本>-windows.zip`、`-macos.zip`），并创建标签为 `v<版本>` 的 Release。所以发新版本只需要改版本号。
+发布：合并到 `main` 后，如果 `Cargo.toml` 里的版本还没有发布过，`.github/workflows/release.yml` 会构建 Windows、macOS 两个安装包（`egress-guard-v<版本>-windows.zip`、`-macos.zip`），并创建标签为 `v<版本>` 的 Release。所以发新版本只需要改版本号。发布前会对同一个提交再跑一遍完整的 CI（三个平台），通过后才打包；Release 先建草稿，核对两个安装包和标签指向的提交后才公开。手动运行只对 `main` 生效。
 
 系统通知：Windows 用 Toast 通知，程序会在 `HKCU\Software\Classes\AppUserModelId\EgressGuard.App` 登记显示名称和图标。macOS 用系统通知中心，第一次会请求权限；被拒绝时改用 AppleScript 的 `display notification`。
 
@@ -196,7 +196,7 @@ macOS 版与 Windows 版共用同一套检测、决策逻辑和界面（苹果�
 
 pf 只认地址、端口和用户，分不清是哪个应用发出的连接。macOS 上能按应用拦截的官方机制是 **Network Extension 内容过滤（NEFilterDataProvider 系统扩展）**，Little Snitch、LuLu 都用它。0.7.0 起 .app 里带有这样一个网络扩展：后台服务把「是否阻断 + 受控应用列表（含自动识别的子进程）」推送给它，它对受控应用的连接逐个放行或丢弃。
 
-**但 macOS 只加载用付费 Apple Developer ID 签名、带描述文件并经过公证的网络扩展。** 发布的 zip 没有签名，「受控应用」页会说明这一点，点「仍要尝试启用」会显示系统拒绝的原因；在那之前请用「全局断网」。拿到开发者账号后怎么签名、用户怎么启用、以及第一次在真机上需要验证什么，见 [docs/macos-network-extension.md](docs/macos-network-extension.md)。
+**但 macOS 只加载用付费 Apple Developer ID 签名、带描述文件并经过公证的网络扩展。** 发布的 zip 没有签名，「受控应用」页会说明这一点，点「仍要尝试启用」会显示系统拒绝的原因；在那之前请用「全局断网」。也就是说，**公开发布的 macOS 安装包里，按应用断网和按应用的「始终阻断 IPv6」都不可用**，只有 pf 全局断网（以及全局断网下的 IPv6 规则）生效。拿到开发者账号后怎么签名、用户怎么启用、以及第一次在真机上需要验证什么，见 [docs/macos-network-extension.md](docs/macos-network-extension.md)。
 
 <p>
   <img src="docs/macos-apps-unsigned-light.png" width="49%" alt="macOS 受控应用页：未签名版本的说明">

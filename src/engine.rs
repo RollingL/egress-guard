@@ -157,9 +157,10 @@ fn run(
 
     // 网卡变化监听，需在整个循环期间保持存活
     let _watcher = start_netwatch(tx.clone());
-    // VPN 守护：每 0.25 秒检查一次网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）
-    vpn::spawn_engine_watch(tx.clone());
-    let mut adapters: Vec<Adapter> = vpn::scan();
+    // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
+    // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
+    let vpn_watch = vpn::spawn_engine_watch(tx.clone());
+    let mut adapters: Vec<Adapter> = vpn::scan().unwrap_or_default();
     let mut guarded: Vec<String> = Vec::new();
 
     let fw: Box<dyn Firewall> = if dry_run {
@@ -286,7 +287,10 @@ fn run(
             Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Event::NetworkChanged) => {
                 // 先看是不是守护中的 VPN 断了（原因更明确，也不受「网络变化时先阻断」开关影响）
-                adapters = vpn::scan();
+                // 列不出网卡时沿用上一次的结果（不当作全部断开）
+                if let Some(a) = vpn::scan() {
+                    adapters = a;
+                }
                 let vpn_blocked = check_vpn!();
                 if debounce_until.is_none() && !vpn_blocked {
                     if let Err(e) = ctrl.on_network_change() {
@@ -411,6 +415,7 @@ fn run(
         }
         status.vpn_guarded = guarded.clone();
         status.generation = generation;
+        vpn_watch.set_active(!guarded.is_empty());
         update_status(&mut status, &ctrl, checking);
         reporter(&status);
     }
