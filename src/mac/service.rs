@@ -8,7 +8,7 @@
 
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -183,47 +183,72 @@ pub fn install(src_bin: &Path) -> Result<()> {
 }
 
 /// 卸载后台服务（保留配置文件）。需要 root。
+///
+/// 先确认服务已经卸载、并取得 pf 锚点的独占锁，之后才删除文件、清空规则（见 [`crate::uninstall`]）。
 pub fn uninstall() -> Result<()> {
     require_root()?;
-    let target = format!("system/{DAEMON_LABEL}");
-    let mut problems = Vec::new();
-    // 没有加载时 bootout 也会失败：以之后服务是否还在为准（bootout 是异步的，稍等）
-    let bootout = launchctl(&["bootout", &target]);
-    let mut still_loaded = true;
-    for _ in 0..20 {
-        if launchctl(&["print", &target]).is_err() {
-            still_loaded = false;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    if still_loaded {
-        problems.push(match bootout {
-            Err(e) => format!("后台服务没有停止：{e:#}"),
-            Ok(()) => "后台服务没有停止".into(),
-        });
-    }
-    let remove = |p: &Path, dir: bool| {
-        let r = if dir { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
-        match r {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(format!("无法删除 {}：{e}", p.display())),
-            _ => None,
-        }
-    };
-    problems.extend(remove(Path::new(DAEMON_PLIST), false));
-    if let Err(e) = super::pf::flush_anchor() {
-        problems.push(format!("没能移除 pf 规则：{e:#}"));
-    }
-    if let Some(dir) = paths::daemon_bin().parent() {
-        problems.extend(remove(dir, true));
-    }
-    problems.extend(remove(Path::new(SOCKET), false));
-    problems.extend(remove(&crate::filterfeed::run_marker(Path::new(SOCKET)), false));
-    if !problems.is_empty() {
-        bail!("卸载没有全部完成：{}", problems.join("；"));
-    }
+    crate::uninstall::uninstall(&mut MacOps)?;
     println!("后台服务已卸载；配置保留在 {SUPPORT_DIR}，日志在 {LOG_FILE}");
     Ok(())
+}
+
+struct MacOps;
+
+/// `launchctl print` 找不到服务时的退出码。
+const LAUNCHCTL_NOT_FOUND: i32 = 113;
+
+impl crate::uninstall::Ops for MacOps {
+    type Lock = std::fs::File;
+
+    fn bootout(&mut self) -> Result<()> {
+        // 没有加载时 bootout 也会失败：以之后查询到的状态为准
+        launchctl(&["bootout", &format!("system/{DAEMON_LABEL}")])
+    }
+
+    fn state(&mut self) -> crate::uninstall::ServiceState {
+        use crate::uninstall::ServiceState;
+        let out = Command::new("/bin/launchctl").args(["print", &format!("system/{DAEMON_LABEL}")]).output();
+        match out {
+            Ok(o) if o.status.success() => ServiceState::Loaded,
+            Ok(o) => {
+                let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                if o.status.code() == Some(LAUNCHCTL_NOT_FOUND) || text.contains("Could not find service") {
+                    ServiceState::NotLoaded
+                } else {
+                    ServiceState::Unknown(format!("launchctl print 失败（{}）：{}", o.status, text.trim()))
+                }
+            }
+            Err(e) => ServiceState::Unknown(format!("无法运行 launchctl：{e}")),
+        }
+    }
+
+    fn wait(&mut self) {
+        // bootout 是异步的，稍等
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    fn lock_anchor(&mut self) -> Result<Option<std::fs::File>> {
+        super::pf::try_lock()
+    }
+
+    fn flush_anchor(&mut self) -> Result<()> {
+        super::pf::flush_anchor()
+    }
+
+    fn remove(&mut self, item: crate::uninstall::Item) -> Result<()> {
+        use crate::uninstall::Item;
+        let (path, dir) = match item {
+            Item::Plist => (PathBuf::from(DAEMON_PLIST), false),
+            Item::BinDir => (paths::daemon_bin().parent().context("服务程序目录")?.to_path_buf(), true),
+            Item::Socket => (PathBuf::from(SOCKET), false),
+            Item::RunMarker => (crate::filterfeed::run_marker(Path::new(SOCKET)), false),
+        };
+        let r = if dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        match r {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => bail!("无法删除 {}：{e}", path.display()),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// 修改「开机自动启动」（服务自己以 root 调用）。下次开机生效；当前运行状态不受影响。

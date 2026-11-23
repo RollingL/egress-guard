@@ -37,7 +37,7 @@ pub struct PfFirewall {
 }
 
 /// 取得锚点的独占锁；已被其他进程持有时返回 Ok(None)。
-fn try_lock() -> Result<Option<std::fs::File>> {
+pub(crate) fn try_lock() -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new()
