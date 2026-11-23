@@ -10,7 +10,7 @@ use std::time::Instant;
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText};
 
 use super::theme::{self, Palette};
-use super::{empty_state, info_card, shorten, warning_card, App};
+use super::{empty_state, info_card, warning_card, App};
 use crate::leaktest::dns::{self, DnsReport, HttpSource};
 use crate::leaktest::webrtc::{self, WebRtcReport};
 use crate::leaktest::{self, Judge, Level, Trusted, Verdict};
@@ -123,14 +123,19 @@ fn toggle_chip(ui: &mut egui::Ui, p: &Palette, on: &mut bool, text: &str) -> egu
 
 /// 列表行：左侧主文字（等宽）+ 说明，右侧控件。
 fn item_row(ui: &mut egui::Ui, p: &Palette, main: &str, sub: &str, right: impl FnOnce(&mut egui::Ui)) {
+    /// 右侧（判定标签、「信任」按钮）预留的宽度；左侧文字超出时截断，悬停看全文。
+    const RIGHT_W: f32 = 200.0;
+    let h = if sub.is_empty() { 34.0 } else { 44.0 };
     ui.horizontal(|ui| {
-        ui.set_min_height(if sub.is_empty() { 34.0 } else { 44.0 });
-        ui.vertical(|ui| {
+        ui.set_min_height(h);
+        let left_w = (ui.available_width() - RIGHT_W).max(120.0);
+        ui.allocate_ui_with_layout(egui::vec2(left_w, h), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(left_w);
             ui.add_space(if sub.is_empty() { 8.0 } else { 4.0 });
-            ui.label(RichText::new(main).monospace().color(p.label));
+            ui.add(egui::Label::new(RichText::new(main).monospace().color(p.label)).truncate());
             if !sub.is_empty() {
                 ui.add_space(-5.0);
-                ui.label(RichText::new(shorten(sub, 86)).size(12.0).color(p.secondary)).on_hover_text(sub);
+                ui.add(egui::Label::new(RichText::new(sub).size(12.0).color(p.secondary)).truncate());
             }
         });
         ui.with_layout(Layout::right_to_left(Align::Center), right);
@@ -354,6 +359,9 @@ impl App {
                     let protos = if x.protos.is_empty() { String::new() } else { format!("{} ", x.protos.join("/")) };
                     sub.push_str(&format!("{}{protos}{} 次查询", if sub.is_empty() { "" } else { " · " }, x.queries));
                 }
+                if !x.sources.is_empty() {
+                    sub.push_str(&format!("{}{}", if sub.is_empty() { "" } else { " · " }, x.sources.join("、")));
+                }
                 let asn = x.info.as_ref().and_then(|i| i.asn);
                 item_row(ui, p, &x.ip.to_string(), &sub, |ui| {
                     theme::chip(ui, verdict_color(p, x.verdict), x.verdict.label()).on_hover_text(verdict_hint(x.verdict));
@@ -366,9 +374,6 @@ impl App {
                         if theme::text_button(ui, p.accent, &label).on_hover_text(hover).clicked() {
                             trust = Some(entry);
                         }
-                    }
-                    if !x.sources.is_empty() {
-                        ui.label(RichText::new(x.sources.join("、")).size(11.5).color(p.tertiary));
                     }
                 });
                 i += 1;

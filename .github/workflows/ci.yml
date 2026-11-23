@@ -118,7 +118,8 @@ jobs:
             (Get-Content -Raw $cfg) -replace 'appearance = "\w+"', "appearance = `"$look`"" | Set-Content -Encoding utf8 $cfg
             $p = Start-Process (Join-Path $env:RUNNER_TEMP 'gui\egress-guard-gui.exe') -ArgumentList '-c', $cfg, '--page', 'leaktest', '--leak-test' -PassThru
             Start-Sleep 40
-            $h = [Win]::FindWindow($null, '出口 IP 网络控制 - egress-guard')
+            # PowerShell 会把 $null 转成空字符串传给 string 参数，要用 [NullString]::Value
+            $h = [Win]::FindWindow([NullString]::Value, '出口 IP 网络控制 - egress-guard')
             $r = New-Object Win+RECT
             if ($h -ne [IntPtr]::Zero -and [Win]::GetWindowRect($h, [ref]$r)) {
               [Win]::SetForegroundWindow($h) | Out-Null
