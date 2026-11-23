@@ -266,9 +266,18 @@ pub fn run(opts: Options) -> Result<()> {
             let reporter: engine::Reporter = {
                 let status = status.clone();
                 let ctx = ctx.clone();
+                // 托盘只在显示的内容变了时更新
+                let last_tray: Mutex<Option<tray::TrayState>> = Mutex::new(None);
                 Arc::new(move |s: &Status| {
                     *status.lock().unwrap() = s.clone();
-                    let _ = tray_tx.send(tray_state(s));
+                    let t = tray_state(s);
+                    let mut last = last_tray.lock().unwrap();
+                    if last.as_ref() != Some(&t) {
+                        let _ = tray_tx.send(tray_state(s));
+                        *last = Some(t);
+                        tray::wake();
+                    }
+                    drop(last);
                     ctx.request_repaint();
                 })
             };
