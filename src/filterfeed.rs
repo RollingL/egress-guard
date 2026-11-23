@@ -25,6 +25,8 @@ pub struct FilterState {
     pub inspect_existing: bool,
     /// 要阻断的程序：可执行文件完整路径，或 `.app` 应用包（包内全部程序都算）。
     pub apps: Vec<String>,
+    /// 放行期间也阻断受控应用的 IPv6 连接（「始终阻断 IPv6」）。
+    pub block_ipv6: bool,
 }
 
 /// 网络扩展连接时报告的信息。
@@ -152,6 +154,7 @@ impl FeedFirewall {
             blocked: self.blocked,
             inspect_existing: self.rules.kill_existing_tcp,
             apps: self.rules.apps.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            block_ipv6: self.rules.block_ipv6,
         });
     }
 
@@ -269,6 +272,7 @@ mod tests {
             apps: vec!["/Applications/A.app".into()],
             block_all: None,
             kill_existing_tcp: true,
+            block_ipv6: false,
         })
         .unwrap();
         assert_eq!(hub.wait_newer(0, Duration::from_millis(1)).0, 0, "做出第一次决定之前不推送");
@@ -296,10 +300,10 @@ mod tests {
 
     #[test]
     fn json_shape() {
-        let s = FilterState { blocked: true, inspect_existing: false, apps: vec!["/Applications/A.app".into()] };
+        let s = FilterState { blocked: true, inspect_existing: false, apps: vec!["/Applications/A.app".into()], block_ipv6: false };
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
-            r#"{"blocked":true,"inspect_existing":false,"apps":["/Applications/A.app"]}"#
+            r#"{"blocked":true,"inspect_existing":false,"apps":["/Applications/A.app"],"block_ipv6":false}"#
         );
     }
 }

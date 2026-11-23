@@ -11,12 +11,35 @@ pub struct IfAddr {
     pub ip: IpAddr,
 }
 
-#[cfg(unix)]
+/// 一块已启用的网卡（不含回环）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Adapter {
+    /// 与 [`IfAddr::name`] 相同。
+    pub name: String,
+    /// Windows 上的网卡描述（如「WireGuard Tunnel」「TAP-Windows Adapter V9」）；其他平台为空。
+    pub description: String,
+    /// Windows 上的接口类型（IF_TYPE_*）；其他平台为 0。
+    pub if_type: u32,
+    pub addrs: Vec<IpAddr>,
+}
+
+/// 已启用网卡上的地址（不含回环）。
 pub fn list() -> Vec<IfAddr> {
+    adapters()
+        .into_iter()
+        .flat_map(|a| {
+            let name = a.name;
+            a.addrs.into_iter().map(move |ip| IfAddr { name: name.clone(), ip })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+pub fn adapters() -> Vec<Adapter> {
     use std::ffi::CStr;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    let mut out = Vec::new();
+    let mut out: Vec<Adapter> = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs 分配的链表在 freeifaddrs 之前一直有效；只读取其中的地址结构。
     unsafe {
@@ -43,7 +66,10 @@ pub fn list() -> Vec<IfAddr> {
                 _ => continue,
             };
             let name = CStr::from_ptr(i.ifa_name).to_string_lossy().into_owned();
-            out.push(IfAddr { name, ip });
+            match out.iter_mut().find(|a| a.name == name) {
+                Some(a) => a.addrs.push(ip),
+                None => out.push(Adapter { name, description: String::new(), if_type: 0, addrs: vec![ip] }),
+            }
         }
         libc::freeifaddrs(ifap);
     }
@@ -51,7 +77,7 @@ pub fn list() -> Vec<IfAddr> {
 }
 
 #[cfg(windows)]
-pub fn list() -> Vec<IfAddr> {
+pub fn adapters() -> Vec<Adapter> {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -94,7 +120,12 @@ pub fn list() -> Vec<IfAddr> {
             if a.OperStatus != IfOperStatusUp || a.IfType == IF_TYPE_SOFTWARE_LOOPBACK {
                 continue;
             }
-            let name = a.FriendlyName.to_string().unwrap_or_default();
+            let mut adapter = Adapter {
+                name: a.FriendlyName.to_string().unwrap_or_default(),
+                description: a.Description.to_string().unwrap_or_default(),
+                if_type: a.IfType,
+                addrs: Vec::new(),
+            };
             let mut u = a.FirstUnicastAddress;
             while !u.is_null() {
                 let ua = &*u;
@@ -112,15 +143,16 @@ pub fn list() -> Vec<IfAddr> {
                 } else {
                     continue;
                 };
-                out.push(IfAddr { name: name.clone(), ip });
+                adapter.addrs.push(ip);
             }
+            out.push(adapter);
         }
     }
     out
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn list() -> Vec<IfAddr> {
+pub fn adapters() -> Vec<Adapter> {
     Vec::new()
 }
 

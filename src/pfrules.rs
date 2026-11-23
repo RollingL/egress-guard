@@ -19,6 +19,40 @@ pub const ANCHOR: &str = "com.apple/egress-guard";
 /// 运行出口 IP 检测子进程的用户。
 pub const PROBE_USER: &str = "nobody";
 
+/// 生成「始终阻断 IPv6」的规则文本：放行期间只切断 IPv6（例外与全局断网相同），IPv4 不受影响。
+pub fn render_v6(policy: &BlockAllPolicy) -> String {
+    let mut s = String::from("# egress-guard：始终阻断 IPv6\n");
+    let mut line = |l: &str| {
+        s.push_str(l);
+        s.push('\n');
+    };
+    line("pass quick on lo0 all no state");
+    line(&format!(
+        "pass out quick inet6 proto udp from any port {DHCP_V6_CLIENT_PORT} to any port 547 no state"
+    ));
+    line(&format!(
+        "pass in quick inet6 proto udp from any port 547 to any port {DHCP_V6_CLIENT_PORT} no state"
+    ));
+    line("pass quick inet6 proto ipv6-icmp all icmp6-type { routersol, routeradv, neighbrsol, neighbradv } no state");
+    if policy.allow_dns {
+        line(&format!("pass out quick inet6 proto {{ tcp, udp }} from any to any port {DNS_PORT} no state"));
+        line(&format!("pass in quick inet6 proto {{ tcp, udp }} from any port {DNS_PORT} to any no state"));
+    }
+    let mut nets: Vec<String> = Vec::new();
+    if policy.allow_lan {
+        nets.extend(lan_nets().iter().filter(|n| matches!(n, ipnet::IpNet::V6(_))).map(|n| n.to_string()));
+    }
+    nets.extend(policy.allow_remote.iter().filter(|n| matches!(n, ipnet::IpNet::V6(_))).map(|n| n.trunc().to_string()));
+    if !nets.is_empty() {
+        let list = nets.join(", ");
+        line(&format!("pass out quick inet6 from any to {{ {list} }} no state"));
+        line(&format!("pass in quick inet6 from {{ {list} }} to any no state"));
+    }
+    line("block drop out quick inet6 all");
+    line("block drop in quick inet6 all");
+    s
+}
+
 /// 生成全局断网的规则文本。
 pub fn render(policy: &BlockAllPolicy) -> String {
     let mut s = String::from("# egress-guard：出口 IP 不在白名单内，切断全部网络\n");
@@ -123,6 +157,28 @@ mod tests {
         assert!(text.contains("pass out quick from any to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"));
         assert!(text.contains("198.51.100.7/32, 2001:db8::/32 }"));
         assert!(text.contains("pass in quick from { 10.0.0.0/8"));
+    }
+
+    #[test]
+    fn ipv6_only() {
+        let p = BlockAllPolicy {
+            allow_lan: true,
+            allow_dns: true,
+            allow_apps: vec![],
+            allow_remote: vec!["198.51.100.7/32".parse().unwrap(), "2001:db8::/32".parse().unwrap()],
+        };
+        let text = render_v6(&p);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        // 除了回环，每条规则都只针对 IPv6，IPv4 不受影响
+        assert!(lines.iter().filter(|l| !l.contains(" on lo0 ")).all(|l| l.contains(" inet6 ")), "{text}");
+        assert!(lines.iter().all(|l| l.contains(" quick ")));
+        assert!(!text.contains("198.51.100.7") && !text.contains("192.168.0.0/16"));
+        assert!(text.contains("{ fe80::/10, fc00::/7, ff00::/8, 2001:db8::/32 }"), "{text}");
+        assert!(text.contains("neighbrsol"));
+        assert_eq!(lines[lines.len() - 2], "block drop out quick inet6 all");
+        assert_eq!(lines[lines.len() - 1], "block drop in quick inet6 all");
+        let strict = render_v6(&BlockAllPolicy::default());
+        assert!(!strict.contains("port 53") && !strict.contains("fe80::/10"));
     }
 
     #[test]

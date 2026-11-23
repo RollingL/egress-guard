@@ -35,9 +35,21 @@ func unitTests() {
     check(allowed.decide(["/usr/local/bin/tool"]) == .allow, "关闭「断开已有连接」后直接放行")
     check(FilterRules.allowAll.decide(["/usr/local/bin/tool"]) == .allow, "没有规则时放行")
 
+    var v6 = FilterRules(blocked: false, inspectExisting: false, apps: ["/usr/local/bin/tool"], blockIPv6: true)
+    check(v6.decide(["/usr/local/bin/tool"], remoteIPv6: true) == .block, "始终阻断 IPv6：放行期间受控应用的 IPv6 连接被丢弃")
+    check(v6.decide(["/usr/local/bin/tool"], remoteIPv6: false) == .allow, "始终阻断 IPv6：IPv4 照常放行")
+    check(v6.decide(["/usr/bin/curl"], remoteIPv6: true) == .allow, "始终阻断 IPv6：不受控的程序不受影响")
+    v6.blockIPv6 = false
+    check(v6.decide(["/usr/local/bin/tool"], remoteIPv6: true) == .allow, "关闭后 IPv6 照常放行")
+    check(FilterRules.isIPv6(host: "2001:db8::1"), "IPv6 地址")
+    check(!FilterRules.isIPv6(host: "::ffff:192.0.2.1"), "IPv4 映射地址不算 IPv6")
+    check(!FilterRules.isIPv6(host: "192.0.2.1"), "IPv4 地址")
+
     let line = Data(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":["/Applications/A.app"]}}"#.utf8)
     let p = FilterRules.parse(line: line)
     check(p == FilterRules(blocked: true, inspectExisting: false, apps: ["/applications/a.app"]), "解析后台服务的规则")
+    let line6 = Data(#"{"kind":"filter","data":{"blocked":false,"inspect_existing":false,"apps":[],"block_ipv6":true}}"#.utf8)
+    check(FilterRules.parse(line: line6)?.blockIPv6 == true, "解析 block_ipv6")
     check(FilterRules.parse(line: Data(#"{"kind":"status","data":{}}"#.utf8)) == nil, "忽略其他回复")
     check(FilterRules.parseError(line: Data(#"{"kind":"err","data":"只接受 root"}"#.utf8)) == "只接受 root", "解析错误回复")
     check(FilterRules.parse(line: Data("garbage".utf8)) == nil, "无法解析的行")

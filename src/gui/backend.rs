@@ -10,6 +10,7 @@ use anyhow::{bail, Result};
 
 use crate::config::{Config, RawConfig};
 use crate::engine::{EngineHandle, Event};
+use crate::eventlog::{self, ConnEvent};
 use crate::logbuf;
 
 /// macOS 后台服务的状态。
@@ -30,6 +31,11 @@ pub trait Backend: Send + Sync {
     fn apply(&self, cfg: &Config) -> Result<()>;
     fn logs(&self) -> Vec<String>;
     fn clear_logs(&self);
+    /// 连接记录（阻断、恢复、泄露），从旧到新。
+    fn events(&self) -> Vec<ConnEvent>;
+    fn clear_events(&self) -> Result<()>;
+    /// 写入一条泄露测试的结果。
+    fn record_event(&self, e: ConnEvent);
     /// 完整日志文件的位置。
     fn log_location(&self) -> Option<String>;
     fn config_location(&self) -> String;
@@ -86,6 +92,19 @@ impl Backend for Local {
         logbuf::clear();
     }
 
+    fn events(&self) -> Vec<ConnEvent> {
+        eventlog::recent()
+    }
+
+    fn clear_events(&self) -> Result<()> {
+        eventlog::clear();
+        Ok(())
+    }
+
+    fn record_event(&self, e: ConnEvent) {
+        eventlog::record(e);
+    }
+
     fn log_location(&self) -> Option<String> {
         crate::exe_dir().map(|d| d.join("egress-guard.log").display().to_string())
     }
@@ -127,6 +146,7 @@ mod remote {
     use super::{Backend, ServiceState};
     use crate::config::{Config, RawConfig};
     use crate::engine::Status;
+    use crate::eventlog::ConnEvent;
     use crate::ipc::{Client, HelloInfo, Request};
     use crate::mac::{paths, service};
 
@@ -138,6 +158,7 @@ mod remote {
         last_error: Mutex<String>,
         new_config: Mutex<Option<RawConfig>>,
         logs: Mutex<(Option<Instant>, Vec<String>)>,
+        events: Mutex<(Option<Instant>, Vec<ConnEvent>)>,
     }
 
     impl Remote {
@@ -149,6 +170,7 @@ mod remote {
                 last_error: Mutex::new(String::new()),
                 new_config: Mutex::new(None),
                 logs: Mutex::new((None, Vec::new())),
+                events: Mutex::new((None, Vec::new())),
             });
             // 先同步取一次配置，界面打开时就能显示
             if service::is_installed() {
@@ -236,6 +258,32 @@ mod remote {
         fn clear_logs(&self) {
             let _ = self.client.command(&Request::ClearLogs, T);
             *self.logs.lock().unwrap() = (None, Vec::new());
+        }
+
+        fn events(&self) -> Vec<ConnEvent> {
+            // 连接记录页每帧都会取；最多每 2 秒向服务请求一次
+            let mut g = self.events.lock().unwrap();
+            if g.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+                g.0 = Some(Instant::now());
+                match self.client.events() {
+                    Ok(l) => g.1 = l,
+                    Err(e) => log::debug!("无法读取连接记录: {e:#}"),
+                }
+            }
+            g.1.clone()
+        }
+
+        fn clear_events(&self) -> Result<()> {
+            self.client.command(&Request::ClearEvents, T)?;
+            *self.events.lock().unwrap() = (None, Vec::new());
+            Ok(())
+        }
+
+        fn record_event(&self, e: ConnEvent) {
+            if let Err(err) = self.client.command(&Request::RecordEvent(Box::new(e)), T) {
+                log::warn!("无法写入连接记录: {err:#}");
+            }
+            self.events.lock().unwrap().0 = None;
         }
 
         fn log_location(&self) -> Option<String> {

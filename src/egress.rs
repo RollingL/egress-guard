@@ -4,26 +4,62 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use ureq::config::IpFamily;
 use ureq::tls::{TlsConfig, TlsProvider};
 use ureq::Agent;
+
+/// 检测用的地址族。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// 按系统默认（通常 IPv6 优先、不通时用 IPv4），依次尝试各服务。
+    Any,
+    /// 只走 IPv6，同时请求各服务，第一个成功的结果生效（IPv6 不通时尽快结束）。
+    V6,
+}
+
+impl Family {
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Any => "any",
+            Family::V6 => "v6",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "any" => Some(Family::Any),
+            "v6" => Some(Family::V6),
+            _ => None,
+        }
+    }
+}
 
 pub struct EgressDetector {
     agent: Agent,
     services: Vec<String>,
+    family: Family,
     #[cfg_attr(windows, allow(dead_code))]
     timeout: Duration,
 }
 
 impl EgressDetector {
     pub fn new(services: Vec<String>, timeout: Duration) -> Self {
+        Self::with_family(services, timeout, Family::Any)
+    }
+
+    pub fn with_family(services: Vec<String>, timeout: Duration, family: Family) -> Self {
         let agent: Agent = Agent::config_builder()
             // 使用系统 TLS（Windows 上为 SChannel，macOS 上为 Security.framework），无需额外证书
             .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
             .timeout_global(Some(timeout))
-            .user_agent("egress-guard/0.6")
+            .ip_family(match family {
+                Family::Any => IpFamily::Any,
+                Family::V6 => IpFamily::Ipv6Only,
+            })
+            .user_agent(concat!("egress-guard/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent, services, timeout }
+        Self { agent, services, family, timeout }
     }
 
     /// 检测出口 IP。
@@ -57,6 +93,8 @@ impl EgressDetector {
             .arg("probe")
             .arg("--timeout")
             .arg(self.timeout.as_secs().max(1).to_string())
+            .arg("--family")
+            .arg(self.family.name())
             .args(&self.services)
             .uid(uid)
             .gid(gid)
@@ -67,8 +105,9 @@ impl EgressDetector {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("无法启动检测子进程: {e}"))?;
-        // 每个服务最多 timeout，再留一些余量
-        let deadline = Instant::now() + self.timeout * (self.services.len() as u32).max(1) + Duration::from_secs(5);
+        // 每个服务最多 timeout（IPv6 同时请求，总共最多 timeout），再留一些余量
+        let n = if self.family == Family::V6 { 1 } else { (self.services.len() as u32).max(1) };
+        let deadline = Instant::now() + self.timeout * n + Duration::from_secs(5);
         loop {
             if child.try_wait()?.is_some() {
                 break;
@@ -92,8 +131,11 @@ impl EgressDetector {
         Err(anyhow!("{}", msg.trim()))
     }
 
-    /// 依次尝试各服务，返回第一个成功解析的出口 IP。
+    /// 依次尝试各服务（IPv6 时同时请求），返回第一个成功解析的出口 IP。
     pub fn detect_direct(&self) -> Result<IpAddr> {
+        if self.family == Family::V6 {
+            return self.detect_parallel();
+        }
         let mut errors = Vec::new();
         for url in &self.services {
             match self.query(url) {
@@ -110,17 +152,39 @@ impl EgressDetector {
         Err(anyhow!("所有出口 IP 服务均失败: {}", errors.join("; ")))
     }
 
-    fn query(&self, url: &str) -> Result<IpAddr> {
-        let body = self
-            .agent
-            .get(url)
-            .call()?
-            .body_mut()
-            .with_config()
-            .limit(4096)
-            .read_to_string()?;
-        extract_ip(&body).ok_or_else(|| anyhow!("响应中没有 IP: {:?}", truncate(&body)))
+    /// 同时请求所有服务，第一个成功的结果立即返回（其余请求在后台自行超时结束）；全部失败时返回所有错误。
+    fn detect_parallel(&self) -> Result<IpAddr> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for url in &self.services {
+            let (tx, agent, url) = (tx.clone(), self.agent.clone(), url.clone());
+            std::thread::spawn(move || {
+                let r = query(&agent, &url);
+                let _ = tx.send((url, r));
+            });
+        }
+        drop(tx);
+        let mut errors = Vec::new();
+        for (url, r) in rx.iter() {
+            match r {
+                Ok(ip) if self.family != Family::V6 || ip.is_ipv6() => {
+                    log::debug!("{url} 返回出口 IP {ip}");
+                    return Ok(ip);
+                }
+                Ok(ip) => errors.push(format!("{url}: 返回的不是 IPv6 地址（{ip}）")),
+                Err(e) => errors.push(format!("{url}: {e}")),
+            }
+        }
+        Err(anyhow!("所有出口 IP 服务均失败: {}", errors.join("; ")))
     }
+
+    fn query(&self, url: &str) -> Result<IpAddr> {
+        query(&self.agent, url)
+    }
+}
+
+fn query(agent: &Agent, url: &str) -> Result<IpAddr> {
+    let body = agent.get(url).call()?.body_mut().with_config().limit(4096).read_to_string()?;
+    extract_ip(&body).ok_or_else(|| anyhow!("响应中没有 IP: {:?}", truncate(&body)))
 }
 
 /// 从响应文本中提取第一个合法 IP。兼容纯文本（"1.2.3.4\n"）

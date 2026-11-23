@@ -74,7 +74,7 @@ fn build_netext_bridge() {
         println!("cargo:rustc-link-search=native={}", d.display());
     }
     println!("cargo:rustc-link-search=native={sdk}/usr/lib/swift");
-    for fw in ["Foundation", "NetworkExtension", "SystemExtensions", "Security"] {
+    for fw in ["Foundation", "NetworkExtension", "SystemExtensions", "Security", "UserNotifications"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");

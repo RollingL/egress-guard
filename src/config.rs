@@ -43,9 +43,83 @@ pub struct RawConfig {
     pub block_all: BlockAllConfig,
     #[serde(default)]
     pub leak_test: LeakTestConfig,
+    #[serde(default)]
+    pub vpn: VpnConfig,
+    #[serde(default)]
+    pub ipv6: Ipv6Config,
+    #[serde(default)]
+    pub update: UpdateConfig,
 }
 
-/// 泄露测试（DNS、WebRTC）。只在手动点「开始测试」或运行 `egress-guard leak-test` 时使用。
+/// VPN 守护：放行时记下正在使用的 VPN 网卡，它一断开就立即阻断，不等下一次出口 IP 检测。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct VpnConfig {
+    /// VPN 断开时立即阻断。
+    pub guard: bool,
+    /// 要守护的 VPN 网卡名称（不区分大小写；Windows 也可以填网卡描述）。为空时自动识别。
+    pub interfaces: Vec<String>,
+    /// 通过 VPN 放行期间的出口 IP 检测间隔（秒），比平时更勤，0 表示与平时相同。
+    pub check_interval_secs: u64,
+}
+
+impl Default for VpnConfig {
+    fn default() -> Self {
+        Self { guard: true, interfaces: Vec::new(), check_interval_secs: 15 }
+    }
+}
+
+/// IPv6 的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Ipv6Mode {
+    /// 另外检测 IPv6 出口：本机能直连 IPv6、而它的出口不在白名单时也阻断（默认）。
+    #[default]
+    Check,
+    /// 始终阻断 IPv6（受控应用，或开启全局断网时的全部 IPv6），IPv4 照常按白名单放行。
+    /// 适合不支持 IPv6 的 VPN：IPv6 流量会绕过 VPN 直接出去。
+    Block,
+    /// 不单独处理 IPv6（0.8 及以前的行为）。
+    Off,
+}
+
+/// IPv6 防护。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Ipv6Config {
+    pub mode: Ipv6Mode,
+    /// 只走 IPv6 的出口 IP 查询服务（同时尝试，第一个成功的结果生效）。
+    pub services: Vec<String>,
+}
+
+impl Default for Ipv6Config {
+    fn default() -> Self {
+        Self {
+            mode: Ipv6Mode::Check,
+            services: vec!["https://6.ipw.cn".into(), "https://api6.ipify.org".into(), "https://v6.ident.me".into()],
+        }
+    }
+}
+
+/// 检查新版本（界面使用）。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpdateConfig {
+    /// 启动时和之后每天检查一次 GitHub 上的最新发布版本。
+    pub check: bool,
+    /// GitHub 仓库（owner/name）。
+    pub repo: String,
+    /// 访问令牌（仓库是私有的时候需要，只要 Contents 只读权限）。
+    pub token: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true, repo: "RollingL/egress-guard".into(), token: String::new() }
+    }
+}
+
+/// 泄露测试（DNS、WebRTC）：手动点「开始测试」、运行 `egress-guard leak-test`，或者由界面自动运行。
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LeakTestConfig {
@@ -59,6 +133,12 @@ pub struct LeakTestConfig {
     pub dns_sources: Vec<String>,
     /// WebRTC 泄露测试用的 STUN 服务器（主机:端口），按顺序尝试。
     pub stun_servers: Vec<String>,
+    /// 网络变化后、出口刚回到白名单时自动测试一次（界面运行时）。
+    pub auto_after_change: bool,
+    /// 放行期间每隔多少分钟自动测试一次，0 表示不定时测试。
+    pub interval_mins: u64,
+    /// 自动测试发现泄露时发系统通知。
+    pub notify: bool,
 }
 
 impl Default for LeakTestConfig {
@@ -73,6 +153,9 @@ impl Default for LeakTestConfig {
                 "stun.l.google.com:19302".into(),
                 "stun.miwifi.com:3478".into(),
             ],
+            auto_after_change: true,
+            interval_mins: 60,
+            notify: true,
         }
     }
 }
@@ -205,6 +288,9 @@ pub struct Config {
     pub children: ChildrenConfig,
     pub block_all: BlockAllConfig,
     pub leak_test: LeakTestConfig,
+    pub vpn: VpnConfig,
+    pub ipv6: Ipv6Config,
+    pub update: UpdateConfig,
 }
 
 impl Config {
@@ -284,6 +370,25 @@ impl Config {
         for s in &leak_test.stun_servers {
             crate::leaktest::stun::split_host_port(s).with_context(|| format!("STUN 服务器有误: {s:?}"))?;
         }
+        let mut vpn = raw.vpn;
+        let mut names: Vec<String> = Vec::new();
+        for n in vpn.interfaces.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                names.push(n.to_owned());
+            }
+        }
+        vpn.interfaces = names;
+        let mut ipv6 = raw.ipv6;
+        ipv6.services.retain(|s| !s.trim().is_empty());
+        if ipv6.mode == Ipv6Mode::Check && ipv6.services.is_empty() {
+            bail!("检测 IPv6 出口需要至少一个 IPv6 查询服务");
+        }
+        let mut update = raw.update;
+        update.repo = update.repo.trim().trim_matches('/').to_owned();
+        update.token = update.token.trim().to_owned();
+        if update.check && !crate::update::valid_repo(&update.repo) {
+            bail!("检查更新的仓库应为 owner/name 的形式: {:?}", update.repo);
+        }
         Ok(Self {
             whitelist,
             apps: raw.apps,
@@ -293,6 +398,9 @@ impl Config {
             children: raw.children,
             block_all,
             leak_test,
+            vpn,
+            ipv6,
+            update,
         })
     }
 
@@ -307,6 +415,9 @@ impl Config {
             children: self.children.clone(),
             block_all: self.block_all.clone(),
             leak_test: self.leak_test.clone(),
+            vpn: self.vpn.clone(),
+            ipv6: self.ipv6.clone(),
+            update: self.update.clone(),
         }
     }
 
@@ -461,6 +572,28 @@ apps = ['C:\Program Files\App\app.exe']
         assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndnscheck_zone=\"a b\"")).is_err());
         let cfg = Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"Fastly\", \"dnscheck\", \"fastly\", \"nope\"]")).unwrap();
         assert_eq!(cfg.leak_test.dns_sources, vec!["fastly", "dnscheck"]);
+    }
+
+    #[test]
+    fn new_sections() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert!(cfg.vpn.guard && cfg.vpn.interfaces.is_empty());
+        assert_eq!(cfg.ipv6.mode, Ipv6Mode::Check);
+        assert!(!cfg.ipv6.services.is_empty());
+        assert!(cfg.update.check && cfg.update.repo == "RollingL/egress-guard");
+        assert!(cfg.leak_test.auto_after_change && cfg.leak_test.notify);
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[vpn]\ninterfaces=[\" utun4 \", \"\"]\n[ipv6]\nmode=\"block\"\nservices=[]\n[update]\nrepo=\" a/b/ \""
+        ))
+        .unwrap();
+        assert_eq!(cfg.vpn.interfaces, vec!["utun4"]);
+        assert_eq!(cfg.ipv6.mode, Ipv6Mode::Block);
+        assert_eq!(cfg.update.repo, "a/b");
+        // 检测 IPv6 出口时必须有查询服务
+        assert!(Config::parse(&format!("{SAMPLE}\n[ipv6]\nservices=[]")).is_err());
+        assert!(Config::parse(&format!("{SAMPLE}\n[update]\nrepo=\"nope\"")).is_err());
+        // 关闭检查更新时仓库可以留空
+        assert!(Config::parse(&format!("{SAMPLE}\n[update]\ncheck=false\nrepo=\"\"")).is_ok());
     }
 
     #[test]

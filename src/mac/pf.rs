@@ -4,6 +4,7 @@
 //! - 阻断时用 `pfctl -E` 取得启用令牌，放行时用 `pfctl -X` 归还；pf 原本是否开启都不受影响。
 //! - pf 规则不随进程退出自动消失：正常退出、收到 SIGTERM 时会清空；异常退出后由 launchd 重启服务，
 //!   启动时先清空残留规则。也可以手动执行 `sudo egress-guard unblock`。
+//! - 「始终阻断 IPv6」且开启了全局断网时，放行期间也装着只针对 IPv6 的规则（见 `pfrules::render_v6`）。
 //! - pf 只能按地址/端口/用户过滤，**不能按应用**区分：受控应用由网络扩展负责（见 `mac::firewall`），
 //!   例外程序在这里不生效。
 
@@ -24,6 +25,8 @@ pub struct PfFirewall {
     token: Option<String>,
     /// 已经提示过的限制，避免日志刷屏。
     warned_allow_apps: bool,
+    /// set_rules 已经调用过（启动时第一次要同步）。
+    synced_once: bool,
 }
 
 fn pfctl(args: &[&str], stdin: Option<&str>) -> Result<String> {
@@ -76,6 +79,7 @@ impl PfFirewall {
             rules: Rules::default(),
             token: None,
             warned_allow_apps: false,
+            synced_once: false,
         })
     }
 
@@ -119,6 +123,15 @@ impl PfFirewall {
                 log::info!("pf 规则已生效（{}）", pfrules::summary(&policy));
                 Ok(())
             }
+            // 放行期间「始终阻断 IPv6」：只装 IPv6 的规则
+            (Some(policy), false) if self.rules.block_ipv6 => {
+                let text = pfrules::render_v6(&policy);
+                log::debug!("装入 pf 规则:\n{text}");
+                pfctl(&["-a", ANCHOR, "-f", "-"], Some(&text))?;
+                self.enable()?;
+                log::info!("pf 规则已生效：始终阻断 IPv6（{}）", pfrules::summary(&policy));
+                Ok(())
+            }
             _ => {
                 flush_anchor()?;
                 self.release();
@@ -144,10 +157,13 @@ impl Firewall for PfFirewall {
     }
 
     fn set_rules(&mut self, rules: Rules) -> Result<()> {
-        let changed = rules.block_all != self.rules.block_all;
+        let changed = rules.block_all != self.rules.block_all || rules.block_ipv6 != self.rules.block_ipv6;
+        // 第一次设置规则时（启动）也同步一次：「始终阻断 IPv6」在放行状态下也要生效
+        let first = !self.synced_once;
+        self.synced_once = true;
         self.rules = rules;
         self.warn_limits();
-        if changed && self.blocked {
+        if changed || first {
             self.sync()?;
         }
         Ok(())

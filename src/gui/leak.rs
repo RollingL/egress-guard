@@ -4,6 +4,7 @@
 //! 结果按正在编辑的白名单、可信解析器实时重新判定，点「信任」后立即变色。
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -12,6 +13,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText}
 use super::theme::{self, Palette};
 use super::{empty_state, info_card, warning_card, App};
 use crate::leaktest::dns::{self, DnsReport, HttpSource};
+use crate::config::LeakTestConfig;
 use crate::leaktest::webrtc::{self, WebRtcReport};
 use crate::leaktest::{self, Judge, Level, Trusted, Verdict};
 
@@ -24,30 +26,176 @@ pub(super) enum Task<T> {
 
 type Shared<T> = Arc<Mutex<Task<T>>>;
 
-pub(super) struct LeakUi {
-    dns: Shared<Result<DnsReport, String>>,
-    webrtc: Shared<WebRtcReport>,
-    new_trusted: String,
-    trusted_error: Option<String>,
-    stun_text: String,
+/// 一次测试（手动或自动）之外的信息。
+#[derive(Default)]
+pub(super) struct JobMeta {
     /// 开始测试时的出口 IP。
-    tested_egress: Option<IpAddr>,
+    pub egress: Option<IpAddr>,
+    /// 这次测试是自动运行的。
+    pub auto: bool,
+    /// 上次测试完成的时刻。
+    pub finished: Option<Instant>,
 }
 
-impl LeakUi {
-    pub(super) fn new(stun: &[String]) -> Self {
+/// 测试完成后的结论（按开始测试时的白名单判定）。
+pub(super) struct Outcome {
+    /// DNS 测试的级别与一句话结论；测试失败时为 Err。
+    pub dns: Result<(Level, String), String>,
+    pub webrtc: (Level, String),
+    pub egress: Option<IpAddr>,
+}
+
+impl Outcome {
+    /// 发现泄露时的说明（DNS、WebRTC 合在一起）。
+    pub fn leak_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Ok((Level::Leak, t)) = &self.dns {
+            parts.push(format!("DNS：{t}"));
+        }
+        if self.webrtc.0 == Level::Leak {
+            parts.push(format!("WebRTC：{}", self.webrtc.1));
+        }
+        (!parts.is_empty()).then(|| parts.join("；"))
+    }
+}
+
+type Done = Box<dyn FnOnce(Outcome) + Send>;
+
+/// 测试的进度与结果。界面（手动）和自动测试线程共用同一份，结果都显示在「泄露测试」页。
+#[derive(Clone)]
+pub(super) struct LeakJob {
+    dns: Shared<Result<DnsReport, String>>,
+    webrtc: Shared<WebRtcReport>,
+    pub meta: Arc<Mutex<JobMeta>>,
+}
+
+impl LeakJob {
+    fn new() -> Self {
         Self {
             dns: Arc::new(Mutex::new(Task::Idle)),
             webrtc: Arc::new(Mutex::new(Task::Idle)),
-            new_trusted: String::new(),
-            trusted_error: None,
-            stun_text: stun.join("\n"),
-            tested_egress: None,
+            meta: Arc::new(Mutex::new(JobMeta::default())),
         }
     }
 
     pub(super) fn running(&self) -> bool {
         matches!(*self.dns.lock().unwrap(), Task::Running { .. }) || matches!(*self.webrtc.lock().unwrap(), Task::Running { .. })
+    }
+
+    /// 开始测试（DNS、WebRTC 同时进行），两项都完成后调用 `done`。已经在测试时返回 false。
+    pub(super) fn start(
+        &self,
+        lt: LeakTestConfig,
+        judge: Judge,
+        egress: Option<IpAddr>,
+        auto: bool,
+        ctx: egui::Context,
+        done: impl FnOnce(Outcome) + Send + 'static,
+    ) -> bool {
+        {
+            // 先占住两项，避免界面和自动测试同时开始
+            let mut d = self.dns.lock().unwrap();
+            let mut w = self.webrtc.lock().unwrap();
+            if matches!(*d, Task::Running { .. }) || matches!(*w, Task::Running { .. }) {
+                return false;
+            }
+            *d = Task::Running { since: Instant::now(), progress: 0 };
+            *w = Task::Running { since: Instant::now(), progress: 0 };
+        }
+        {
+            let mut m = self.meta.lock().unwrap();
+            m.egress = egress;
+            m.auto = auto;
+        }
+        log::info!(
+            "开始{}泄露测试（出口 IP {}）",
+            if auto { "自动" } else { "" },
+            egress.map(|i| i.to_string()).unwrap_or_else(|| "未知".into())
+        );
+
+        // 后完成的那个线程汇总结论
+        let remaining = Arc::new(AtomicUsize::new(2));
+        let done: Arc<Mutex<Option<Done>>> = Arc::new(Mutex::new(Some(Box::new(done))));
+        let finish = {
+            let job = self.clone();
+            let ctx = ctx.clone();
+            move |remaining: &AtomicUsize, done: &Mutex<Option<Done>>| {
+                if remaining.fetch_sub(1, Ordering::SeqCst) != 1 {
+                    return;
+                }
+                job.meta.lock().unwrap().finished = Some(Instant::now());
+                let dns = match &*job.dns.lock().unwrap() {
+                    Task::Done { result: Ok(r), .. } => Ok(leaktest::dns_summary(r)),
+                    Task::Done { result: Err(e), .. } => Err(e.clone()),
+                    _ => Err("未完成".into()),
+                };
+                let webrtc = match &*job.webrtc.lock().unwrap() {
+                    Task::Done { result, .. } => leaktest::webrtc_summary(result),
+                    _ => (Level::Ok, String::new()),
+                };
+                if let Some(f) = done.lock().unwrap().take() {
+                    f(Outcome { dns, webrtc, egress });
+                }
+                ctx.request_repaint();
+            }
+        };
+
+        {
+            let (task, ctx, judge, lt) = (self.dns.clone(), ctx.clone(), judge.clone(), lt.clone());
+            let (remaining, done, finish) = (remaining.clone(), done.clone(), finish.clone());
+            std::thread::Builder::new()
+                .name("dns-leak-test".into())
+                .spawn(move || {
+                    let progress = |n: u32| {
+                        if let Task::Running { progress, .. } = &mut *task.lock().unwrap() {
+                            *progress = n;
+                        }
+                        ctx.request_repaint();
+                    };
+                    let zone = lt.dnscheck_zone.trim().trim_matches('.').to_ascii_lowercase();
+                    let r = if leaktest::valid_zone(&zone) {
+                        dns::run(&zone, &lt.dns_sources, egress, &judge, &progress)
+                    } else {
+                        Err(anyhow::anyhow!("DNS 测试服务的域名有误：{:?}", lt.dnscheck_zone))
+                    };
+                    match &r {
+                        Ok(r) => log::info!("DNS 泄露测试：{}", leaktest::dns_summary(r).1),
+                        Err(e) => log::warn!("DNS 泄露测试失败：{e:#}"),
+                    }
+                    *task.lock().unwrap() =
+                        Task::Done { at: crate::logbuf::now_hms(), result: r.map_err(|e| format!("{e:#}")) };
+                    ctx.request_repaint();
+                    finish(&remaining, &done);
+                })
+                .expect("无法创建测试线程");
+        }
+        {
+            let (task, ctx) = (self.webrtc.clone(), ctx.clone());
+            std::thread::Builder::new()
+                .name("webrtc-leak-test".into())
+                .spawn(move || {
+                    let r = webrtc::run(&lt.stun_servers, egress, &judge);
+                    log::info!("WebRTC 泄露测试：{}", leaktest::webrtc_summary(&r).1);
+                    *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
+                    ctx.request_repaint();
+                    finish(&remaining, &done);
+                })
+                .expect("无法创建测试线程");
+        }
+        true
+    }
+}
+
+pub(super) struct LeakUi {
+    pub(super) job: LeakJob,
+    new_trusted: String,
+    trusted_error: Option<String>,
+    stun_text: String,
+}
+
+impl LeakUi {
+    pub(super) fn new(stun: &[String]) -> Self {
+        Self { job: LeakJob::new(), new_trusted: String::new(), trusted_error: None, stun_text: stun.join("\n") }
     }
 
     /// 撤销修改时恢复 STUN 服务器的文本框。
@@ -143,60 +291,13 @@ fn item_row(ui: &mut egui::Ui, p: &Palette, main: &str, sub: &str, right: impl F
 }
 
 impl App {
-    /// 开始测试（DNS、WebRTC 同时进行）。
+    /// 手动开始测试（按正在编辑的设置）。
     pub(super) fn start_leak_test(&mut self, ctx: &egui::Context) {
-        if self.leak.running() {
-            return;
-        }
         self.sync_stun();
         let egress = self.status.lock().unwrap().egress_ip;
-        self.leak.tested_egress = egress;
         let lt = self.draft.leak_test.clone();
         let judge = Judge::from_strings(&self.draft.whitelist, &lt.trusted_dns);
-        log::info!("开始泄露测试（出口 IP {}）", egress.map(|i| i.to_string()).unwrap_or_else(|| "未知".into()));
-
-        *self.leak.dns.lock().unwrap() = Task::Running { since: Instant::now(), progress: 0 };
-        *self.leak.webrtc.lock().unwrap() = Task::Running { since: Instant::now(), progress: 0 };
-
-        {
-            let (task, ctx, judge, lt) = (self.leak.dns.clone(), ctx.clone(), judge.clone(), lt.clone());
-            std::thread::Builder::new()
-                .name("dns-leak-test".into())
-                .spawn(move || {
-                    let progress = |n: u32| {
-                        if let Task::Running { progress, .. } = &mut *task.lock().unwrap() {
-                            *progress = n;
-                        }
-                        ctx.request_repaint();
-                    };
-                    let zone = lt.dnscheck_zone.trim().trim_matches('.').to_ascii_lowercase();
-                    let r = if leaktest::valid_zone(&zone) {
-                        dns::run(&zone, &lt.dns_sources, egress, &judge, &progress)
-                    } else {
-                        Err(anyhow::anyhow!("DNS 测试服务的域名有误：{:?}", lt.dnscheck_zone))
-                    };
-                    match &r {
-                        Ok(r) => log::info!("DNS 泄露测试：{}", leaktest::dns_summary(r).1),
-                        Err(e) => log::warn!("DNS 泄露测试失败：{e:#}"),
-                    }
-                    *task.lock().unwrap() =
-                        Task::Done { at: crate::logbuf::now_hms(), result: r.map_err(|e| format!("{e:#}")) };
-                    ctx.request_repaint();
-                })
-                .expect("无法创建测试线程");
-        }
-        {
-            let (task, ctx) = (self.leak.webrtc.clone(), ctx.clone());
-            std::thread::Builder::new()
-                .name("webrtc-leak-test".into())
-                .spawn(move || {
-                    let r = webrtc::run(&lt.stun_servers, egress, &judge);
-                    log::info!("WebRTC 泄露测试：{}", leaktest::webrtc_summary(&r).1);
-                    *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
-                    ctx.request_repaint();
-                })
-                .expect("无法创建测试线程");
-        }
+        self.leak.job.start(lt, judge, egress, false, ctx.clone(), |_| {});
     }
 
     fn sync_stun(&mut self) {
@@ -211,7 +312,7 @@ impl App {
     /// 当前结果（按正在编辑的白名单重新判定）。
     fn leak_results(&self) -> (LeakView, LeakView) {
         let j = self.judge();
-        let d = match &*self.leak.dns.lock().unwrap() {
+        let d = match &*self.leak.job.dns.lock().unwrap() {
             Task::Idle => LeakView::Idle,
             Task::Running { since, progress } => LeakView::Running(since.elapsed().as_secs(), *progress),
             Task::Done { at, result: Ok(r) } => {
@@ -223,7 +324,7 @@ impl App {
                 LeakView::Done { at: at.clone(), level: None, text: format!("测试失败：{e}"), dns: None, rtc: None }
             }
         };
-        let w = match &*self.leak.webrtc.lock().unwrap() {
+        let w = match &*self.leak.job.webrtc.lock().unwrap() {
             Task::Idle => LeakView::Idle,
             Task::Running { since, .. } => LeakView::Running(since.elapsed().as_secs(), 0),
             Task::Done { at, result } => {
@@ -303,11 +404,12 @@ impl App {
                     ui.add_space(-4.0);
                     let sub = match (&d, &w) {
                         (LeakView::Done { at, .. }, _) | (_, LeakView::Done { at, .. }) if !busy => {
-                            let e = self.leak.tested_egress.map(|i| format!("，当时出口 IP {i}")).unwrap_or_default();
-                            format!("测试于 {at}{e}")
+                            let m = self.leak.job.meta.lock().unwrap();
+                            let e = m.egress.map(|i| format!("，当时出口 IP {i}")).unwrap_or_default();
+                            format!("{}测试于 {at}{e}", if m.auto { "自动" } else { "" })
                         }
                         _ if busy => "大约需要 10 秒".to_owned(),
-                        _ => "测试只在点「开始测试」时进行，大约需要 10 秒".to_owned(),
+                        _ => "大约需要 10 秒；也可以在下方设置网络变化后、定时自动测试".to_owned(),
                     };
                     ui.label(RichText::new(sub).size(12.5).color(p.secondary));
                 });
@@ -344,6 +446,9 @@ impl App {
         if let LeakView::Done { rtc: Some(r), .. } = &w {
             webrtc_results(ui, p, r);
         }
+
+        // ---- 自动测试 ----
+        self.auto_section(ui, p, &s);
 
         // ---- 可信解析器 ----
         self.trusted_section(ui, p);
@@ -495,6 +600,47 @@ impl App {
             p,
             "出口 IP 白名单内的解析器本来就算安全。用 Cloudflare、Google 等公共解析器时，它们向外查询的 IP 不固定，按自治系统（AS 号）信任更方便。",
         );
+    }
+
+    fn auto_section(&mut self, ui: &mut egui::Ui, p: &Palette, s: &crate::engine::Status) {
+        theme::section(ui, p, "自动测试");
+        let st = self.auto_leak.lock().unwrap().clone();
+        theme::card(ui, p, |ui| {
+            let lt = &mut self.draft.leak_test;
+            theme::row(ui, p, "网络变化后自动测试", Some("刚放行、或者出口 IP 变了时，等 10 秒网络稳定后测一次"), |ui| {
+                theme::toggle(ui, p, &mut lt.auto_after_change);
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "定时测试", Some("距上次测试满这么久就再测一次；0 表示不定时测试"), |ui| {
+                ui.add(egui::DragValue::new(&mut lt.interval_mins).range(0..=1440).suffix(" 分钟"));
+            });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "发现泄露时发系统通知", Some("同一出口、同样的结论只提醒一次；结果也会写进「连接记录」"), |ui| {
+                theme::toggle(ui, p, &mut lt.notify);
+            });
+            theme::hairline(ui, p);
+            let next = match st.next {
+                _ if !lt.auto_after_change && lt.interval_mins == 0 => "已关闭".to_owned(),
+                Some(t) => {
+                    let secs = t.saturating_duration_since(Instant::now()).as_secs();
+                    match secs {
+                        0 => "即将开始".to_owned(),
+                        1..=59 => format!("{secs} 秒后"),
+                        _ => format!("约 {} 分钟后", secs.div_ceil(60)),
+                    }
+                }
+                None if s.running && !s.blocked => "等待出口 IP 通过检查".to_owned(),
+                None => "出口放行后进行（阻断时测试流量也被切断）".to_owned(),
+            };
+            let last = st.last.as_ref().map(|(t, r)| format!("；上次 {t}：{r}")).unwrap_or_default();
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("下一次自动测试：{next}{last}")).size(12.5).color(p.secondary));
+            ui.add_space(4.0);
+        });
+        if st.next.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        theme::footnote(ui, p, "自动测试在后台进行，窗口收在托盘 / 菜单栏里也照常运行；改动在保存设置后生效。");
     }
 
     fn services_section(&mut self, ui: &mut egui::Ui, p: &Palette) {

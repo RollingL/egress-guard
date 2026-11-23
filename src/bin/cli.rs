@@ -97,6 +97,9 @@ enum Command {
     Probe {
         #[arg(long, default_value_t = 5)]
         timeout: u64,
+        /// any / v6
+        #[arg(long, default_value = "any")]
+        family: String,
         services: Vec<String>,
     },
 }
@@ -113,10 +116,11 @@ enum ServiceAction {
 fn main() {
     let cli = Cli::parse();
     #[cfg(unix)]
-    if let Some(Command::Probe { timeout, services }) = &cli.command {
+    if let Some(Command::Probe { timeout, family, services }) = &cli.command {
         // 检测子进程：结果打印到 stdout，错误打印到 stderr 最后一行
         logbuf::init("error", true, None);
-        let det = EgressDetector::new(services.clone(), Duration::from_secs(*timeout));
+        let family = egress_guard::egress::Family::from_name(family).unwrap_or(egress_guard::egress::Family::Any);
+        let det = EgressDetector::with_family(services.clone(), Duration::from_secs(*timeout), family);
         match det.detect_direct() {
             Ok(ip) => println!("{ip}"),
             Err(e) => {
@@ -246,15 +250,34 @@ fn real_main(cli: Cli) -> Result<()> {
     log::debug!("使用配置文件 {}", config_path.display());
 
     match cli.command.unwrap_or(Command::Run { dry_run: false }) {
-        Command::Run { dry_run } => run(cfg, dry_run, learned_file(&config_path)),
+        Command::Run { dry_run } => {
+            egress_guard::eventlog::init(&egress_guard::events_file(&config_path));
+            run(cfg, dry_run, learned_file(&config_path))
+        }
         Command::Ip => {
             let det = EgressDetector::new(
                 cfg.detect.services.clone(),
                 Duration::from_secs(cfg.detect.timeout_secs),
             );
             let ip = det.detect()?;
-            let ok = cfg.is_whitelisted(ip);
-            println!("出口 IP: {ip}");
+            let mut egress = egress_guard::controller::Egress::v4(ip);
+            println!("出口 IP: {ip}（{}）", if cfg.is_whitelisted(ip) { "在白名单内" } else { "不在白名单内" });
+            if cfg.ipv6.mode == egress_guard::config::Ipv6Mode::Check {
+                let v6 = EgressDetector::with_family(
+                    cfg.ipv6.services.clone(),
+                    Duration::from_secs(cfg.detect.timeout_secs),
+                    egress_guard::egress::Family::V6,
+                );
+                match v6.detect() {
+                    Ok(v) if v != ip => {
+                        println!("IPv6 出口: {v}（{}）", if cfg.is_whitelisted(v) { "在白名单内" } else { "不在白名单内" });
+                        egress.v6 = Some(v);
+                    }
+                    Ok(_) => {}
+                    Err(e) => println!("IPv6 出口: 没有检测到（{e:#}）"),
+                }
+            }
+            let ok = egress_guard::controller::egress_allowed(&cfg, &egress);
             println!("白名单: {}", if ok { "命中 → 放行" } else { "未命中 → 阻断" });
             Ok(())
         }

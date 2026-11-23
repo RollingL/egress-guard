@@ -1,6 +1,6 @@
 [package]
 name = "egress-guard"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "根据本机公网出口 IP 判断是否阻断选中应用（Windows：WFP；macOS：网络扩展）或全部网络（Windows：WFP；macOS：pf）的连接"
 
@@ -51,7 +51,12 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # 系统通知（Toast）
+    "Data_Xml_Dom",
+    "UI_Notifications",
 ] }
 
 [build-dependencies]

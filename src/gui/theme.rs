@@ -35,6 +35,7 @@ pub struct Palette {
     pub indigo: Color32,
     pub gray: Color32,
     pub teal: Color32,
+    pub purple: Color32,
 }
 
 impl Palette {
@@ -57,6 +58,7 @@ impl Palette {
         indigo: Color32::from_rgb(0x58, 0x56, 0xD6),
         gray: Color32::from_rgb(0x8E, 0x8E, 0x93),
         teal: Color32::from_rgb(0x30, 0xB0, 0xC7),
+        purple: Color32::from_rgb(0xA2, 0x4E, 0xD6),
     };
 
     pub const DARK: Palette = Palette {
@@ -77,6 +79,7 @@ impl Palette {
         indigo: Color32::from_rgb(0x5E, 0x5C, 0xE6),
         gray: Color32::from_rgb(0x8E, 0x8E, 0x93),
         teal: Color32::from_rgb(0x40, 0xC8, 0xE0),
+        purple: Color32::from_rgb(0xBF, 0x5A, 0xF2),
     };
 
     pub fn of(ui: &Ui) -> Palette {
@@ -541,6 +544,8 @@ pub enum Glyph {
     Bar,
     /// 水滴（泄露测试）。
     Drop,
+    /// 时钟（连接记录）。
+    Clock,
 }
 
 /// 盾牌轮廓的多边形（凸多边形，坐标归一化到 0..1）。
@@ -618,6 +623,13 @@ pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Col
         }
         Glyph::Bar => {
             painter.line_segment([at(0.26, 0.5), at(0.74, 0.5)], Stroke::new(s * 0.14, color));
+        }
+        Glyph::Clock => {
+            let c = rect.center();
+            let st = Stroke::new(s * 0.10, color);
+            painter.circle_stroke(c, s * 0.32, st);
+            painter.line_segment([c, at(0.5, 0.30)], st);
+            painter.line_segment([c, at(0.64, 0.58)], st);
         }
         Glyph::Lines => {
             for (i, w) in [0.56, 0.44, 0.56].iter().enumerate() {
