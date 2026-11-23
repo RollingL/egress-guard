@@ -78,7 +78,8 @@ Windows 版提供两个程序：
 - DNS 检测源：主要用 [addr.tools](https://github.com/brianshea2/addr.tools) 的 dnscheck 服务（`wss://ws.dnscheck.tools/watch/<ID>` 实时推送每一个查询的来源，能看到全部解析器和 ECS，服务端开源、可以自建）；另外参考 [MyIP](https://github.com/jason5ng32/MyIP)，并行使用 ip-api、every1dns、fastly、surfshark、ipleak、browserleaks 六个「一次 HTTP 请求」式的检测源，dnscheck 连不上时也能给出结果。这些请求不走代理，域名一定由本机系统解析器解析。
 - 用 Cloudflare、Google 等公共解析器时，它们向外查询的 IP 不固定，可以在结果里点「信任 AS…」，按自治系统信任整个服务商。
 - 解析器和出口 IP 的归属（运营商、自治系统号、国家）来自 `ip.addr.tools`。
-- 测试只在点「开始测试」或运行命令时进行，不会定时运行。测试由 Egress Guard 自己发出：Windows 上全局断网会放行本程序，所以断网时测到的是「不断网时会怎样」；macOS 上测试以当前用户身份运行，全局断网时会被 pf 拦截。
+- 自动测试：界面在后台自动测试，窗口收在托盘 / 菜单栏里也照常进行。出口放行后、出口 IP 变化后等 10 秒测一次，之后默认每 60 分钟测一次（距上次测试，手动的也算）。发现泄露时发系统通知（同一出口、同样的结论只提醒一次），并写进「连接记录」。在 **泄露测试 → 自动测试** 里开关、改间隔。出口处于阻断时不测试，因为测试流量同样会被切断。命令行版本只在执行 `leak-test` 时测试。
+- 测试由 Egress Guard 自己发出：Windows 上全局断网会放行本程序，所以断网时测到的是「不断网时会怎样」；macOS 上测试以当前用户身份运行，全局断网时会被 pf 拦截。
 - 两个参考项目都使用 AGPL-3.0 许可。本程序只调用它们（及上述检测源）的公开服务、按公开的协议自己实现，没有复制它们的代码。
 
 ```powershell
@@ -86,6 +87,34 @@ Windows 版提供两个程序：
 .\egress-guard.exe leak-test --dns       # 只测 DNS（--webrtc 只测 WebRTC）
 .\egress-guard.exe leak-test --json      # JSON 输出；加 --fail-on-leak 时发现泄露以退出码 2 结束
 ```
+
+## VPN 断线保护、IPv6 防护
+
+**VPN 守护**：放行时记下正在使用的 VPN 网卡，之后它断开（网卡消失、关闭或失去地址）就**立即阻断**，不等下一次出口 IP 检测，也不受「网络变化时先阻断」开关影响。网卡每秒检查一次，另外网卡 / 地址变化通知一到就检查。VPN 重新连上、出口 IP 再次通过检查后自动放行。
+
+- 默认自动识别 VPN 网卡：macOS 上是 `utun`、`tun`、`tap`、`ppp`、`ipsec`、`wg`、`tailscale` 等名称，Windows 上看接口类型（隧道、PPP、虚拟网卡）以及名称和描述（WireGuard、OpenVPN、TAP-Windows、Wintun、Clash、sing-box 等）。只算有可用地址（不只是 `fe80::`）的网卡，所以 macOS 自带的几个 utun（iCloud 专用代理等）不会被当成 VPN。
+- 识别不准时，在 **设置 → VPN 守护** 里点本机网卡把它加入列表，就只守护列出的网卡。
+- 通过 VPN 放行期间，出口 IP 默认每 15 秒检测一次，比平时更勤。这样 VPN 服务器那一侧换了出口、本机网卡又没变化时，也能尽快发现。
+
+**IPv6 防护**（**设置 → IPv6**）：
+
+| 模式 | 做法 |
+| --- | --- |
+| 检查 IPv6 出口（默认） | 每次检测时另外只走 IPv6 查询一次出口（与主检测同时进行）。本机能直连 IPv6、且这个 IPv6 出口不在白名单内时也阻断。常见的情况是 VPN 只接管 IPv4，IPv6 流量仍然从本地网络直连出去。本机没有 IPv6 时不影响结果。 |
+| 始终阻断 IPv6 | 放行时也阻断受控应用的全部 IPv6（Windows 在 WFP 的 v6 层，macOS 由网络扩展判定）。开启全局断网时阻断本机全部 IPv6，例外与全局断网相同（macOS 用 pf 的 `inet6` 规则）。 |
+| 不处理 | 与旧版本相同。 |
+
+## 连接记录
+
+每次阻断、恢复放行都会记下时间、原因（如「VPN 断开（utun4）」「出口 IP 203.0.113.9 不在白名单内」「IPv6 出口 2001:db8::1 不在白名单内」）和当时的出口 IP，自动泄露测试发现的泄露也会记下。在侧边栏 **连接记录** 页查看，可以按类型筛选、清空。记录保存在配置文件旁的 `connection-log.jsonl`（每行一条 JSON），保留最近 1000 条。macOS 上在 `/Library/Application Support/EgressGuard/connection-log.jsonl`。
+
+## 检查更新
+
+界面启动 20 秒后、之后每天检查一次 GitHub Releases，有新版本时在概览页顶部提示，并发一次系统通知。只提醒，不会自动下载安装：点「下载」打开对应平台的安装包。在 **设置 → 检查更新** 里可以关闭或立即检查。仓库是私有的时候需要填一个只有读取权限的 GitHub 令牌。
+
+发布：合并到 `main` 后，如果 `Cargo.toml` 里的版本还没有发布过，`.github/workflows/release.yml` 会构建 Windows、macOS 两个安装包（`egress-guard-v<版本>-windows.zip`、`-macos.zip`），并创建标签为 `v<版本>` 的 Release。所以发新版本只需要改版本号。
+
+系统通知：Windows 用 Toast 通知，程序会在 `HKCU\Software\Classes\AppUserModelId\EgressGuard.App` 登记显示名称和图标。macOS 用系统通知中心，第一次会请求权限；被拒绝时改用 AppleScript 的 `display notification`。
 
 ## 命令行版本
 
@@ -117,7 +146,10 @@ Register-ScheduledTask -TaskName "egress-guard-cli" -Action $action -Trigger $tr
 - `detect.fail_mode`：检测失败时 `block`（默认）/ `allow` / `keep`，在连续失败 `failure_threshold` 次后生效。
 - `detect.services`：任意返回包含 IP 文本的 HTTPS 地址都可以。
 - `[block_all]`：全局断网，界面里在 **全局断网** 页设置。默认放行局域网和 DNS。
-- `[leak_test]`：泄露测试的可信 DNS 解析器、检测源和 STUN 服务器，界面里在 **泄露测试** 页设置。
+- `[leak_test]`：泄露测试的可信 DNS 解析器、检测源、STUN 服务器和自动测试，界面里在 **泄露测试** 页设置。
+- `[vpn]`：VPN 守护（断开时立即阻断）、守护的网卡、连着 VPN 时的检测间隔。
+- `[ipv6]`：IPv6 防护：`check`（检查 IPv6 出口，默认）/ `block`（始终阻断）/ `off`。
+- `[update]`：检查新版本。
 
 ## 注意事项与已知限制
 
@@ -250,7 +282,10 @@ src/
   netext.rs         界面调用的网络扩展安装/开关（macOS，Swift 桥接）
   pfrules.rs        pf 规则文本生成（与平台无关，可测试）
   config.rs         TOML 配置解析/保存、白名单（IP/CIDR）匹配
-  egress.rs         公网出口 IP 查询（ureq + 系统 TLS）
+  egress.rs         公网出口 IP 查询（ureq + 系统 TLS），可以只走 IPv6
+  vpn.rs            VPN 网卡识别与断线检查
+  eventlog.rs       连接记录（阻断、放行、泄露，JSON 行文件）
+  update.rs         检查 GitHub Releases 上的新版本
   leaktest/         泄露测试：判定逻辑（mod.rs）、DNS（dns.rs）、WebRTC（webrtc.rs）、STUN 客户端（stun.rs）、网卡地址（ifaces.rs）
   controller.rs     阻断/放行决策逻辑，Firewall 抽象，dry-run 后端
   blockall.rs       全局断网的例外规则（局域网网段、DNS、DHCP 端口）
@@ -258,6 +293,8 @@ src/
   logbuf.rs         日志（stderr / 文件 / 界面）
   gui/mod.rs        界面页面（eframe/egui）
   gui/leak.rs       「泄露测试」页
+  gui/auto.rs       界面的后台任务：自动泄露测试、检查更新
+  gui/notify.rs     系统通知（Windows Toast、macOS 通知中心）
   gui/backend.rs    界面背后的引擎：本进程（Windows）或后台服务（macOS）
   gui/theme.rs      苹果风格配色、样式和自绘控件（开关、分段控件、卡片、图标）
   gui/tray.rs       系统托盘（独立消息循环线程）
@@ -275,7 +312,7 @@ src/
   mac/procs.rs      进程枚举（libproc）
 macos/FilterExtension/  网络扩展（Swift，NEFilterDataProvider）、Info.plist、权限
 macos/Shared/       网络扩展与测试共用：规则匹配、连接后台服务
-macos/Bridge/       界面调用的网络扩展管理（Swift，编译为静态库）
+macos/Bridge/       界面调用的网络扩展管理和系统通知（Swift，编译为静态库）
 macos/Tests/        Swift 单元测试与协议测试客户端
 assets/             exe 图标、界面程序清单（requireAdministrator）
 scripts/macos/      .app 打包、Info.plist、CI 端到端测试

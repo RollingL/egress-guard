@@ -139,6 +139,70 @@ jobs:
             Start-Sleep 2
           }
           Get-ChildItem $shots | Select-Object Name, Length
+      - name: 界面截图：概览、连接记录、VPN 守护、IPv6、检查更新、自动泄露测试、系统通知
+        shell: pwsh
+        env:
+          GALLIUM_DRIVER: llvmpipe
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win2 {
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+          }
+          '@
+          $shots = Join-Path $env:RUNNER_TEMP 'shots'
+          New-Item -ItemType Directory -Force $shots | Out-Null
+          $gui = Join-Path $env:RUNNER_TEMP 'gui\egress-guard-gui.exe'
+          $cfg = Join-Path $env:RUNNER_TEMP 'leak.toml'
+          (Get-Content -Raw $cfg) -replace 'appearance = "\w+"', 'appearance = "light"' | Set-Content -Encoding utf8 $cfg
+          function Capture($file, [bool]$window) {
+            $h = [Win2]::FindWindow([NullString]::Value, '出口 IP 网络控制 - egress-guard')
+            $r = New-Object Win2+RECT
+            if ($window -and $h -ne [IntPtr]::Zero -and [Win2]::GetWindowRect($h, [ref]$r)) {
+              [Win2]::SetForegroundWindow($h) | Out-Null
+              Start-Sleep 1
+              $x, $y, $w, $hh = $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top)
+            } else {
+              $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $x, $y, $w, $hh = 0, 0, $b.Width, $b.Height
+            }
+            $bmp = New-Object System.Drawing.Bitmap $w, $hh
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($x, $y, 0, 0, $bmp.Size)
+            $bmp.Save((Join-Path $shots $file), [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+          }
+          function Shot($name, $wait, [string[]]$extra) {
+            $p = Start-Process $gui -ArgumentList (@('-c', $cfg) + $extra) -PassThru
+            Start-Sleep $wait
+            Capture "$name.png" $true
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+          Shot 'overview-light' 15 @('--page', 'overview')
+          Shot 'events-light' 8 @('--page', 'events')
+          Shot 'settings-vpn-light' 8 @('--page', 'settings', '--scroll', '620')
+          Shot 'settings-ipv6-update-light' 8 @('--page', 'settings', '--scroll', '1050')
+          Shot 'leaktest-auto-light' 8 @('--page', 'leaktest', '--scroll', '330')
+          # 连接记录写在配置文件旁
+          $log = Join-Path $env:RUNNER_TEMP 'connection-log.jsonl'
+          Get-Content $log -Tail 5
+          if (-not (Select-String -Quiet -Path $log -Pattern '"kind":"block"')) { Write-Error '连接记录里没有阻断' }
+          if (-not (Select-String -Quiet -Path $log -Pattern '"kind":"restore"')) { Write-Error '连接记录里没有恢复' }
+          # 系统通知（Toast）：发一条测试通知，截全屏看右下角
+          $err = Join-Path $env:RUNNER_TEMP 'notify.err'
+          $n = Start-Process $gui -ArgumentList '--notify-selftest' -PassThru -Wait -RedirectStandardError $err
+          Get-Content $err -ErrorAction SilentlyContinue
+          if ($n.ExitCode -ne 0) { Write-Warning "通知自检失败（退出码 $($n.ExitCode)）" }
+          Start-Sleep 2
+          Capture 'notification.png' $false
+          Get-ChildItem $shots | Select-Object Name, Length
       - uses: actions/upload-artifact@v4
         if: always()
         with:

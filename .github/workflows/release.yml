@@ -1,0 +1,107 @@
+name: 发布
+
+# 合并到 main 后，如果 Cargo.toml 里的版本还没有发布过，就构建 Windows、macOS 两个安装包，
+# 创建 GitHub Release（标签 v<版本>）。界面的「检查更新」读取的就是这里的最新发布。
+# 也可以在 Actions 页面手动运行。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: 是否需要发布
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$V 已经发布过，跳过"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "将发布 v$V"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    name: Windows 安装包
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: 打包
+        shell: pwsh
+        run: |
+          $v = '${{ needs.check.outputs.version }}'
+          $dir = "dist\egress-guard-v$v-windows"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\egress-guard.exe, target\release\egress-guard-gui.exe, config.example.toml, README.md $dir
+          Compress-Archive -Path "$dir\*" -DestinationPath "dist\egress-guard-v$v-windows.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*.zip
+
+  macos:
+    name: macOS 安装包
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: 打包 .app（通用二进制）
+        run: |
+          scripts/macos/bundle.sh --universal
+          mkdir -p dist
+          cp target/macos/egress-guard-*-macos.zip "dist/egress-guard-v${{ needs.check.outputs.version }}-macos.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist/*.zip
+
+  release:
+    name: 创建 GitHub Release
+    needs: [check, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.check.outputs.version }}
+        run: |
+          ls -la dist
+          gh release create "v$V" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Egress Guard $V" \
+            --generate-notes

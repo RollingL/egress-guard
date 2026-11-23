@@ -219,6 +219,22 @@ write_cfg "\"$IP\"" light
 "$CLI" apply /tmp/eg.toml || fail "apply 失败"
 shot 12-leaktest-light leaktest 35 --leak-test
 
+step "连接记录：后台服务记下了阻断与恢复"
+LOG="/Library/Application Support/EgressGuard/connection-log.jsonl"
+sudo tail -5 "$LOG"
+sudo grep -q '"kind":"block"' "$LOG" && echo "OK：有阻断记录" || fail "连接记录里没有阻断"
+sudo grep -q '"kind":"restore"' "$LOG" && echo "OK：有恢复记录" || fail "连接记录里没有恢复"
+
+step "新功能截图：连接记录、VPN 守护、IPv6、检查更新、自动泄露测试、系统通知"
+shot 13-events-light events 5
+shot 14-settings-vpn-light settings 5 "--scroll 620"
+shot 15-settings-ipv6-update-light settings 5 "--scroll 1050"
+shot 16-leaktest-auto-light leaktest 5 "--scroll 330"
+# 第一次发通知会请求权限（CI 里没人点，最多等 15 秒）；只截图，不作为失败条件
+"$GUI" --notify-selftest || echo "通知自检失败（不影响测试结果）"
+sleep 2
+screencapture -x "$SHOTS/17-notification.png" || true
+
 step "菜单栏应用：窗口隐藏后再次打开应用会显示窗口"
 pkill -f "$GUI" 2>/dev/null
 open "$APP" --args --minimized
