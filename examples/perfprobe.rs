@@ -243,15 +243,27 @@ fn engine_steady(secs: u64, guarded_iface: Option<String>, apps: Vec<PathBuf>) {
 /// 一次系统网络变化会产生多少个 NetworkChanged（每个都会让引擎枚举一次网卡、上报一次状态）。
 #[cfg(any(windows, target_os = "macos"))]
 fn netwatch_burst() {
-    use egress_guard::engine::Event;
+    use egress_guard::engine::{Event, NetNotifier};
     let (tx, rx) = std::sync::mpsc::channel::<Event>();
+    let net = NetNotifier::new(tx);
     #[cfg(windows)]
-    let _w = egress_guard::win::netwatch::NetWatcher::start(tx).unwrap();
+    let _w = egress_guard::win::netwatch::NetWatcher::start(net.clone()).unwrap();
     #[cfg(target_os = "macos")]
-    let _w = egress_guard::mac::netwatch::start(tx).unwrap();
+    let _w = egress_guard::mac::netwatch::start(net.clone()).unwrap();
+    // 像引擎一样：每取到一个事件就清掉合并标志（每 5ms 取一次，相当于引擎处理得很快）
     let count = |rx: &std::sync::mpsc::Receiver<Event>, wait: Duration| {
-        std::thread::sleep(wait);
-        rx.try_iter().filter(|e| matches!(e, Event::NetworkChanged)).count()
+        let end = Instant::now() + wait;
+        let mut c = 0;
+        while Instant::now() < end {
+            while let Ok(e) = rx.try_recv() {
+                if matches!(e, Event::NetworkChanged) {
+                    c += 1;
+                    net.taken();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        c
     };
     println!("网络变化通知：空闲 30 秒内 {} 个", count(&rx, Duration::from_secs(30)));
     let run = |args: &[&str]| {

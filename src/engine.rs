@@ -4,6 +4,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -105,6 +106,35 @@ pub struct Status {
 
 pub type Reporter = Arc<dyn Fn(&Status) + Send + Sync>;
 
+/// 网卡变化监听用的通知端：一批连续的系统通知只给引擎发一个 [`Event::NetworkChanged`]。
+///
+/// 第一个通知立即发出（不推迟阻断）；引擎取到这个事件、开始处理之前清掉标志，
+/// 处理期间再来的通知会再发一个，所以不会漏掉最后一次变化。
+#[derive(Clone)]
+pub struct NetNotifier {
+    tx: Sender<Event>,
+    pending: Arc<AtomicBool>,
+}
+
+impl NetNotifier {
+    pub fn new(tx: Sender<Event>) -> Self {
+        Self { tx, pending: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// 报告一次网络变化。引擎已经退出时返回 false。
+    pub fn notify(&self) -> bool {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        self.tx.send(Event::NetworkChanged).is_ok()
+    }
+
+    /// 引擎开始处理网络变化：之后的通知要再发一次。
+    pub fn taken(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
 pub struct EngineHandle {
     tx: Sender<Event>,
     join: Mutex<Option<JoinHandle<Result<()>>>>,
@@ -172,7 +202,8 @@ fn run(
     let mut status = Status { running: true, per_app: true, ..Default::default() };
 
     // 网卡变化监听，需在整个循环期间保持存活；注册失败时稍后重试（见下面的 recover）
-    let mut watcher = start_netwatch(tx.clone());
+    let net = NetNotifier::new(tx.clone());
+    let mut watcher = start_netwatch(net.clone());
     // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
     // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
@@ -311,6 +342,7 @@ fn run(
         match event {
             Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Event::NetworkChanged) => {
+                net.taken();
                 // 先看是不是守护中的 VPN 断了（原因更明确，也不受「网络变化时先阻断」开关影响）
                 // 列不出网卡时沿用上一次的结果（不当作全部断开）
                 if let Some(a) = vpn::scan() {
@@ -469,7 +501,7 @@ fn run(
                 }
             }
             if watch_retry.due(now) {
-                watcher = start_netwatch(tx.clone());
+                watcher = start_netwatch(net.clone());
                 if watcher.is_some() {
                     watch_retry.done();
                     log::info!("网卡变化监听已恢复");
@@ -597,14 +629,14 @@ fn make_detector(cfg: &Config) -> Detectors {
 }
 
 /// 网卡/地址/路由变化监听；返回值需保持存活。
-fn start_netwatch(tx: Sender<Event>) -> Option<Box<dyn std::any::Any>> {
+fn start_netwatch(net: NetNotifier) -> Option<Box<dyn std::any::Any>> {
     #[cfg(windows)]
-    let r = crate::win::netwatch::NetWatcher::start(tx).map(|w| Box::new(w) as Box<dyn std::any::Any>);
+    let r = crate::win::netwatch::NetWatcher::start(net).map(|w| Box::new(w) as Box<dyn std::any::Any>);
     #[cfg(target_os = "macos")]
-    let r = crate::mac::netwatch::start(tx).map(|w| Box::new(w) as Box<dyn std::any::Any>);
+    let r = crate::mac::netwatch::start(net).map(|w| Box::new(w) as Box<dyn std::any::Any>);
     #[cfg(not(any(windows, target_os = "macos")))]
     let r: Result<Box<dyn std::any::Any>> = {
-        let _ = tx;
+        let _ = net;
         Err(anyhow!("此平台不支持"))
     };
     match r {
@@ -651,6 +683,25 @@ fn open_backend(_cfg: &Config, _tx: Sender<Event>) -> Result<Box<dyn Firewall>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一批通知只发一个事件；引擎开始处理之后再来的通知会再发一个。
+    #[test]
+    fn net_notifier_coalesces_bursts_but_keeps_trailing_change() {
+        let (tx, rx) = mpsc::channel();
+        let n = NetNotifier::new(tx);
+        for _ in 0..30 {
+            assert!(n.notify());
+        }
+        assert!(matches!(rx.try_recv(), Ok(Event::NetworkChanged)));
+        assert!(rx.try_recv().is_err());
+        n.taken();
+        assert!(n.notify() && n.notify());
+        assert!(matches!(rx.try_recv(), Ok(Event::NetworkChanged)));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        n.taken();
+        assert!(!n.notify(), "引擎已退出");
+    }
 
     #[test]
     fn settle_deadline_slides_but_is_capped() {

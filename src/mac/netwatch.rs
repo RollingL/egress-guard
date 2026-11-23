@@ -4,11 +4,10 @@
 //! 地址增删、网卡状态变化和非主机路由的增删改；AirDrop 等使用的 awdl/llw 接口频繁开关，忽略。
 
 use std::ffi::CStr;
-use std::sync::mpsc::Sender;
 
 use anyhow::{bail, Result};
 
-use crate::engine::Event;
+use crate::engine::NetNotifier;
 
 const RTM_ADD: u8 = 0x1;
 const RTM_DELETE: u8 = 0x2;
@@ -63,7 +62,7 @@ fn relevant(msg: &[u8]) -> bool {
     }
 }
 
-pub fn start(tx: Sender<Event>) -> Result<Watcher> {
+pub fn start(tx: NetNotifier) -> Result<Watcher> {
     let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
     if fd < 0 {
         bail!("无法打开路由套接字: {}", std::io::Error::last_os_error());
@@ -85,7 +84,8 @@ pub fn start(tx: Sender<Event>) -> Result<Watcher> {
                 let msg = &buf[..n as usize];
                 if relevant(msg) {
                     log::debug!("路由消息 type={} 触发网络变化", msg[3]);
-                    if tx.send(Event::NetworkChanged).is_err() {
+                    // 一连串路由消息只给引擎发一个事件（见 NetNotifier）
+                    if !tx.notify() {
                         break;
                     }
                 }
