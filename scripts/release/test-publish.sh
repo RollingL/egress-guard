@@ -50,6 +50,29 @@ jq -n --arg m "$MARK" --arg s "$SHA" --arg d "$(digest windows)" '{releases: [{i
   assets: [{id: 8, name: "egress-guard-v1.2.3-windows.zip", size: 7, state: "uploaded", digest: $d}]}]}' >"$FAKE_GH_STATE"
 check "一致的资产不重传" ok "$published_once and (([.calls[] | select(startswith(\"POST\") and contains(\"assets\"))] | length == 1))"
 
+# 已有资产没有摘要、下载核对时服务出错（503），上传也 503：保留现有资产，不删除，保持草稿
+jq -n --arg m "$MARK" --arg s "$SHA" '{fail: {"GET repos/owner/repo/releases/assets": 503, "POST https://uploads.github.com": 503},
+  releases: [{id: 7, tag_name: "v1.2.3", target_commitish: $s, name: "x", body: $m, draft: true,
+  assets: [{id: 8, name: "egress-guard-v1.2.3-windows.zip", size: 7, state: "uploaded", digest: null, content: "windows"}]}]}' >"$FAKE_GH_STATE"
+check "暂时无法核实时保留资产" fail "$none_public and (.releases[0].assets | length == 1) and (([.calls[] | select(startswith(\"DELETE\"))] | length == 0))"
+jq 'del(.fail)' "$FAKE_GH_STATE" >"$WORK/s" && mv "$WORK/s" "$FAKE_GH_STATE"
+check "恢复后重跑：没有摘要但下载核对一致，不重传" ok "$published_once and (([.calls[] | select(startswith(\"DELETE\"))] | length == 0))"
+
+# 没有摘要、下载下来内容不符：确定不同，替换
+jq -n --arg m "$MARK" --arg s "$SHA" '{releases: [{id: 7, tag_name: "v1.2.3", target_commitish: $s, name: "x", body: $m, draft: true,
+  assets: [{id: 8, name: "egress-guard-v1.2.3-windows.zip", size: 7, state: "uploaded", digest: null, content: "WINDOWS"}]}]}' >"$FAKE_GH_STATE"
+check "下载核对内容不符时替换" ok "$published_once and (([.calls[] | select(. == \"DELETE repos/owner/repo/releases/assets/8\")] | length == 1))"
+
+# 403（例如令牌权限不足）：同样不删除
+jq -n --arg m "$MARK" --arg s "$SHA" '{fail: {"GET repos/owner/repo/releases/assets": 403},
+  releases: [{id: 7, tag_name: "v1.2.3", target_commitish: $s, name: "x", body: $m, draft: true,
+  assets: [{id: 8, name: "egress-guard-v1.2.3-windows.zip", size: 7, state: "uploaded", digest: null, content: "windows"}]}]}' >"$FAKE_GH_STATE"
+check "下载 403 时保留资产" fail "$none_public and (.releases[0].assets | length == 1)"
+
+# 两层附注标签剥离后指向本次提交
+jq -n --arg s "$SHA" '{refs: {"v1.2.3": {type: "tag", sha: "t1"}}, tag_objects: {t1: {type: "tag", sha: "t2"}, t2: {type: "commit", sha: $s}}}' >"$FAKE_GH_STATE"
+check "两层附注标签剥离后一致" ok "([.releases[] | select(.draft == false)] | length == 1)"
+
 # 别的提交留下的草稿：不碰它
 jq -n --arg o "$OTHER" '{releases: [{id: 7, tag_name: "v1.2.3", target_commitish: $o, name: "x", body: "", draft: true, assets: []}]}' >"$FAKE_GH_STATE"
 check "冲突草稿时失败" fail "$none_public and (.releases | length == 1) and (.refs | length == 0)"

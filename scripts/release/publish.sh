@@ -8,7 +8,7 @@
 # - 同版本已经公开：跳过（成功退出）。
 # - 同提交、由本流程创建的草稿（目标提交和正文里的标记都对得上）：按它的 release ID 续传。
 # - 其他同标签草稿：报错，不动它。
-# - 资产按名字、大小和 SHA-256 与本地安装包核对；对不上的删掉重传。
+# - 资产按名字、大小和 SHA-256 与本地安装包核对；确定对不上的删掉重传，暂时无法核实（下载失败）时保留并失败退出。
 # - 公开前确认标签剥离到的提交就是本次提交；标签不存在时先绑定到本次提交，并发创建时读回再核对。
 # - 任何一步失败都保持草稿状态。
 set -euo pipefail
@@ -91,7 +91,9 @@ else
   echo "已创建草稿 $ID"
 fi
 
-# 远端资产与本地是否一致：名字、状态、大小、SHA-256（没有摘要时下载下来算）
+# 远端资产与本地是否一致：名字、状态、大小、SHA-256（没有摘要时下载下来算）。
+# 返回 0：一致；1：确定不一致（没传完、大小或摘要不同）；2：暂时无法核实（下载失败等）。
+# 只有确定不一致才替换；暂时无法核实时保留现有资产，本次失败退出，下次重跑再核对。
 remote_ok() {
   local asset=$1 f=$2 digest id
   [[ "$(jq -r .state <<<"$asset")" == uploaded ]] || return 1
@@ -101,11 +103,14 @@ remote_ok() {
     id=$(jq -r .id <<<"$asset")
     local tmp
     tmp=$(mktemp)
-    gh api -H "Accept: application/octet-stream" "repos/$R/releases/assets/$id" >"$tmp" || { rm -f "$tmp"; return 1; }
+    if ! gh api -H "Accept: application/octet-stream" "repos/$R/releases/assets/$id" >"$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      return 2
+    fi
     digest="sha256:$(sha256 "$tmp")"
     rm -f "$tmp"
   fi
-  [[ "$digest" == "sha256:$(sha256 "$f")" ]]
+  [[ "$digest" == "sha256:$(sha256 "$f")" ]] || return 1
 }
 
 list_assets() {
@@ -117,9 +122,14 @@ list_assets() {
 assets=$(list_assets)
 for f in "${ASSETS[@]}"; do
   a=$(jq -c --arg n "$f" 'select(.name == $n)' <<<"$assets")
-  if [[ -n "$a" ]] && remote_ok "$a" "$DIST/$f"; then
-    echo "$f 已上传且一致"
-    continue
+  if [[ -n "$a" ]]; then
+    rc=0
+    remote_ok "$a" "$DIST/$f" || rc=$?
+    if (( rc == 0 )); then
+      echo "$f 已上传且一致"
+      continue
+    fi
+    (( rc == 1 )) || die "暂时无法核实已上传的 $f（下载失败），保留现有资产，请稍后重跑"
   fi
   if [[ -n "$a" ]]; then
     echo "$f 与本地不一致或没有传完，重传"

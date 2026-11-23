@@ -5,6 +5,7 @@
   fail: {"<方法> <路径前缀>": 状态码}   让匹配的请求失败
   corrupt_uploads: true                  上传后远端摘要与内容不符
   ref_race: "<sha>"                      创建标签时假装别人刚建好、指向这个提交
+资产可以带 content（文本）：下载资产时返回它；没有 content 的资产无法下载（404）。
 """
 import hashlib
 import json
@@ -119,6 +120,14 @@ if len(rest) == 3 and rest[0] == "releases" and rest[2] == "assets" and method =
     a = {"id": new_id(), "name": name, "size": len(data), "state": "uploaded", "digest": "sha256:" + digest}
     r["assets"].append(a)
     out(a)
+if len(rest) == 3 and rest[:2] == ["releases", "assets"] and method == "GET":
+    for r in st["releases"]:
+        for a in r["assets"]:
+            if str(a["id"]) == rest[2] and "content" in a:
+                save()
+                sys.stdout.write(a["content"])
+                sys.exit(0)
+    fail(404, "Not Found")
 if len(rest) == 3 and rest[:2] == ["releases", "assets"] and method == "DELETE":
     for r in st["releases"]:
         r["assets"] = [a for a in r["assets"] if str(a["id"]) != rest[2]]
