@@ -268,7 +268,7 @@ fn run(
     status.extra_apps = initial;
     discovery::spawn(watch.clone(), learned_file, snapshot_fn(), system_dirs, tx.clone());
 
-    let mut detector = Arc::new(make_detector(&cfg));
+    let mut detector = Arc::new(Detectors::new(&cfg));
     let mut generation: u64 = 0;
     let mut checking = false;
     let mut next_check: Option<Instant> = Some(Instant::now());
@@ -376,7 +376,7 @@ fn run(
                     new_cfg.apps.len(),
                     new_cfg.whitelist.len()
                 );
-                detector = Arc::new(make_detector(&new_cfg));
+                detector = Arc::new(Detectors::new(&new_cfg));
                 watch_version += 1;
                 {
                     let mut w = watch.lock().unwrap();
@@ -440,7 +440,7 @@ fn run(
                     status.last_check = Some(logbuf::now_hms());
                     // 放行时记下正在使用的 VPN 网卡，之后它一断开就立即阻断
                     let vcfg = &ctrl.config().vpn;
-                    guarded = if !ctrl.is_blocked() && vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    guarded = guard_links(&ctrl, &adapters);
                     if !guarded.is_empty() && status.vpn_guarded != vpn::names(&guarded) {
                         log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                     }
@@ -527,7 +527,7 @@ fn run(
                 // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
                 if was_blocked && !ctrl.is_blocked() {
                     let vcfg = &ctrl.config().vpn;
-                    guarded = if vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    guarded = guard_links(&ctrl, &adapters);
                     if !guarded.is_empty() {
                         log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                         if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
@@ -566,6 +566,16 @@ fn run(
 fn later(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
+}
+
+/// 放行时要守护的 VPN 网卡：已经放行、开了 VPN 守护时，现在连着的 VPN 网卡；否则为空。
+fn guard_links(ctrl: &Controller, adapters: &[Adapter]) -> Vec<vpn::Link> {
+    let vcfg = &ctrl.config().vpn;
+    if !ctrl.is_blocked() && vcfg.guard {
+        vpn::links(adapters, vcfg)
+    } else {
+        Vec::new()
+    }
 }
 
 /// 防抖的截止时刻：每次变化都从现在起再等 `debounce`，但从这一轮变化开始算最多等 [`max_settle`]。
@@ -627,10 +637,6 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.apply_error = ctrl.apply_error().map(str::to_owned);
     s.degraded = ctrl.degraded();
     s.limitation = ctrl.limitation();
-}
-
-fn make_detector(cfg: &Config) -> Detectors {
-    Detectors::new(cfg)
 }
 
 /// 网卡/地址/路由变化监听；返回值需保持存活。

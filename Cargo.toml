@@ -33,13 +33,11 @@ rfd = "0.18"
 dispatch2 = "0.3"
 winit = { version = "0.30", default-features = false }
 objc2 = "0.6"
-objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSWorkspace"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26"
 rfd = "0.18"
-raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

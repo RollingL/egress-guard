@@ -224,10 +224,6 @@ impl Controller {
         pushed.and(switched)
     }
 
-    pub fn firewall(&mut self) -> &mut dyn Firewall {
-        self.fw.as_mut()
-    }
-
     pub fn config(&self) -> &Config {
         &self.cfg
     }

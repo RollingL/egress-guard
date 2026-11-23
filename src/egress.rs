@@ -64,10 +64,6 @@ pub struct EgressDetector {
 }
 
 impl EgressDetector {
-    pub fn new(services: Vec<String>, timeout: Duration) -> Self {
-        Self::with_family(services, timeout, Family::Any)
-    }
-
     pub fn with_family(services: Vec<String>, timeout: Duration, family: Family) -> Self {
         Self::with_proxy(services, timeout, family, None)
     }
