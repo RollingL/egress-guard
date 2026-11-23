@@ -13,14 +13,27 @@ use ureq::Agent;
 pub enum Family {
     /// 按系统默认（通常 IPv6 优先、不通时用 IPv4），依次尝试各服务。
     Any,
+    /// 只走 IPv4（「始终阻断 IPv6」时：应用的流量只能走 IPv4，出口也只看 IPv4；
+    /// 而且 IPv6 被防火墙丢弃，按默认顺序先试 IPv6 地址会一直等到超时）。
+    V4,
     /// 只走 IPv6，同时请求各服务，第一个成功的结果生效（IPv6 不通时尽快结束）。
     V6,
 }
 
 impl Family {
+    /// 主出口检测用的地址族：「始终阻断 IPv6」时只走 IPv4，其余按系统默认。
+    pub fn for_main(mode: crate::config::Ipv6Mode) -> Self {
+        if mode == crate::config::Ipv6Mode::Block {
+            Family::V4
+        } else {
+            Family::Any
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Family::Any => "any",
+            Family::V4 => "v4",
             Family::V6 => "v6",
         }
     }
@@ -28,6 +41,7 @@ impl Family {
     pub fn from_name(s: &str) -> Option<Self> {
         match s {
             "any" => Some(Family::Any),
+            "v4" => Some(Family::V4),
             "v6" => Some(Family::V6),
             _ => None,
         }
@@ -54,6 +68,7 @@ impl EgressDetector {
             .timeout_global(Some(timeout))
             .ip_family(match family {
                 Family::Any => IpFamily::Any,
+                Family::V4 => IpFamily::Ipv4Only,
                 Family::V6 => IpFamily::Ipv6Only,
             })
             .user_agent(concat!("egress-guard/", env!("CARGO_PKG_VERSION")))

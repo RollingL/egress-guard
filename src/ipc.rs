@@ -221,7 +221,14 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
         let reply = match req {
             Request::Hello => Reply::Hello(handler.hello()),
             Request::GetStatus => Reply::Status(Box::new(hub.state.lock().unwrap().1.clone())),
-            Request::GetConfig => Reply::Config(Box::new(handler.get_config())),
+            Request::GetConfig => {
+                let mut raw = handler.get_config();
+                // GitHub 令牌只给能修改设置的账户（管理员）；其他账户读到的配置里没有令牌
+                if !uid.is_some_and(may_modify) {
+                    raw.update.token.clear();
+                }
+                Reply::Config(Box::new(raw))
+            }
             Request::SetConfig(raw) => match handler.set_config(*raw) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Err(format!("{e:#}")),

@@ -255,9 +255,10 @@ fn real_main(cli: Cli) -> Result<()> {
             run(cfg, dry_run, learned_file(&config_path))
         }
         Command::Ip => {
-            let det = EgressDetector::new(
+            let det = EgressDetector::with_family(
                 cfg.detect.services.clone(),
                 Duration::from_secs(cfg.detect.timeout_secs),
+                egress_guard::egress::Family::for_main(cfg.ipv6.mode),
             );
             let ip = det.detect()?;
             let mut egress = egress_guard::controller::Egress::v4(ip);

@@ -293,11 +293,40 @@ pub struct Config {
     pub update: UpdateConfig,
 }
 
+/// 把一节配置改回默认值。
+type Repair = fn(&mut RawConfig, &RawConfig);
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("无法读取配置文件 {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("配置文件 {} 有误", path.display()))
+        Self::parse_lenient(&text).with_context(|| format!("配置文件 {} 有误", path.display()))
+    }
+
+    /// 读取配置文件用：泄露测试、IPv6 查询服务、检查更新这几项与断网保护无关，写错时改用默认值并记日志，
+    /// 不让整份配置失效（失效时后台服务会退回默认配置，可能把整个网络断掉）。
+    pub fn parse_lenient(text: &str) -> Result<Self> {
+        let mut raw: RawConfig = toml::from_str(text)?;
+        let err = match Self::from_raw(raw.clone()) {
+            Ok(c) => return Ok(c),
+            Err(e) => e,
+        };
+        let d = RawConfig::default();
+        let repairs: [(&str, Repair); 3] = [
+            ("[leak_test]", |r, d| r.leak_test = d.leak_test.clone()),
+            ("[ipv6] services", |r, d| r.ipv6.services = d.ipv6.services.clone()),
+            ("[update]", |r, d| r.update = d.update.clone()),
+        ];
+        let mut fixed = Vec::new();
+        for (name, repair) in repairs {
+            repair(&mut raw, &d);
+            fixed.push(name);
+            if let Ok(c) = Self::from_raw(raw.clone()) {
+                log::warn!("配置有误（{err:#}）：{} 改用默认值", fixed.join("、"));
+                return Ok(c);
+            }
+        }
+        Err(err)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -438,7 +467,15 @@ impl Config {
             "# egress-guard 配置（由程序保存，说明见 config.example.toml）\n\n{}",
             toml::to_string_pretty(&self.to_raw())?
         );
-        std::fs::write(path, text).with_context(|| format!("无法写入 {}", path.display()))
+        std::fs::write(path, text).with_context(|| format!("无法写入 {}", path.display()))?;
+        // 带 GitHub 令牌时只让文件所有者读写（macOS 上配置由 root 保存，其他账户不应读到令牌）
+        #[cfg(unix)]
+        if !self.update.token.is_empty() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("无法设置 {} 的权限", path.display()))?;
+        }
+        Ok(())
     }
 
     /// 出口 IP 是否命中白名单。
@@ -572,6 +609,18 @@ apps = ['C:\Program Files\App\app.exe']
         assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndnscheck_zone=\"a b\"")).is_err());
         let cfg = Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"Fastly\", \"dnscheck\", \"fastly\", \"nope\"]")).unwrap();
         assert_eq!(cfg.leak_test.dns_sources, vec!["fastly", "dnscheck"]);
+    }
+
+    #[test]
+    fn optional_sections_do_not_break_loading() {
+        let text = "whitelist=[\"203.0.113.0/24\"]\n[leak_test]\nstun_servers=[\"stun.example.org\"]\n[update]\nrepo=\"bad repo\"";
+        assert!(Config::parse(text).is_err());
+        let c = Config::parse_lenient(text).unwrap();
+        assert_eq!(c.whitelist.len(), 1);
+        assert_eq!(c.leak_test.stun_servers, LeakTestConfig::default().stun_servers);
+        assert_eq!(c.update.repo, UpdateConfig::default().repo);
+        // 保护相关的错误仍然报错
+        assert!(Config::parse_lenient("whitelist=[\"not-an-ip\"]").is_err());
     }
 
     #[test]

@@ -110,6 +110,8 @@ pub struct Controller {
     reason: Option<String>,
     /// 上次把程序列表同步到防火墙失败，需要重试。
     apps_dirty: bool,
+    /// 最近一次检测到的出口已经过时（VPN 断开、网络变化之后），在下一次检测前不能据此放行。
+    stale: bool,
 }
 
 impl Controller {
@@ -124,6 +126,7 @@ impl Controller {
             last_error: None,
             reason: None,
             apps_dirty: false,
+            stale: false,
         }
     }
 
@@ -200,8 +203,9 @@ impl Controller {
         Ok(())
     }
 
-    /// 以给定原因阻断（启动时先阻断、VPN 断开等）。
+    /// 以给定原因阻断（启动时先阻断、VPN 断开等）。之前检测到的出口随之作废，等下一次检测再决定是否放行。
     pub fn block_for(&mut self, reason: impl Into<String>) -> Result<()> {
+        self.stale = true;
         self.switch(true, reason.into())
     }
 
@@ -277,9 +281,13 @@ impl Controller {
         if self.cfg.ipv6.mode != Ipv6Mode::Check {
             self.last_v6 = None;
         }
-        // 白名单可能已变化：用最近一次的出口 IP 立即重新决策
+        // 白名单可能已变化：用最近一次的出口 IP 立即重新决策。
+        // 出口已经过时（VPN 断开、网络变化后还没重新检测）时只能收紧，不能据此放行
         if let Some(e) = self.last_egress() {
             if egress_allowed(&self.cfg, &e) {
+                if self.stale {
+                    return sync;
+                }
                 self.switch(false, format!("新白名单包含当前出口 IP {}", e.ip))?;
             } else {
                 self.switch(true, format!("新配置下{}", rejection(&self.cfg, &e)))?;
@@ -290,6 +298,7 @@ impl Controller {
 
     /// 网络变化时调用：按配置先行阻断。
     pub fn on_network_change(&mut self) -> Result<()> {
+        self.stale = true;
         if self.cfg.behavior.block_on_network_change && !self.fw.is_blocked() {
             self.switch(true, "网络发生变化，等待重新检测出口 IP".into())?;
         }
@@ -298,6 +307,7 @@ impl Controller {
 
     /// 处理一次检测结果。
     pub fn on_detection(&mut self, detection: Result<Egress>) -> Result<()> {
+        self.stale = false;
         match &detection {
             Ok(e) => {
                 self.failures = 0;
@@ -469,6 +479,31 @@ mod tests {
         assert!(c.is_blocked());
         let new = Config::parse("whitelist=[\"198.51.100.0/24\"]\napps=[]").unwrap();
         c.reconfigure(new).unwrap();
+        assert!(!c.is_blocked());
+    }
+
+    #[test]
+    fn stale_egress_never_unblocks() {
+        // 放行中 VPN 断开 → 阻断；重新检测前保存设置不能按断开前的出口放行
+        let wl = |net: &str| Config::parse(&format!("whitelist=[\"{net}\"]\napps=['C:\\a.exe']")).unwrap();
+        let mut c = Controller::new(wl("198.51.100.0/24"), Box::new(DryRunFirewall::default()));
+        c.on_detection(Ok(eg("198.51.100.1", None))).unwrap();
+        assert!(!c.is_blocked());
+        c.block_for("VPN 断开（utun4）").unwrap();
+        c.reconfigure(wl("198.51.100.0/24")).unwrap();
+        assert!(c.is_blocked());
+        // 新配置不再允许旧出口时仍然可以收紧
+        c.reconfigure(wl("203.0.113.0/24")).unwrap();
+        assert!(c.is_blocked());
+        // 网络变化后同样如此
+        let mut c = Controller::new(wl("198.51.100.0/24"), Box::new(DryRunFirewall::default()));
+        c.on_detection(Ok(eg("198.51.100.1", None))).unwrap();
+        c.on_network_change().unwrap();
+        assert!(c.is_blocked());
+        c.reconfigure(wl("198.51.100.0/24")).unwrap();
+        assert!(c.is_blocked());
+        // 重新检测之后恢复正常
+        c.on_detection(Ok(eg("198.51.100.1", None))).unwrap();
         assert!(!c.is_blocked());
     }
 

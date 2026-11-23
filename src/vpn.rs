@@ -14,8 +14,9 @@ use std::time::Duration;
 use crate::config::VpnConfig;
 use crate::leaktest::ifaces::{self, Adapter};
 
-/// 轮询网卡的间隔（网卡变化通知之外的兜底）。
-pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// 轮询网卡的间隔。Windows、macOS 上网卡一变化系统就会通知引擎、立即检查（毫秒级），
+/// 轮询只是兜底（通知没来、或者本平台没有通知时）；列一次网卡只需几毫秒，所以可以轮询得很勤。
+pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Windows 接口类型（IF_TYPE_*）。
 const IF_TYPE_PPP: u32 = 23;
@@ -103,7 +104,7 @@ fn fingerprint(adapters: &[Adapter]) -> Vec<(String, bool)> {
     v
 }
 
-/// 在后台线程中每秒检查一次网卡；有变化时调用 `send`（返回 false 时结束线程）。
+/// 在后台线程中每 [`POLL_INTERVAL`] 检查一次网卡；有变化时调用 `send`（返回 false 时结束线程）。
 pub fn spawn_watch(send: impl Fn(Vec<Adapter>) -> bool + Send + 'static) {
     let r = std::thread::Builder::new().name("vpn-watch".into()).spawn(move || {
         let mut last = None;

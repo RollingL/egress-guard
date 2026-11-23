@@ -151,7 +151,7 @@ fn run(
 
     // 网卡变化监听，需在整个循环期间保持存活
     let _watcher = start_netwatch(tx.clone());
-    // VPN 守护：每秒检查一次网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）
+    // VPN 守护：每 0.25 秒检查一次网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）
     vpn::spawn_engine_watch(tx.clone());
     let mut adapters: Vec<Adapter> = vpn::scan();
     let mut guarded: Vec<String> = Vec::new();
@@ -228,7 +228,9 @@ fn run(
         let det = detector.clone();
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let result = det.detect();
+            // 检测里出现 panic 也要回报结果，否则 checking 一直为真，之后再也不会检测
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| det.detect()))
+                .unwrap_or_else(|_| Err(anyhow!("检测线程异常退出")));
             let _ = tx.send(Event::Detected { generation, result });
         });
     };
@@ -334,7 +336,9 @@ fn run(
             }
             Ok(Event::Adapters(a)) => {
                 adapters = a;
-                if check_vpn!() {
+                let before = status.vpn_connected.clone();
+                // VPN 网卡有增减时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废
+                if check_vpn!() || status.vpn_connected != before {
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
@@ -438,7 +442,8 @@ impl Detectors {
     fn detect(&self) -> Result<Egress> {
         std::thread::scope(|s| {
             let v6 = self.v6.as_ref().map(|d| s.spawn(|| d.detect()));
-            let ip = self.main.detect()?;
+            let main = self.main.detect();
+            // 先等 IPv6 检测结束再返回主检测的错误：未 join 的线程若 panic，scope 会把 panic 传出来
             let v6 = match v6.map(|h| h.join()) {
                 Some(Ok(Ok(v))) => Some(v),
                 Some(Ok(Err(e))) => {
@@ -448,7 +453,7 @@ impl Detectors {
                 Some(Err(_)) => None,
                 None => None,
             };
-            Ok(Egress { ip, v6 })
+            Ok(Egress { ip: main?, v6 })
         })
     }
 }
@@ -456,7 +461,7 @@ impl Detectors {
 fn make_detector(cfg: &Config) -> Detectors {
     let timeout = Duration::from_secs(cfg.detect.timeout_secs);
     Detectors {
-        main: EgressDetector::new(cfg.detect.services.clone(), timeout),
+        main: EgressDetector::with_family(cfg.detect.services.clone(), timeout, Family::for_main(cfg.ipv6.mode)),
         v6: (cfg.ipv6.mode == Ipv6Mode::Check)
             .then(|| EgressDetector::with_family(cfg.ipv6.services.clone(), timeout, Family::V6)),
     }

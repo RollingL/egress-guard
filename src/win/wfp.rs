@@ -521,10 +521,12 @@ impl WfpFirewall {
             if let Some(p) = &key.1 {
                 let (mut v, c) = fw.add_global_filters(p, &layers, &mut warnings, &mut ok_keys)?;
                 ids.append(&mut v);
-                if !c {
-                    // 例外程序不存在或添加失败：按「添加失败」处理（与全局断网主规则一样定时重试）
+                // 例外程序不存在：等它出现再重建（不必每 5 秒重试）；其余情况按添加失败处理
+                let absent: Vec<PathBuf> = p.allow_apps.iter().filter(|a| !a.exists()).cloned().collect();
+                if !c && absent.is_empty() {
                     failed = true;
                 }
+                missing.extend(absent);
             }
             let complete = !failed && missing.is_empty();
             if failed {

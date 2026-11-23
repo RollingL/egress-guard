@@ -194,6 +194,8 @@ impl UpdateState {
 /// 启动后多久第一次检查，之后的间隔。
 const FIRST_CHECK: Duration = Duration::from_secs(20);
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// 关闭检查更新时多久再看一次设置。
+const DISABLED_POLL: Duration = Duration::from_secs(60);
 /// 失败后多久重试。
 const RETRY_AFTER: Duration = Duration::from_secs(3600);
 
@@ -223,7 +225,8 @@ impl UpdateChecker {
             };
             let cfg = self.config.lock().unwrap().update.clone();
             if !cfg.check && !manual {
-                wait = CHECK_EVERY;
+                // 关闭期间每分钟看一次设置，重新打开后很快就会检查
+                wait = DISABLED_POLL;
                 continue;
             }
             self.state.lock().unwrap().checking = true;

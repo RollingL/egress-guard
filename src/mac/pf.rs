@@ -27,6 +27,8 @@ pub struct PfFirewall {
     warned_allow_apps: bool,
     /// set_rules 已经调用过（启动时第一次要同步）。
     synced_once: bool,
+    /// 上次同步 pf 规则失败：引擎会定时重试（见 has_pending），直到规则真正装上。
+    dirty: bool,
 }
 
 fn pfctl(args: &[&str], stdin: Option<&str>) -> Result<String> {
@@ -80,6 +82,7 @@ impl PfFirewall {
             token: None,
             warned_allow_apps: false,
             synced_once: false,
+            dirty: false,
         })
     }
 
@@ -111,8 +114,14 @@ impl PfFirewall {
         }
     }
 
-    /// 让 pf 中的规则与当前状态一致。
+    /// 让 pf 中的规则与当前状态一致；失败时记下，稍后重试。
     fn sync(&mut self) -> Result<()> {
+        let r = self.sync_inner();
+        self.dirty = r.is_err();
+        r
+    }
+
+    fn sync_inner(&mut self) -> Result<()> {
         match (self.rules.block_all.clone(), self.blocked) {
             (Some(policy), true) => {
                 let text = pfrules::render(&policy);
@@ -163,10 +172,14 @@ impl Firewall for PfFirewall {
         self.synced_once = true;
         self.rules = rules;
         self.warn_limits();
-        if changed || first {
+        if changed || first || self.dirty {
             self.sync()?;
         }
         Ok(())
+    }
+
+    fn has_pending(&self) -> bool {
+        self.dirty
     }
 
     fn per_app(&self) -> bool {
