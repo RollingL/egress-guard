@@ -315,6 +315,8 @@ pub enum Loaded {
     LastGood { cfg: Config, error: String, broken: Option<PathBuf> },
     /// 配置文件有误，也没有可用的最近有效配置。
     Failed { error: String, broken: Option<PathBuf> },
+    /// 真正的首次启动：配置文件和最近有效配置的副本都确实不存在。调用方可以创建默认配置。
+    Missing,
 }
 
 /// 最近一次有效配置的副本：每次保存、每次成功读取后更新，配置文件损坏时用它恢复保护。
@@ -354,6 +356,22 @@ impl Config {
         Self::parse_lenient(&text).with_context(|| format!("配置文件 {} 有误", path.display()))
     }
 
+    /// 启动时读取配置（界面和后台服务共用）。区分：
+    ///
+    /// - 配置文件和最近有效配置的副本都确实不存在：[`Loaded::Missing`]（首次启动，可以创建默认配置）；
+    /// - 配置文件不存在、但副本还在（例如被误删）：用副本恢复（[`Loaded::LastGood`]），副本不能被默认配置覆盖；
+    /// - 其他情况（包括无法判断文件是否存在的权限、I/O 错误）：见 [`Config::load_recovering`]。
+    pub fn load_startup(path: &Path) -> Loaded {
+        let exists = |p: &Path| !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        if exists(path) {
+            return Self::load_recovering(path);
+        }
+        if !exists(&last_good_path(path)) {
+            return Loaded::Missing;
+        }
+        Self::from_last_good(path, format!("配置文件 {} 不存在", path.display()), None)
+    }
+
     /// 读取配置文件；读取失败或内容有误时改用最近一次有效的配置（[`last_good_path`]），
     /// 无法解析的原文件另存为 [`broken_path`]。没有可用的最近有效配置时返回 `Err`（调用方决定怎么退回）。
     ///
@@ -369,10 +387,8 @@ impl Config {
         };
         match Self::parse_lenient(&text) {
             Ok(cfg) => {
-                let private = cfg.has_secrets();
-                if let Err(e) = write_atomic(&last_good_path(path), text.as_bytes(), Some(private).filter(|p| *p)) {
-                    log::warn!("无法更新最近有效配置的副本: {e:#}");
-                }
+                // 副本按校验后的配置重新生成（不是原文）：原文里写错、被忽略的一节可能带着令牌等凭据
+                cfg.write_last_good(path);
                 Loaded::Ok(cfg)
             }
             Err(e) => {
@@ -608,17 +624,29 @@ impl Config {
     /// 先在同一目录写临时文件再替换：写到一半中断时原配置保持完整。带 GitHub 令牌时临时文件一创建就只有
     /// 所有者能读写（Unix 0600；Windows 只给 SYSTEM、管理员组和所有者），令牌不会经过可读的窗口。
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = format!(
-            "# egress-guard 配置（由程序保存，说明见 config.example.toml）\n\n{}",
-            toml::to_string_pretty(&self.to_raw())?
-        );
+        let text = self.to_text()?;
         let private = self.has_secrets();
         write_atomic(path, text.as_bytes(), Some(private).filter(|p| *p))?;
         // 刚保存的是校验过的配置：同时更新最近有效配置的副本（失败不影响保存本身）
-        if let Err(e) = write_atomic(&last_good_path(path), text.as_bytes(), Some(private).filter(|p| *p)) {
+        self.write_last_good(path);
+        Ok(())
+    }
+
+    /// 保存时写入的文本。
+    fn to_text(&self) -> Result<String> {
+        Ok(format!(
+            "# egress-guard 配置（由程序保存，说明见 config.example.toml）\n\n{}",
+            toml::to_string_pretty(&self.to_raw())?
+        ))
+    }
+
+    /// 更新最近有效配置的副本：按校验后的配置生成，一律只让所有者读写（Unix 0600，Windows 私有 ACL；
+    /// 已有的宽权限副本被替换后同样收紧）。失败只记日志。
+    fn write_last_good(&self, path: &Path) {
+        let r = self.to_text().and_then(|t| write_atomic(&last_good_path(path), t.as_bytes(), Some(true)));
+        if let Err(e) = r {
             log::warn!("无法更新最近有效配置的副本: {e:#}");
         }
-        Ok(())
     }
 
     /// 出口 IP 是否命中白名单。
@@ -1078,10 +1106,11 @@ apps = ['C:\Program Files\App\app.exe']
         std::fs::remove_file(last_good_path(&path)).unwrap();
         assert!(matches!(Config::load_recovering(&path), Loaded::Failed { broken: Some(_), .. }));
 
-        // 正常读取会刷新最近有效配置（包括手工编辑的有效配置）
+        // 正常读取会刷新最近有效配置（包括手工编辑的有效配置），内容按校验后的配置生成
         std::fs::write(&path, SAMPLE).unwrap();
-        assert!(matches!(Config::load_recovering(&path), Loaded::Ok(_)));
-        assert_eq!(std::fs::read_to_string(last_good_path(&path)).unwrap(), SAMPLE);
+        let Loaded::Ok(c) = Config::load_recovering(&path) else { panic!() };
+        let good = std::fs::read_to_string(last_good_path(&path)).unwrap();
+        assert_eq!(Config::parse(&good).unwrap().to_raw(), c.to_raw());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1095,7 +1124,8 @@ apps = ['C:\Program Files\App\app.exe']
         let Loaded::Ok(c) = Config::load_recovering(&path) else { panic!() };
         assert_eq!(c.apps.len(), 1);
         assert!(!c.leak_test.auto);
-        assert_eq!(std::fs::read_to_string(last_good_path(&path)).unwrap(), text);
+        let good = std::fs::read_to_string(last_good_path(&path)).unwrap();
+        assert_eq!(Config::parse(&good).unwrap().to_raw(), c.to_raw());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1199,6 +1229,72 @@ apps = ['C:\Program Files\App\app.exe']
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动入口：首次启动、主文件丢失（副本还在）、损坏、读不了，分别处理；主文件丢失时不能用默认配置覆盖副本。
+    #[test]
+    fn startup_entry_distinguishes_first_run_and_recovery() {
+        let dir = temp_dir("startup");
+        let path = dir.join("config.toml");
+        assert!(matches!(Config::load_startup(&path), Loaded::Missing));
+
+        let mut cfg = Config::parse(SAMPLE).unwrap();
+        cfg.block_all.enabled = true;
+        cfg.save(&path).unwrap();
+        let good = std::fs::read_to_string(last_good_path(&path)).unwrap();
+        // 主文件被删：用副本恢复，而不是当作首次启动
+        std::fs::remove_file(&path).unwrap();
+        match Config::load_startup(&path) {
+            Loaded::LastGood { cfg: c, error, broken: None } => {
+                assert_eq!(c.to_raw(), cfg.to_raw());
+                assert!(error.contains("不存在"), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(last_good_path(&path)).unwrap(), good, "副本不能被改动");
+        // 主文件丢失、副本也坏了：报告失败，不当作首次启动（调用方不会创建默认配置覆盖它）
+        std::fs::write(last_good_path(&path), "whitelist=[\"x\"]").unwrap();
+        assert!(matches!(Config::load_startup(&path), Loaded::Failed { broken: None, .. }));
+        std::fs::write(last_good_path(&path), &good).unwrap();
+        // 主文件损坏：副本恢复，原文另存
+        std::fs::write(&path, "apps = [").unwrap();
+        assert!(matches!(Config::load_startup(&path), Loaded::LastGood { broken: Some(_), .. }));
+        // 主文件读不了（这里用目录代替）
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(matches!(Config::load_startup(&path), Loaded::LastGood { broken: None, .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 最近有效配置的副本：按校验后的配置生成（写错而被忽略的一节里的令牌不会进副本），一律私有。
+    #[test]
+    fn last_good_copy_is_validated_and_private() {
+        let dir = temp_dir("lastgood-private");
+        let path = dir.join("config.toml");
+        // [update] 写错（仓库格式不对）：整节改用默认值，令牌随之丢弃；它不能出现在副本里
+        let text = format!("{SAMPLE}\n[update]\ncheck=true\nrepo=\"not a repo\"\ntoken=\"TEST-MARKER-123\"\n");
+        std::fs::write(&path, &text).unwrap();
+        let Loaded::Ok(c) = Config::load_recovering(&path) else { panic!() };
+        assert!(c.update.token.is_empty());
+        let good = std::fs::read_to_string(last_good_path(&path)).unwrap();
+        assert!(!good.contains("TEST-MARKER-123"), "{good}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&last_good_path(&path)), 0o600);
+            // 已有的宽权限副本在下一次刷新时收紧
+            std::fs::set_permissions(last_good_path(&path), std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::write(&path, SAMPLE).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(Config::load_recovering(&path), Loaded::Ok(_)));
+            assert_eq!(mode(&last_good_path(&path)), 0o600);
+            // 保存不带凭据的配置：主文件沿用原权限，副本仍然私有
+            Config::parse(SAMPLE).unwrap().save(&path).unwrap();
+            assert_eq!(mode(&path), 0o644);
+            assert_eq!(mode(&last_good_path(&path)), 0o600);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

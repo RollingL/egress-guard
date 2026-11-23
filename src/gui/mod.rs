@@ -212,12 +212,17 @@ struct App {
 }
 
 pub fn run(opts: Options) -> Result<()> {
-    let (cfg, load_error) = if opts.config_path.exists() {
+    let (cfg, load_error) = {
         let saved_as = |broken: &Option<std::path::PathBuf>| match broken {
             Some(b) => format!("原文件已另存为 {}。", b.display()),
             None => String::new(),
         };
-        match Config::load_recovering(&opts.config_path) {
+        // 与后台服务共用的启动入口：配置文件丢失但最近有效的副本还在时用副本恢复，而不是当作首次启动
+        match Config::load_startup(&opts.config_path) {
+            config::Loaded::Missing => {
+                log::info!("配置文件不存在，将使用默认设置：{}", opts.config_path.display());
+                (Config::from_raw(RawConfig::default())?, None)
+            }
             config::Loaded::Ok(c) => (c, None),
             config::Loaded::LastGood { cfg: c, error, broken } => {
                 let msg = format!(
@@ -235,9 +240,6 @@ pub fn run(opts: Options) -> Result<()> {
                 (Config::from_raw(RawConfig::default())?, Some(msg))
             }
         }
-    } else {
-        log::info!("配置文件不存在，将使用默认设置：{}", opts.config_path.display());
-        (Config::from_raw(RawConfig::default())?, None)
     };
 
     let viewport = egui::ViewportBuilder::default()

@@ -102,15 +102,16 @@ fn autostart_enabled() -> bool {
     false
 }
 
-/// 读取配置；不存在时创建默认配置（与 Windows 相同，默认不开启全局断网，安装后不会立刻断网）。
-/// 配置文件有误时改用最近一次有效的配置（第二项说明恢复情况）。
+/// 读取配置；只有配置文件和最近有效配置的副本都不存在（真正的首次启动）时才创建默认配置
+/// （与 Windows 相同，默认不开启全局断网，安装后不会立刻断网）。
+/// 配置文件丢失、有误或读不了时改用最近一次有效的配置；那时不创建默认配置，副本不会被覆盖。
 fn load_or_create(path: &Path) -> Loaded {
-    if path.exists() {
-        return Config::load_recovering(path);
-    }
-    match create_default(path) {
-        Ok(cfg) => Loaded::Ok(cfg),
-        Err(e) => Loaded::Failed { error: format!("{e:#}"), broken: None },
+    match Config::load_startup(path) {
+        Loaded::Missing => match create_default(path) {
+            Ok(cfg) => Loaded::Ok(cfg),
+            Err(e) => Loaded::Failed { error: format!("{e:#}"), broken: None },
+        },
+        other => other,
     }
 }
 
@@ -147,6 +148,7 @@ pub fn run(opts: Options) -> Result<()> {
             );
             (c, Some(msg))
         }
+        Loaded::Missing => unreachable!("load_or_create 已经处理"),
         Loaded::Failed { error: e, broken } => {
             // 配置损坏、也没有最近有效的配置时仍然启动，并按最安全的方式（全局断网）运行，界面可以重新保存
             log::error!("{e}");
@@ -250,4 +252,30 @@ mod tests {
         assert!(format!("{err:#}").contains("引擎已经停止"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 服务的启动入口：主文件被删、副本还在时用副本恢复，不创建默认配置、不覆盖副本；
+    /// 两者都不存在才创建默认配置。
+    #[test]
+    fn startup_recovers_instead_of_overwriting_last_good() {
+        let dir = std::env::temp_dir().join(format!("eg-daemon-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let Loaded::Ok(fresh) = load_or_create(&path) else { panic!("首次启动应创建默认配置") };
+        assert!(path.exists() && !fresh.block_all.enabled);
+
+        let mut raw = RawConfig { whitelist: vec!["203.0.113.0/24".into()], apps: vec!["/Applications/A.app".into()], ..Default::default() };
+        raw.block_all.enabled = true;
+        let cfg = Config::from_raw(raw).unwrap();
+        cfg.save(&path).unwrap();
+        let good = std::fs::read_to_string(crate::config::last_good_path(&path)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        match load_or_create(&path) {
+            Loaded::LastGood { cfg: c, .. } => assert_eq!(c.to_raw(), cfg.to_raw()),
+            other => panic!("{other:?}"),
+        }
+        assert!(!path.exists(), "不能用默认配置补上主文件");
+        assert_eq!(std::fs::read_to_string(crate::config::last_good_path(&path)).unwrap(), good);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
