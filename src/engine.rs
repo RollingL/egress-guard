@@ -45,7 +45,7 @@ pub enum Event {
 }
 
 /// 引擎对外报告的状态快照。macOS 上由后台服务通过本地套接字发给界面。
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Status {
     /// 最近一次检测到的出口 IP。
@@ -325,6 +325,8 @@ fn run(
     update_status(&mut status, &ctrl, checking);
     status.vpn_connected = vpn::names(&vpn_links);
     reporter(&status);
+    // 上一次报告的状态：没有变化时不再报告（每个事件、每次定时器到期都会走一遍循环）
+    let mut reported = status.clone();
 
     loop {
         if ctrl.needs_retry() {
@@ -544,7 +546,10 @@ fn run(
         status.generation = generation;
         vpn_watch.set_active(!guarded.is_empty());
         update_status(&mut status, &ctrl, checking);
-        reporter(&status);
+        if status != reported {
+            reporter(&status);
+            reported.clone_from(&status);
+        }
     }
 
     log::info!("引擎退出，移除阻断规则");
