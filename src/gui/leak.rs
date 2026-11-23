@@ -22,6 +22,8 @@ pub(super) enum Task<T> {
     Idle,
     Running { since: Instant, progress: u32 },
     Done { at: String, result: T },
+    /// 自动测试期间网络、设置或阻断状态变了：结果作废，不显示过期的结论。
+    Cancelled { at: String },
 }
 
 type Shared<T> = Arc<Mutex<Task<T>>>;
@@ -209,7 +211,9 @@ impl LeakJob {
                     let r = r.map_err(|e| format!("{e:#}"));
                     results.lock().unwrap().dns = Some(r.clone());
                     if meta.lock().unwrap().id == id {
-                        *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
+                        let at = crate::logbuf::now_hms();
+                        // 与通知、连接记录用同一个有效性判断：作废的测试不覆盖测试页
+                        *task.lock().unwrap() = if valid() { Task::Done { at, result: r } } else { Task::Cancelled { at } };
                     }
                     ctx.request_repaint();
                     finish(&remaining, &done);
@@ -226,7 +230,9 @@ impl LeakJob {
                     log::info!("WebRTC 泄露测试：{}", leaktest::webrtc_summary(&r).1);
                     results.lock().unwrap().webrtc = Some(r.clone());
                     if meta.lock().unwrap().id == id {
-                        *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
+                        let at = crate::logbuf::now_hms();
+                        // 与通知、连接记录用同一个有效性判断：作废的测试不覆盖测试页
+                        *task.lock().unwrap() = if valid() { Task::Done { at, result: r } } else { Task::Cancelled { at } };
                     }
                     ctx.request_repaint();
                     finish(&remaining, &done);
@@ -371,11 +377,12 @@ impl App {
             Task::Done { at, result: Ok(r) } => {
                 let r = r.judged(&j);
                 let (l, t) = leaktest::dns_summary(&r);
-                LeakView::Done { at: at.clone(), level: Some(l), text: t, dns: Some(Box::new(r)), rtc: None }
+                LeakView::Done { at: at.clone(), level: Some(l), text: t, dns: Some(Box::new(r)), rtc: None, cancelled: false }
             }
             Task::Done { at, result: Err(e) } => {
-                LeakView::Done { at: at.clone(), level: None, text: format!("测试失败：{e}"), dns: None, rtc: None }
+                LeakView::Done { at: at.clone(), level: None, text: format!("测试失败：{e}"), dns: None, rtc: None, cancelled: false }
             }
+            Task::Cancelled { at } => LeakView::cancelled(at),
         };
         let w = match &*self.leak.job.webrtc.lock().unwrap() {
             Task::Idle => LeakView::Idle,
@@ -383,8 +390,9 @@ impl App {
             Task::Done { at, result } => {
                 let r = result.judged(&j);
                 let (l, t) = leaktest::webrtc_summary(&r);
-                LeakView::Done { at: at.clone(), level: Some(l), text: t, dns: None, rtc: Some(Box::new(r)) }
+                LeakView::Done { at: at.clone(), level: Some(l), text: t, dns: None, rtc: Some(Box::new(r)), cancelled: false }
             }
+            Task::Cancelled { at } => LeakView::cancelled(at),
         };
         (d, w)
     }
@@ -395,6 +403,7 @@ impl App {
         let (text, color) = match (&d, &w) {
             (LeakView::Running(..), _) | (_, LeakView::Running(..)) => ("测试中…".to_owned(), p.secondary),
             (LeakView::Idle, LeakView::Idle) => ("未测试".to_owned(), p.accent),
+            (LeakView::Done { cancelled: true, .. }, LeakView::Done { cancelled: true, .. }) => ("已取消".to_owned(), p.gray),
             _ => {
                 let worst = [d.level(), w.level()].into_iter().flatten().max_by_key(|l| *l as u8);
                 match worst {
@@ -449,6 +458,9 @@ impl App {
                 ui.vertical(|ui| {
                     let title = match (d.level(), w.level()) {
                         _ if busy => "正在测试…",
+                        _ if matches!((&d, &w), (LeakView::Done { cancelled: true, .. }, LeakView::Done { cancelled: true, .. })) => {
+                            "测试已取消"
+                        }
                         (Some(Level::Leak), _) | (_, Some(Level::Leak)) => "发现泄露",
                         (Some(Level::Ok), Some(Level::Ok)) => "未发现泄露",
                         _ if matches!((&d, &w), (LeakView::Idle, LeakView::Idle)) => "尚未测试",
@@ -831,10 +843,29 @@ enum LeakView {
     Idle,
     /// 已运行秒数、收到的查询数。
     Running(u64, u32),
-    Done { at: String, level: Option<Level>, text: String, dns: Option<Box<DnsReport>>, rtc: Option<Box<WebRtcReport>> },
+    Done {
+        at: String,
+        level: Option<Level>,
+        text: String,
+        dns: Option<Box<DnsReport>>,
+        rtc: Option<Box<WebRtcReport>>,
+        /// 测试作废了（网络或设置变了）。
+        cancelled: bool,
+    },
 }
 
 impl LeakView {
+    fn cancelled(at: &str) -> Self {
+        LeakView::Done {
+            at: at.to_owned(),
+            level: None,
+            text: "已取消：测试期间网络、设置或阻断状态变了，结果作废".to_owned(),
+            dns: None,
+            rtc: None,
+            cancelled: true,
+        }
+    }
+
     fn level(&self) -> Option<Level> {
         match self {
             LeakView::Done { level, .. } => *level,
