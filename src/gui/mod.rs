@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod icons;
+mod leak;
 mod platform;
 mod theme;
 #[cfg(windows)]
@@ -94,8 +95,10 @@ type Job = Arc<Mutex<Option<Result<(), String>>>>;
 pub struct Options {
     pub config_path: PathBuf,
     pub start_minimized: bool,
-    /// 打开时显示的页面（overview / whitelist / apps / network / settings / log），用于截图。
+    /// 打开时显示的页面（overview / whitelist / apps / network / leaktest / settings / log），用于截图。
     pub start_page: Option<String>,
+    /// 打开后立即开始泄露测试（截图、CI 用）。
+    pub run_leak_test: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -104,6 +107,7 @@ enum Page {
     Whitelist,
     Apps,
     Network,
+    Leak,
     Settings,
     Log,
 }
@@ -115,6 +119,7 @@ impl Page {
             "whitelist" => Page::Whitelist,
             "apps" => Page::Apps,
             "network" => Page::Network,
+            "leaktest" => Page::Leak,
             "settings" => Page::Settings,
             "log" => Page::Log,
             _ => return None,
@@ -122,7 +127,7 @@ impl Page {
     }
 
     fn editable(self) -> bool {
-        matches!(self, Page::Whitelist | Page::Apps | Page::Network | Page::Settings)
+        matches!(self, Page::Whitelist | Page::Apps | Page::Network | Page::Leak | Page::Settings)
     }
 }
 
@@ -175,6 +180,10 @@ struct App {
     /// macOS 网络扩展的安装状态（系统一侧），以及上次请求刷新的时间。
     netext: crate::netext::State,
     netext_refreshed: Option<Instant>,
+    /// 泄露测试页的状态与结果。
+    leak: leak::LeakUi,
+    /// 第一帧开始泄露测试。
+    run_leak_test: bool,
 }
 
 pub fn run(opts: Options) -> Result<()> {
@@ -235,6 +244,8 @@ pub fn run(opts: Options) -> Result<()> {
 
             let raw = cfg.to_raw();
             Ok(Box::new(App {
+                leak: leak::LeakUi::new(&raw.leak_test.stun_servers),
+                run_leak_test: opts.run_leak_test,
                 autostart: backend.autostart_enabled(),
                 backend,
                 status,
@@ -475,6 +486,7 @@ impl App {
     fn revert(&mut self) {
         self.draft = self.applied.clone();
         self.services_text = self.draft.detect.services.join("\n");
+        self.leak.reset_text(&self.draft.leak_test.stun_servers);
         self.message = None;
         self.entry_error = None;
         self.remote_error = None;
@@ -790,6 +802,7 @@ impl App {
             (Page::Whitelist, theme::NavItem { glyph: Glyph::Check, icon_bg: p.accent, text: "出口 IP 白名单", badge: Some(&wl) }),
             (Page::Apps, theme::NavItem { glyph: Glyph::Grid, icon_bg: p.orange, text: "受控应用", badge: Some(&apps) }),
             (Page::Network, theme::NavItem { glyph: Glyph::Globe, icon_bg: p.red, text: "全局断网", badge: Some(scope) }),
+            (Page::Leak, theme::NavItem { glyph: Glyph::Drop, icon_bg: p.teal, text: "泄露测试", badge: None }),
             (Page::Settings, theme::NavItem { glyph: Glyph::Gear, icon_bg: p.gray, text: "设置", badge: None }),
             (Page::Log, theme::NavItem { glyph: Glyph::Lines, icon_bg: p.indigo, text: "日志", badge: None }),
         ];
@@ -972,6 +985,10 @@ impl App {
                     goto = Some(Page::Whitelist);
                 }
             });
+            theme::hairline(ui, p);
+            if self.leak_overview_row(ui, p) {
+                goto = Some(Page::Leak);
+            }
         });
         if let Some(pg) = goto {
             self.page = pg;
@@ -1733,6 +1750,17 @@ impl eframe::App for App {
                 self.applied = raw.clone();
                 self.draft = raw;
                 self.services_text = self.draft.detect.services.join("\n");
+                self.leak.reset_text(&self.draft.leak_test.stun_servers);
+            }
+        }
+        // --leak-test：等出口 IP 检测出来（最多 15 秒）再开始，结果才能和出口对照
+        if self.run_leak_test {
+            let known = self.status.lock().unwrap().egress_ip.is_some();
+            if known || ctx.input(|i| i.time) > 15.0 {
+                self.run_leak_test = false;
+                self.start_leak_test(ctx);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(200));
             }
         }
         if !self.started {
@@ -1816,6 +1844,7 @@ impl eframe::App for App {
                         Page::Whitelist => self.whitelist(ui, &p),
                         Page::Apps => self.apps(ui, &p),
                         Page::Network => self.network(ui, &p),
+                        Page::Leak => self.leak_page(ui, &p),
                         Page::Settings => self.settings(ui, &p),
                         Page::Log => {}
                     }

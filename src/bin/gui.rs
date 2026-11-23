@@ -5,6 +5,7 @@
 //!   --minimized        启动后直接隐藏到托盘 / 菜单栏（开机自启时使用）
 //!   -c, --config PATH  配置文件路径（Windows，默认：exe 所在目录下的 config.toml）
 //!   --page NAME        打开时显示的页面（截图用）
+//!   --leak-test        打开后立即开始 DNS / WebRTC 泄露测试（截图用）
 //!   --netext-selftest [秒]  macOS：查询网络扩展状态并尝试安装，打印结果后退出（CI 用）
 //!   --clipboard-selftest 输出文件 [秒]  打开一个输入框窗口检查系统剪贴板的复制、粘贴（CI 用）
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -36,11 +37,13 @@ fn main() {
     let mut start_minimized = false;
     let mut config: Option<PathBuf> = None;
     let mut start_page = None;
+    let mut run_leak_test = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--minimized" => start_minimized = true,
             "-c" | "--config" => config = args.next().map(PathBuf::from),
             "--page" => start_page = args.next(),
+            "--leak-test" => run_leak_test = true,
             "--clipboard-selftest" => clipboard_selftest(args),
             _ => {}
         }
@@ -65,7 +68,7 @@ fn main() {
     logbuf::init("info", false, Some(&dir.join("egress-guard.log")));
     log::info!("egress-guard-gui {} 启动", env!("CARGO_PKG_VERSION"));
 
-    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page }) {
+    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test }) {
         log::error!("{e:#}");
         let text: Vec<u16> = format!("{e:#}").encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
@@ -86,10 +89,12 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut start_minimized = false;
     let mut start_page = None;
+    let mut run_leak_test = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--minimized" => start_minimized = true,
             "--page" => start_page = args.next(),
+            "--leak-test" => run_leak_test = true,
             // CI 自检：查询网络扩展状态并尝试安装，打印结果（JSON）后退出
             "--netext-selftest" => {
                 egress_guard::netext::selftest(args.next().and_then(|s| s.parse().ok()).unwrap_or(10.0));
@@ -117,7 +122,7 @@ fn main() {
 
     // 配置由后台服务保存；这里的路径只在连不上服务时作为占位
     let config_path = paths::config_path();
-    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page }) {
+    if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test }) {
         log::error!("{e:#}");
         let msg = format!("{e:#}").replace('\\', "\\\\").replace('"', "\\\"");
         let _ = std::process::Command::new("/usr/bin/osascript")
@@ -137,14 +142,16 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut config_path = std::path::PathBuf::from("config.toml");
     let mut start_page = None;
+    let mut run_leak_test = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--page" => start_page = args.next(),
+            "--leak-test" => run_leak_test = true,
             "--clipboard-selftest" => clipboard_selftest(args),
             other => config_path = other.into(),
         }
     }
-    if let Err(e) = gui::run(gui::Options { config_path, start_minimized: false, start_page }) {
+    if let Err(e) = gui::run(gui::Options { config_path, start_minimized: false, start_page, run_leak_test }) {
         eprintln!("{e:#}");
         std::process::exit(1);
     }

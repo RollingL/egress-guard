@@ -48,7 +48,7 @@ impl Handler for Daemon {
         *self.raw.lock().unwrap() = cfg.to_raw();
         *self.config_error.lock().unwrap() = None;
         log::info!("界面保存了新配置");
-        self.send(Event::Reconfigure(cfg));
+        self.send(Event::Reconfigure(Box::new(cfg)));
         Ok(())
     }
 

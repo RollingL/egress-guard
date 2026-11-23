@@ -41,6 +41,40 @@ pub struct RawConfig {
     pub children: ChildrenConfig,
     #[serde(default)]
     pub block_all: BlockAllConfig,
+    #[serde(default)]
+    pub leak_test: LeakTestConfig,
+}
+
+/// 泄露测试（DNS、WebRTC）。只在手动点「开始测试」或运行 `egress-guard leak-test` 时使用。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LeakTestConfig {
+    /// 可信的 DNS 解析器：IP、CIDR 或自治系统号（如 `AS13335`）。
+    /// DNS 泄露测试发现的解析器在这里、或在出口 IP 白名单内时不算泄露。
+    pub trusted_dns: Vec<String>,
+    /// DNS 泄露测试服务的域名（addr.tools 的 dnscheck，开源可自建）。
+    pub dnscheck_zone: String,
+    /// 使用的 DNS 检测源：dnscheck（WebSocket 推送，能看到全部解析器和 ECS），
+    /// 以及 ip-api、every1dns、fastly、surfshark、ipleak、browserleaks（每个一次 HTTP 请求）。
+    pub dns_sources: Vec<String>,
+    /// WebRTC 泄露测试用的 STUN 服务器（主机:端口），按顺序尝试。
+    pub stun_servers: Vec<String>,
+}
+
+impl Default for LeakTestConfig {
+    fn default() -> Self {
+        Self {
+            trusted_dns: Vec::new(),
+            dnscheck_zone: "dnscheck.tools".into(),
+            dns_sources: crate::leaktest::dns::all_source_names(),
+            stun_servers: vec![
+                "myip.addr.tools:3478".into(),
+                "stun.cloudflare.com:3478".into(),
+                "stun.l.google.com:19302".into(),
+                "stun.miwifi.com:3478".into(),
+            ],
+        }
+    }
 }
 
 /// 全局断网：出口 IP 不在白名单时切断本机全部网络（而不只是受控应用）。
@@ -170,6 +204,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub children: ChildrenConfig,
     pub block_all: BlockAllConfig,
+    pub leak_test: LeakTestConfig,
 }
 
 impl Config {
@@ -219,6 +254,28 @@ impl Config {
         }
         let mut detect = raw.detect;
         detect.services.retain(|s| !s.trim().is_empty());
+        let mut leak_test = raw.leak_test;
+        leak_test.trusted_dns = leak_test
+            .trusted_dns
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| crate::leaktest::Trusted::parse(s).map(|t| t.to_string()).with_context(|| "可信 DNS 解析器有误"))
+            .collect::<Result<Vec<_>>>()?;
+        leak_test.dnscheck_zone = leak_test.dnscheck_zone.trim().trim_matches('.').to_ascii_lowercase();
+        if !crate::leaktest::valid_zone(&leak_test.dnscheck_zone) {
+            bail!("DNS 泄露测试服务的域名有误: {:?}", leak_test.dnscheck_zone);
+        }
+        leak_test.dns_sources.retain(|s| !s.trim().is_empty());
+        for s in &mut leak_test.dns_sources {
+            *s = s.trim().to_ascii_lowercase();
+            if !crate::leaktest::dns::all_source_names().contains(s) {
+                bail!("未知的 DNS 检测源: {s:?}（可用：{}）", crate::leaktest::dns::all_source_names().join("、"));
+            }
+        }
+        leak_test.stun_servers = leak_test.stun_servers.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+        for s in &leak_test.stun_servers {
+            crate::leaktest::stun::split_host_port(s).with_context(|| format!("STUN 服务器有误: {s:?}"))?;
+        }
         Ok(Self {
             whitelist,
             apps: raw.apps,
@@ -227,6 +284,7 @@ impl Config {
             ui: raw.ui,
             children: raw.children,
             block_all,
+            leak_test,
         })
     }
 
@@ -240,6 +298,7 @@ impl Config {
             ui: self.ui.clone(),
             children: self.children.clone(),
             block_all: self.block_all.clone(),
+            leak_test: self.leak_test.clone(),
         }
     }
 
@@ -305,7 +364,7 @@ pub fn is_windows_absolute(p: &str) -> bool {
 }
 
 /// 把 IPv4 映射的 IPv6 地址（::ffff:a.b.c.d）还原成 IPv4。
-fn normalize(ip: IpAddr) -> IpAddr {
+pub fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
@@ -375,6 +434,25 @@ apps = ['C:\Program Files\App\app.exe']
         assert_eq!(cfg.block_all.allow_remote, vec!["198.51.100.7", "203.0.113.0/24"]);
         assert!(Config::parse(&format!("{SAMPLE}\n[block_all]\nallow_remote=[\"x\"]")).is_err());
         assert!(Config::parse(&format!("{SAMPLE}\n[block_all]\nallow_apps=['vpn.exe']")).is_err());
+    }
+
+    #[test]
+    fn leak_test_section() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert_eq!(cfg.leak_test.dnscheck_zone, "dnscheck.tools");
+        assert!(!cfg.leak_test.stun_servers.is_empty());
+        let cfg = Config::parse(&format!(
+            "{SAMPLE}\n[leak_test]\ntrusted_dns=[\"as13335\", \"203.0.113.9/24\", \" \"]\ndnscheck_zone=\"Example.ORG.\"\nstun_servers=[\"stun.example.org:3478\", \"[2001:db8::1]:3478\"]"
+        ))
+        .unwrap();
+        assert_eq!(cfg.leak_test.trusted_dns, vec!["AS13335", "203.0.113.0/24"]);
+        assert_eq!(cfg.leak_test.dnscheck_zone, "example.org");
+        assert_eq!(cfg.leak_test.stun_servers.len(), 2);
+        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ntrusted_dns=[\"ASx\"]")).is_err());
+        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\nstun_servers=[\"stun.example.org\"]")).is_err());
+        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndnscheck_zone=\"a b\"")).is_err());
+        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"Fastly\", \"dnscheck\"]")).is_ok());
+        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"nope\"]")).is_err());
     }
 
     #[test]

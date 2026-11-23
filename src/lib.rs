@@ -13,6 +13,7 @@ pub mod egress;
 pub mod engine;
 #[cfg(unix)]
 pub mod filterfeed;
+pub mod leaktest;
 pub mod gui;
 #[cfg(unix)]
 pub mod ipc;

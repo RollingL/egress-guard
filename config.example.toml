@@ -83,3 +83,19 @@ allow_remote = [
 [ui]
 # 界面外观：system（跟随系统）/ light（浅色）/ dark（深色）。命令行版本忽略此项
 appearance = "system"
+
+[leak_test]
+# 泄露测试（界面「泄露测试」页、命令行 egress-guard leak-test）。只在手动开始测试时使用。
+# 可信 DNS 解析器：IP、CIDR 或自治系统号。DNS 泄露测试发现的解析器在这里或在出口 IP 白名单内时，不算泄露。
+# 用 Cloudflare、Google 等公共解析器时，它们向外查询的 IP 不固定，按自治系统信任更方便。
+trusted_dns = [
+    # "AS13335",          # Cloudflare 1.1.1.1
+    # "198.51.100.53",
+]
+# DNS 测试服务的域名：addr.tools 的 dnscheck（开源，可自建）
+dnscheck_zone = "dnscheck.tools"
+# DNS 检测源：dnscheck（WebSocket 实时推送，能看到全部解析器和 ECS），
+# 以及 ip-api、every1dns、fastly、surfshark、ipleak、browserleaks（每个发一次 HTTP 请求，只看到一个解析器）
+dns_sources = ["dnscheck", "ip-api", "every1dns", "fastly", "surfshark", "ipleak", "browserleaks"]
+# WebRTC 泄露测试用的 STUN 服务器（主机:端口），按顺序尝试
+stun_servers = ["myip.addr.tools:3478", "stun.cloudflare.com:3478", "stun.l.google.com:19302", "stun.miwifi.com:3478"]

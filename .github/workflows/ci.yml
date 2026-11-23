@@ -79,6 +79,70 @@ jobs:
           "输入框内容：$pasted"
           if ($pasted -ne '203.0.113.7') { Write-Error 'Ctrl+V 没有把系统剪贴板的内容粘贴进输入框' }
           else { 'OK：Ctrl+V 把系统剪贴板的内容粘贴进了输入框' }
+      - name: 泄露测试（命令行，DNS 与 WebRTC）
+        shell: pwsh
+        run: |
+          $ip = (Invoke-RestMethod https://api.ipify.org).Trim()
+          $cfg = Join-Path $env:RUNNER_TEMP 'leak.toml'
+          "whitelist = [`"$ip`"]`n[ui]`nappearance = `"light`"" | Set-Content -Encoding utf8 $cfg
+          target\release\egress-guard.exe -c $cfg leak-test
+          if ($LASTEXITCODE -ne 0) { Write-Error "泄露测试失败（退出码 $LASTEXITCODE）" }
+          $json = Join-Path $env:RUNNER_TEMP 'leak.json'
+          target\release\egress-guard.exe -c $cfg leak-test --json | Set-Content -Encoding utf8 $json
+          # 依赖外部服务：结果只打印；但输出必须是完整的 JSON，并且至少测了默认路由
+          $r = Get-Content -Raw $json | ConvertFrom-Json
+          if (-not $r.webrtc.report.paths) { Write-Error 'WebRTC 没有测试任何路径' }
+          "DNS：$($r.dns.summary.text)$($r.dns.error)"
+          "WebRTC：$($r.webrtc.summary.text)"
+      - name: 界面截图：泄露测试（浅色、深色）
+        shell: pwsh
+        env:
+          GALLIUM_DRIVER: llvmpipe
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win {
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+          }
+          '@
+          $shots = Join-Path $env:RUNNER_TEMP 'shots'
+          New-Item -ItemType Directory -Force $shots | Out-Null
+          $cfg = Join-Path $env:RUNNER_TEMP 'leak.toml'
+          foreach ($look in 'light', 'dark') {
+            (Get-Content -Raw $cfg) -replace 'appearance = "\w+"', "appearance = `"$look`"" | Set-Content -Encoding utf8 $cfg
+            $p = Start-Process (Join-Path $env:RUNNER_TEMP 'gui\egress-guard-gui.exe') -ArgumentList '-c', $cfg, '--page', 'leaktest', '--leak-test' -PassThru
+            Start-Sleep 40
+            $h = [Win]::FindWindow($null, '出口 IP 网络控制 - egress-guard')
+            $r = New-Object Win+RECT
+            if ($h -ne [IntPtr]::Zero -and [Win]::GetWindowRect($h, [ref]$r)) {
+              [Win]::SetForegroundWindow($h) | Out-Null
+              Start-Sleep 1
+              $x, $y, $w, $hh = $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top)
+            } else {
+              Write-Warning '找不到界面窗口，截全屏'
+              $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $x, $y, $w, $hh = 0, 0, $b.Width, $b.Height
+            }
+            $bmp = New-Object System.Drawing.Bitmap $w, $hh
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($x, $y, 0, 0, $bmp.Size)
+            $bmp.Save((Join-Path $shots "leaktest-$look.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+          Get-ChildItem $shots | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-screenshots
+          path: ${{ runner.temp }}/shots/
       - uses: actions/upload-artifact@v4
         with:
           name: egress-guard-windows
