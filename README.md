@@ -68,6 +68,13 @@ Windows 版提供两个程序：
 | DNS | 用系统解析器（和普通应用一样）查询几个随机子域名，由检测服务的权威服务器告诉本程序是哪些递归解析器来查的；同时查询这些解析器的运营商和所在地 | 解析器既不在白名单内、也不在「可信 DNS 解析器」里，也不和白名单内的出口属于同一个网络（自治系统）；或者解析器把白名单以外的客户端网段（ECS）转发了出去 |
 | WebRTC | 像浏览器收集 ICE 候选地址那样，从默认路由（IPv4、IPv6）和每个网卡地址分别向 STUN 服务器发送绑定请求，并列出网卡上的地址 | STUN 看到的公网 IP 不在白名单内（例如 VPN 之外的网卡还能直连外网，或者代理只管 TCP）；网卡上不在白名单内的公网地址标为「公网地址」，网页获得摄像头/麦克风权限后可以读到 |
 
+<p>
+  <img src="docs/leaktest-windows-light.png" width="49%" alt="Windows 泄露测试页：解析器与出口属于同一网络，未发现泄露">
+  <img src="docs/leaktest-macos-dark.png" width="49%" alt="macOS 泄露测试页（深色）：发现白名单以外的解析器和 WebRTC 公网 IP">
+</p>
+
+以上截图来自 GitHub Actions：Windows 虚拟机的解析器与出口同属 AS8075，判为未泄露；macOS 虚拟机用的是 Google 公共 DNS，且 STUN 看到的公网 IP 与出口 IP 不同，所以判为泄露。
+
 - DNS 检测源：主要用 [addr.tools](https://github.com/brianshea2/addr.tools) 的 dnscheck 服务（`wss://ws.dnscheck.tools/watch/<ID>` 实时推送每一个查询的来源，能看到全部解析器和 ECS，服务端开源、可以自建）；另外参考 [MyIP](https://github.com/jason5ng32/MyIP)，并行使用 ip-api、every1dns、fastly、surfshark、ipleak、browserleaks 六个「一次 HTTP 请求」式的检测源，dnscheck 连不上时也能给出结果。这些请求不走代理，域名一定由本机系统解析器解析。
 - 用 Cloudflare、Google 等公共解析器时，它们向外查询的 IP 不固定，可以在结果里点「信任 AS…」，按自治系统信任整个服务商。
 - 解析器和出口 IP 的归属（运营商、自治系统号、国家）来自 `ip.addr.tools`。
