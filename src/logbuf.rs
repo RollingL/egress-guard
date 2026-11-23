@@ -3,17 +3,57 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 const MAX_LINES: usize = 500;
 
+/// 日志文件超过这个大小时轮转：当前文件改名为 `<文件名>.1`（覆盖上一份），再新建一个。
+/// 后台服务可能几个月不重启，以前日志文件只增不减。
+const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// 日志文件及已写入的字节数。
+struct FileSink {
+    path: PathBuf,
+    file: Option<File>,
+    written: u64,
+    limit: u64,
+}
+
+impl FileSink {
+    fn create(path: &Path, limit: u64) -> Option<Self> {
+        let file = File::create(path).ok()?;
+        Some(Self { path: path.to_path_buf(), file: Some(file), written: 0, limit })
+    }
+
+    fn write_line(&mut self, line: &str) {
+        if self.written >= self.limit {
+            self.rotate();
+        }
+        if let Some(f) = self.file.as_mut() {
+            if writeln!(f, "{line}").is_ok() {
+                self.written += line.len() as u64 + 1;
+            }
+        }
+    }
+
+    fn rotate(&mut self) {
+        self.file = None; // 先关闭（Windows 上打开的文件不能改名）
+        let mut old = self.path.clone().into_os_string();
+        old.push(".1");
+        let _ = std::fs::rename(&self.path, &old);
+        // 新建失败时不再写文件（stderr 和界面里的日志照常）
+        self.file = File::create(&self.path).ok();
+        self.written = 0;
+    }
+}
+
 struct Logger {
     level: LevelFilter,
     stderr: bool,
-    file: Mutex<Option<File>>,
+    file: Mutex<Option<FileSink>>,
     lines: Mutex<VecDeque<String>>,
 }
 
@@ -38,7 +78,7 @@ impl Log for Logger {
             eprintln!("{line}");
         }
         if let Some(f) = self.file.lock().unwrap().as_mut() {
-            let _ = writeln!(f, "{line}");
+            f.write_line(&line);
         }
         let mut lines = self.lines.lock().unwrap();
         if lines.len() >= MAX_LINES {
@@ -50,10 +90,10 @@ impl Log for Logger {
     fn flush(&self) {}
 }
 
-/// 初始化全局日志。`file` 为 Some 时同时写入（覆盖）该文件。
+/// 初始化全局日志。`file` 为 Some 时同时写入（覆盖）该文件，超过 5 MB 时轮转一次。
 pub fn init(level: &str, stderr: bool, file: Option<&Path>) {
     let level = level.parse().unwrap_or(LevelFilter::Info);
-    let file = file.and_then(|p| File::create(p).ok());
+    let file = file.and_then(|p| FileSink::create(p, MAX_FILE_BYTES));
     let logger = LOGGER.get_or_init(|| Logger {
         level,
         stderr,
@@ -153,6 +193,31 @@ fn utc_now() -> (u32, u32, u32, u32, u32, u32) {
         (rem % 3600 / 60) as u32,
         (rem % 60) as u32,
     )
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    #[test]
+    fn log_file_rotates_at_limit() {
+        let dir = std::env::temp_dir().join(format!("eg-logrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.log");
+        let mut sink = FileSink::create(&path, 1024).unwrap();
+        for i in 0..100 {
+            sink.write_line(&format!("{i:03} {}", "x".repeat(40)));
+        }
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, vec!["t.log", "t.log.1"]);
+        let total: u64 = ["t.log", "t.log.1"].iter().map(|n| std::fs::metadata(dir.join(n)).unwrap().len()).sum();
+        assert!(total <= 2 * 1024 + 64, "{total}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("099 "), "最新的行在当前文件里");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(all(test, unix))]
