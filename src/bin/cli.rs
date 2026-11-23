@@ -100,6 +100,9 @@ enum Command {
         /// any / v6
         #[arg(long, default_value = "any")]
         family: String,
+        /// 设置里填写的检测代理
+        #[arg(long)]
+        proxy: Option<String>,
         services: Vec<String>,
     },
 }
@@ -116,11 +119,11 @@ enum ServiceAction {
 fn main() {
     let cli = Cli::parse();
     #[cfg(unix)]
-    if let Some(Command::Probe { timeout, family, services }) = &cli.command {
+    if let Some(Command::Probe { timeout, family, proxy, services }) = &cli.command {
         // 检测子进程：结果打印到 stdout，错误打印到 stderr 最后一行
         logbuf::init("error", true, None);
         let family = egress_guard::egress::Family::from_name(family).unwrap_or(egress_guard::egress::Family::Any);
-        let det = EgressDetector::with_family(services.clone(), Duration::from_secs(*timeout), family);
+        let det = EgressDetector::with_proxy(services.clone(), Duration::from_secs(*timeout), family, proxy.as_deref());
         match det.detect_direct() {
             Ok(ip) => println!("{ip}"),
             Err(e) => {

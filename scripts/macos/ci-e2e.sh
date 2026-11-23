@@ -196,7 +196,12 @@ write_cfg "\"$IP\"" dark
 "$CLI" apply /tmp/eg.toml || fail "apply 失败"
 wait_for "not s.get('blocked')" 30 || fail "没有放行"
 can_reach https://example.com && echo "OK：已放行" || fail "放行后仍不能访问"
-[[ -z "$(sudo pfctl -a com.apple/egress-guard -s rules 2>/dev/null)" ]] || fail "放行后锚点里仍有规则"
+# IPv6 默认「始终阻断」：放行后锚点里只剩 IPv6 规则（和回环放行），IPv4 规则必须全部移除
+RULES=$(sudo pfctl -a com.apple/egress-guard -s rules 2>/dev/null)
+echo "$RULES"
+LEFT=$(echo "$RULES" | grep -v '^$' | grep -v 'inet6' | grep -v ' on lo0 ' || true)
+[[ -z "$LEFT" ]] || fail "放行后锚点里仍有 IPv4 规则：$LEFT"
+echo "$RULES" | grep -q '^block.*inet6' && echo "OK：放行后仍始终阻断 IPv6" || fail "IPv6 默认始终阻断，放行后锚点里却没有 IPv6 阻断规则"
 shot 3-allowed-dark overview
 shot 4-settings-dark settings 4
 shot 5-whitelist-dark whitelist 4

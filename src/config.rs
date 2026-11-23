@@ -73,11 +73,11 @@ impl Default for VpnConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Ipv6Mode {
-    /// 另外检测 IPv6 出口：本机能直连 IPv6、而它的出口不在白名单时也阻断（默认）。
-    #[default]
+    /// 另外检测 IPv6 出口：本机能直连 IPv6、而它的出口不在白名单时也阻断。
     Check,
-    /// 始终阻断 IPv6（受控应用，或开启全局断网时的全部 IPv6），IPv4 照常按白名单放行。
+    /// 始终阻断 IPv6（受控应用，或开启全局断网时的全部 IPv6），IPv4 照常按白名单放行（默认）。
     /// 适合不支持 IPv6 的 VPN：IPv6 流量会绕过 VPN 直接出去。
+    #[default]
     Block,
     /// 不单独处理 IPv6（0.8 及以前的行为）。
     Off,
@@ -95,7 +95,7 @@ pub struct Ipv6Config {
 impl Default for Ipv6Config {
     fn default() -> Self {
         Self {
-            mode: Ipv6Mode::Check,
+            mode: Ipv6Mode::Block,
             services: vec!["https://6.ipw.cn".into(), "https://api6.ipify.org".into(), "https://v6.ident.me".into()],
         }
     }
@@ -239,6 +239,10 @@ pub struct DetectConfig {
     pub fail_mode: FailMode,
     /// 连续失败多少次后才执行 fail_mode（避免偶发抖动）。
     pub failure_threshold: u32,
+    /// 检测出口时使用的代理（如 `http://127.0.0.1:7890`、`socks5://127.0.0.1:7891`）。默认为空：直连检测。
+    /// 只有受控应用的流量全部经过这个代理时才适合填写，否则测到的是代理的出口，直连的应用会被误放行。
+    /// 不读 `HTTP(S)_PROXY` 等环境变量。
+    pub proxy: String,
 }
 
 impl Default for DetectConfig {
@@ -254,6 +258,7 @@ impl Default for DetectConfig {
             ],
             fail_mode: FailMode::Block,
             failure_threshold: 2,
+            proxy: String::new(),
         }
     }
 }
@@ -374,6 +379,10 @@ impl Config {
         }
         let mut detect = raw.detect;
         detect.services.retain(|s| !s.trim().is_empty());
+        detect.proxy = detect.proxy.trim().to_owned();
+        if !detect.proxy.is_empty() {
+            ureq::Proxy::new(&detect.proxy).with_context(|| format!("检测代理地址有误: {:?}", detect.proxy))?;
+        }
         let mut leak_test = raw.leak_test;
         leak_test.trusted_dns = leak_test
             .trusted_dns
@@ -716,7 +725,8 @@ apps = ['C:\Program Files\App\app.exe']
     fn new_sections() {
         let cfg = Config::parse(SAMPLE).unwrap();
         assert!(cfg.vpn.guard && cfg.vpn.interfaces.is_empty());
-        assert_eq!(cfg.ipv6.mode, Ipv6Mode::Check);
+        // 0.9.2 起默认始终阻断 IPv6
+        assert_eq!(cfg.ipv6.mode, Ipv6Mode::Block);
         assert!(!cfg.ipv6.services.is_empty());
         assert!(cfg.update.check && cfg.update.repo == "RollingL/egress-guard");
         assert!(cfg.leak_test.auto_after_change && cfg.leak_test.notify);
@@ -732,7 +742,13 @@ apps = ['C:\Program Files\App\app.exe']
         assert_eq!(cfg.ipv6.mode, Ipv6Mode::Block);
         assert_eq!(cfg.update.repo, "a/b");
         // 检测 IPv6 出口时必须有查询服务
-        assert!(Config::parse(&format!("{SAMPLE}\n[ipv6]\nservices=[]")).is_err());
+        assert!(Config::parse(&format!("{SAMPLE}\n[ipv6]\nmode=\"check\"\nservices=[]")).is_err());
+        // 检测代理：默认为空；填了就要能解析
+        assert!(cfg.detect.proxy.is_empty());
+        let c = Config::parse(&format!("{SAMPLE}\n[detect]\nproxy=\" http://127.0.0.1:7890 \"")).unwrap();
+        assert_eq!(c.detect.proxy, "http://127.0.0.1:7890");
+        assert!(Config::parse(&format!("{SAMPLE}\n[detect]\nproxy=\"socks5://127.0.0.1:7891\"")).is_ok());
+        assert!(Config::parse(&format!("{SAMPLE}\n[detect]\nproxy=\"ftp://x\"")).is_err());
         assert!(Config::parse(&format!("{SAMPLE}\n[update]\nrepo=\"nope\"")).is_err());
         // 关闭检查更新时仓库可以留空
         assert!(Config::parse(&format!("{SAMPLE}\n[update]\ncheck=false\nrepo=\"\"")).is_ok());

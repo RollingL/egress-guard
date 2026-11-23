@@ -946,7 +946,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(RichText::new("IPv6 查询服务").color(p.label));
                 ui.add_space(-2.0);
-                ui.label(RichText::new("每行一个，只走 IPv6、同时请求，第一个成功的结果生效；都失败时视为本机不能直连 IPv6").size(12.0).color(p.secondary));
+                ui.label(RichText::new("每行一个，只走 IPv6、同时请求，第一个成功的结果生效；本机有 IPv6 路由却都失败时按检测失败处理").size(12.0).color(p.secondary));
                 ui.add(
                     egui::TextEdit::multiline(&mut self.v6_services_text)
                         .desired_rows(3)
@@ -1969,7 +1969,34 @@ impl App {
             theme::row(ui, p, "连续失败几次后执行", None, |ui| {
                 ui.add(egui::DragValue::new(&mut d.failure_threshold).range(1..=20).suffix(" 次"));
             });
+            theme::hairline(ui, p);
+            theme::row(ui, p, "通过代理检测", Some("如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.proxy)
+                        .hint_text("留空 = 直连（推荐）")
+                        .desired_width(220.0)
+                        .font(egui::TextStyle::Monospace)
+                        .margin(Margin::symmetric(8, 4)),
+                );
+            });
         });
+        if !self.draft.detect.proxy.trim().is_empty() {
+            let mut note = String::from(
+                "填了代理后，检测到的是代理的出口，不是本机直连的出口。只有受控应用的流量全部经过这个代理时才适合这样设置；\
+                 有任何受控应用直连时，它会在代理出口在白名单内时被一起放行。",
+            );
+            if self.draft.block_all.enabled {
+                note.push_str(if ALLOW_APPS {
+                    "已开启全局断网：请把代理程序加入全局断网的例外，否则断网后代理也连不出去，检测会一直失败，无法自动恢复。"
+                } else {
+                    "已开启全局断网：请把代理连接的远端服务器地址加入全局断网的例外地址，否则断网后代理也连不出去，检测会一直失败，无法自动恢复。"
+                });
+            }
+            if self.draft.ipv6.mode == Ipv6Mode::Check {
+                note.push_str("「检测 IPv6 出口」也会通过代理检测，代理没有 IPv6 出口时会按检测失败处理。");
+            }
+            theme::footnote(ui, p, &note);
+        }
 
         theme::section(ui, p, "出口 IP 查询服务");
         theme::card(ui, p, |ui| {
