@@ -29,7 +29,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - name: 文件权限测试（umask 077）
-        run: umask 077 && cargo test --lib config::
+        run: "umask 077 && cargo test --lib config::"
 
   windows:
     name: Windows 构建
@@ -240,7 +240,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - name: 文件权限测试（umask 077）
-        run: umask 077 && cargo test --lib config::
+        run: "umask 077 && cargo test --lib config::"
       - name: 网络扩展共用代码的单元测试（Swift）
         run: |
           mkdir -p target/macos
