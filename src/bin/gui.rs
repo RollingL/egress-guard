@@ -83,6 +83,11 @@ fn main() {
 
     logbuf::init("info", false, Some(&dir.join("egress-guard.log")));
     log::info!("egress-guard-gui {} 启动", env!("CARGO_PKG_VERSION"));
+    {
+        // 旧版本注册的开机自启任务按新规则更新（不拖慢启动）
+        let config_path = config_path.clone();
+        std::thread::spawn(move || egress_guard::win::autostart::upgrade_legacy(&config_path));
+    }
 
     if let Err(e) = gui::run(gui::Options { config_path, start_minimized, start_page, run_leak_test, scroll }) {
         log::error!("{e:#}");

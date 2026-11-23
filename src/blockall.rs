@@ -25,6 +25,8 @@ pub const DNS_PORT: u16 = 53;
 /// DHCP 客户端端口：IPv4 为 68，DHCPv6 为 546。
 pub const DHCP_V4_CLIENT_PORT: u16 = 68;
 pub const DHCP_V6_CLIENT_PORT: u16 = 546;
+pub const DHCP_V4_SERVER_PORT: u16 = 67;
+pub const DHCP_V6_SERVER_PORT: u16 = 547;
 
 /// 全局断网时的例外规则。
 #[derive(Debug, Clone, PartialEq, Default)]

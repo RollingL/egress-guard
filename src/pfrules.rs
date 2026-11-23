@@ -11,7 +11,9 @@
 
 use std::fmt::Write;
 
-use crate::blockall::{lan_nets, BlockAllPolicy, DHCP_V4_CLIENT_PORT, DHCP_V6_CLIENT_PORT, DNS_PORT};
+use crate::blockall::{
+    lan_nets, BlockAllPolicy, DHCP_V4_CLIENT_PORT, DHCP_V4_SERVER_PORT, DHCP_V6_CLIENT_PORT, DHCP_V6_SERVER_PORT, DNS_PORT,
+};
 
 /// 规则装入的锚点。主规则集（/etc/pf.conf）里的 `anchor "com.apple/*"` 会评估它。
 pub const ANCHOR: &str = "com.apple/egress-guard";
@@ -28,10 +30,10 @@ pub fn render_v6(policy: &BlockAllPolicy) -> String {
     };
     line("pass quick on lo0 all no state");
     line(&format!(
-        "pass out quick inet6 proto udp from any port {DHCP_V6_CLIENT_PORT} to any port 547 no state"
+        "pass out quick inet6 proto udp from any port {DHCP_V6_CLIENT_PORT} to any port {DHCP_V6_SERVER_PORT} no state"
     ));
     line(&format!(
-        "pass in quick inet6 proto udp from any port 547 to any port {DHCP_V6_CLIENT_PORT} no state"
+        "pass in quick inet6 proto udp from any port {DHCP_V6_SERVER_PORT} to any port {DHCP_V6_CLIENT_PORT} no state"
     ));
     line("pass quick inet6 proto ipv6-icmp all icmp6-type { routersol, routeradv, neighbrsol, neighbradv } no state");
     if policy.allow_dns {
@@ -62,16 +64,16 @@ pub fn render(policy: &BlockAllPolicy) -> String {
     };
     line("pass quick on lo0 all no state");
     line(&format!(
-        "pass out quick inet proto udp from any port {DHCP_V4_CLIENT_PORT} to any port 67 no state"
+        "pass out quick inet proto udp from any port {DHCP_V4_CLIENT_PORT} to any port {DHCP_V4_SERVER_PORT} no state"
     ));
     line(&format!(
-        "pass in quick inet proto udp from any port 67 to any port {DHCP_V4_CLIENT_PORT} no state"
+        "pass in quick inet proto udp from any port {DHCP_V4_SERVER_PORT} to any port {DHCP_V4_CLIENT_PORT} no state"
     ));
     line(&format!(
-        "pass out quick inet6 proto udp from any port {DHCP_V6_CLIENT_PORT} to any port 547 no state"
+        "pass out quick inet6 proto udp from any port {DHCP_V6_CLIENT_PORT} to any port {DHCP_V6_SERVER_PORT} no state"
     ));
     line(&format!(
-        "pass in quick inet6 proto udp from any port 547 to any port {DHCP_V6_CLIENT_PORT} no state"
+        "pass in quick inet6 proto udp from any port {DHCP_V6_SERVER_PORT} to any port {DHCP_V6_CLIENT_PORT} no state"
     ));
     line("pass quick inet6 proto ipv6-icmp all icmp6-type { routersol, routeradv, neighbrsol, neighbradv } no state");
     line(&format!("pass out quick proto tcp from any to any user {PROBE_USER} flags S/SA keep state"));
@@ -108,6 +110,16 @@ pub fn has_apple_anchor(main_rules: &str) -> bool {
         let l = l.trim_start();
         l.starts_with("anchor \"com.apple/*\"")
     })
+}
+
+/// `pfctl -s rules` 的输出里有没有已加载的规则（忽略 ALTQ 提示等非规则行）。
+/// 主规则集为空说明还没加载，可以按 /etc/pf.conf 加载；不为空却没有 `com.apple/*` 锚点时不能替换它。
+pub fn has_loaded_rules(main_rules: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "scrub", "scrub-anchor", "nat", "rdr", "binat", "anchor", "nat-anchor", "rdr-anchor", "binat-anchor", "dummynet",
+        "dummynet-anchor", "pass", "block", "match", "load", "table",
+    ];
+    main_rules.lines().any(|l| l.split_whitespace().next().is_some_and(|w| KEYWORDS.contains(&w)))
 }
 
 /// 便于日志显示的规则摘要。
@@ -188,5 +200,18 @@ mod tests {
         let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all\n";
         assert!(has_apple_anchor(main));
         assert!(!has_apple_anchor("scrub-anchor \"com.apple/*\" all fragment reassemble\n"));
+    }
+
+    #[test]
+    fn detects_loaded_main_ruleset() {
+        // pf 从没加载过规则：只有 ALTQ 提示（pfctl 写在 stderr，这里和输出合在一起）
+        assert!(!has_loaded_rules("No ALTQ support in kernel\nALTQ related functions disabled\n"));
+        assert!(!has_loaded_rules(""));
+        // 系统默认规则集
+        let default = "scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all\n";
+        assert!(has_loaded_rules(default) && has_apple_anchor(default));
+        // 其他软件加载的自定义规则集，没有 com.apple 锚点
+        let custom = "No ALTQ support in kernel\nblock drop in all\npass out all flags S/SA keep state\n";
+        assert!(has_loaded_rules(custom) && !has_apple_anchor(custom));
     }
 }

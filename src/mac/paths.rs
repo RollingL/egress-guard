@@ -12,6 +12,8 @@ pub const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.egressguard.daemon.pl
 pub const SUPPORT_DIR: &str = "/Library/Application Support/EgressGuard";
 /// 界面与后台服务通信的本地套接字（由 launchd 创建并按需启动服务）。
 pub const SOCKET: &str = "/var/run/egress-guard.sock";
+/// pf 锚点的所有权锁：持有它的进程才能改动本工具的 pf 锚点（进程退出时由系统释放）。
+pub const PF_LOCK: &str = "/var/run/egress-guard.pf.lock";
 /// 后台服务日志。
 pub const LOG_FILE: &str = "/Library/Logs/egress-guard.log";
 

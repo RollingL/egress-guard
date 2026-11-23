@@ -11,8 +11,8 @@ use crate::filterfeed::{self, FeedFirewall};
 pub struct MacFirewall;
 
 impl MacFirewall {
-    pub fn open(tx: Sender<Event>) -> Result<FeedFirewall> {
-        let pf = PfFirewall::open()?;
+    pub fn open(tx: Sender<Event>, start_blocked: bool) -> Result<FeedFirewall> {
+        let pf = PfFirewall::open(start_blocked)?;
         let hub = filterfeed::hub();
         // 扩展连上或断开时刷新界面上的状态
         let tx = std::sync::Mutex::new(tx);

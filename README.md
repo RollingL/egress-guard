@@ -35,7 +35,7 @@ Windows 版提供两个程序：
 | 出口 IP 检测 | 定时（默认 60 秒）依次查询配置的公网 IP 服务，取第一个成功结果；同时用 `NotifyIpInterfaceChange` / `NotifyUnicastIpAddressChange` / `NotifyRouteChange2` 监听网卡、地址、路由变化，变化后防抖 2 秒立即重新检测。 |
 | 防泄漏 | 默认启动时先阻断；网络变化时也先阻断，确认新出口 IP 在白名单后再放行。 |
 | 子进程 | 每秒扫描进程树，受控应用启动的子进程（即使是不同的 exe，含多级后代）自动加入阻断，并记录到 `learned-apps.txt`。用进程创建时间排除 PID 复用误判；`%WINDIR%` 下的系统程序不会被加入。可选同时阻断受控应用所在目录下的全部 exe。规则增量更新，没有放行空档。 |
-| 全局断网 | 开启后阻断时额外添加一条不带条件的兜底 Block 过滤器（四个层，`CLEAR_ACTION_RIGHT`）和若干 Permit 例外：本工具自身（按应用 ID）、回环（`FWP_CONDITION_FLAG_IS_LOOPBACK`）、DHCP（UDP 本地端口 68/546），以及可选的局域网网段、DNS（远端端口 53）、例外程序和例外地址。同一子层内按权重裁决：受控应用阻断 15 > 例外放行 8 > 兜底阻断 0，所以受控应用不享受这些例外。切换时同样断开非例外的 IPv4 TCP 连接。 |
+| 全局断网 | 开启后阻断时额外添加一条不带条件的兜底 Block 过滤器（四个层，`CLEAR_ACTION_RIGHT`）和若干 Permit 例外：本工具自身（按应用 ID）、回环（`FWP_CONDITION_FLAG_IS_LOOPBACK`）、DHCP（UDP 本地端口 68/546 且远端端口 67/547），以及可选的局域网网段、DNS（远端端口 53）、例外程序和例外地址。同一子层内按权重裁决：受控应用阻断 15 > 例外放行 8 > 兜底阻断 0，所以受控应用不享受这些例外。切换时同样断开非例外的 IPv4 TCP 连接。 |
 | 白名单 | 单个 IPv4/IPv6 地址或 CIDR 网段（如 `198.51.100.0/24`、`2001:db8::/32`）。 |
 
 ## 快速开始（图形界面）
@@ -53,7 +53,9 @@ Windows 版提供两个程序：
 - **退出程序后，所有阻断规则会被移除。**
 - 再次双击 exe 不会启动第二个实例，只会把已有的窗口调出来。
 
-开机自启：在 **设置** 页勾选"登录 Windows 时自动启动"。程序会注册一个任务计划程序任务，登录后以最高权限在托盘中启动，不弹出 UAC。任务不限运行时长，用电池时也会运行。
+开机自启：在 **设置** 页勾选"登录 Windows 时自动启动"。程序会注册一个任务计划程序任务，登录后以最高权限在托盘中启动，不弹出 UAC。任务不限运行时长，用电池时也会运行，并记录当前使用的配置文件路径（用 `--config` 指定的配置在登录后照样加载）。
+
+0.9.3 及以前注册的任务没有记录配置文件路径，新版本启动时会自动重新注册一次。
 
 日志在 **日志** 页查看，同时写入 exe 同目录的 `egress-guard.log`，每次启动时覆盖。
 
@@ -101,7 +103,7 @@ Windows 版提供两个程序：
 
 | 模式 | 做法 |
 | --- | --- |
-| 始终阻断 IPv6（默认） | 放行时也阻断受控应用的全部 IPv6（Windows 在 WFP 的 v6 层，macOS 由网络扩展判定）。开启全局断网时阻断本机全部 IPv6，例外与全局断网相同（macOS 用 pf 的 `inet6` 规则）。 |
+| 始终阻断 IPv6（默认） | 放行时也阻断受控应用的全部 IPv6（Windows 在 WFP 的 v6 层，macOS 由网络扩展判定）。Windows 上某个应用的 IPv6 规则没能加上时，放行时先保留这个应用原来的阻断规则（IPv4 也不放行），每 5 秒重试，加上后再放行，概览页会提示。开启全局断网时阻断本机全部 IPv6，例外与全局断网相同（macOS 用 pf 的 `inet6` 规则）。 |
 | 检查 IPv6 出口 | 每次检测时 IPv4、IPv6 **分别**检测出口（只走 IPv4、只走 IPv6，同时进行），两个都要在白名单内才放行。常见的情况是 VPN 只接管 IPv4，IPv6 流量仍然从本地网络直连出去。本机没有某个地址族的路由时不需要验证它；有路由却测不到出口（超时等）时按检测失败处理（见「检测失败时」），因为不知道这部分流量从哪里出去。VPN 不支持 IPv6 时建议改用「始终阻断」。 |
 | 不处理 | 与旧版本相同。 |
 
@@ -148,7 +150,7 @@ Register-ScheduledTask -TaskName "egress-guard-cli" -Action $action -Trigger $tr
 - `apps` 写 exe 完整路径，TOML 里用单引号就不用转义反斜杠。应用文件必须存在（WFP 根据文件路径生成应用 ID）。
 - `detect.fail_mode`：检测失败时 `block`（默认）/ `allow` / `keep`，在连续失败 `failure_threshold` 次后生效。
 - `detect.services`：任意返回包含 IP 文本的 HTTPS 地址都可以。
-- `detect.proxy`：通过代理检测出口，默认为空（直连检测），见下面「注意事项」。
+- `detect.proxy`：通过代理检测出口，默认为空（直连检测），见下面「注意事项」。地址里可以带用户名密码（`http://user:pass@host:port`），这时和 GitHub 令牌一样当作凭据：配置文件只让所有者读写，日志、状态和错误信息里显示为 `***`，macOS 上非管理员账户读到的配置也是 `***`，检测子进程通过管道而不是命令行参数拿到它。
 - `[block_all]`：全局断网，界面里在 **全局断网** 页设置。默认放行局域网和 DNS。
 - `[leak_test]`：泄露测试的可信 DNS 解析器、检测源、STUN 服务器和自动测试，界面里在 **泄露测试** 页设置。
 - `[vpn]`：VPN 守护（断开时立即阻断）、守护的网卡、连着 VPN 时的检测间隔。
@@ -230,11 +232,11 @@ pf 只认地址、端口和用户，分不清是哪个应用发出的连接。ma
 | 后台服务 | `/Library/LaunchDaemons/com.egressguard.daemon.plist`，以 root 运行 `/Library/Application Support/EgressGuard/bin/egress-guard daemon`（安装时从 .app 里复制，移动或删除 .app 不影响已安装的服务）。配置在同目录的 `config.toml`，日志在 `/Library/Logs/egress-guard.log`。 |
 | 界面通信 | launchd 创建的本地套接字 `/var/run/egress-guard.sock`，每行一个 JSON。界面连接时服务按需启动；只读请求所有用户可用，修改设置只接受 root 和管理员组。 |
 | 按应用断网 | 网络扩展（`com.egressguard.app.filter`，root）连接上面的套接字接收规则，逐个连接放行或丢弃，详见 [docs/macos-network-extension.md](docs/macos-network-extension.md)。服务运行期间存在 `/var/run/egress-guard.running`，扩展只在它存在时连接，避免「退出」后被扩展重新拉起。 |
-| 全局断网 | 规则装入 `com.apple/egress-guard` 子锚点（系统默认的 `/etc/pf.conf` 已经引用 `com.apple/*`，不修改系统文件）。阻断时用 `pfctl -E` 取得启用令牌，放行时 `pfctl -X` 归还，不影响 pf 原本是否开启。 |
+| 全局断网 | 规则装入 `com.apple/egress-guard` 子锚点（系统默认的 `/etc/pf.conf` 已经引用 `com.apple/*`，不修改系统文件）。阻断时用 `pfctl -E` 取得启用令牌，放行时 `pfctl -X` 归还，不影响 pf 原本是否开启。同一时间只有一个实例管理这个锚点（锁文件 `/var/run/egress-guard.pf.lock`），后台服务运行时再用 sudo 运行命令行版本会直接报错。pf 主规则集已被其他防火墙软件或自定义规则替换、不再引用 `com.apple/*` 时，不会重新加载 `/etc/pf.conf` 覆盖它，而是报错说明。 |
 | 断网期间检测出口 IP | 检测在以 `nobody` 身份运行的子进程里进行，pf 规则按套接字所属用户（`user nobody`）放行它，而不是放行全部 root 进程。 |
 | 已有连接 | 例外规则不建立状态，兜底规则直接丢弃，所以开始阻断前已经建立的连接在下一个数据包就会被拦截，同时局域网等例外连接不受影响。 |
 | 网络变化 | 监听路由套接字（地址增删、网卡状态、非主机路由变化），忽略 AirDrop 等频繁开关的 awdl/llw 接口；变化后与 Windows 一样先阻断、防抖后重新检测。 |
-| 异常退出 | pf 规则不会随进程消失：服务崩溃时 launchd 会重启它，启动时先清空残留规则。紧急情况下可以执行 `sudo "/Applications/Egress Guard.app/Contents/MacOS/egress-guard" unblock`。 |
+| 异常退出 | pf 规则不会随进程消失：服务崩溃时 launchd 会重启它。启动时不清空残留规则，按配置（默认先阻断）第一次装入规则时直接替换，中间没有放行空档。紧急情况下可以执行 `sudo "/Applications/Egress Guard.app/Contents/MacOS/egress-guard" unblock`。 |
 
 命令行（在 `Egress Guard.app/Contents/MacOS/` 里）：
 

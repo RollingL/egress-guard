@@ -20,7 +20,9 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::tcpkill;
-use crate::blockall::{lan_nets, BlockAllPolicy, DHCP_V4_CLIENT_PORT, DHCP_V6_CLIENT_PORT, DNS_PORT};
+use crate::blockall::{
+    lan_nets, BlockAllPolicy, DHCP_V4_CLIENT_PORT, DHCP_V4_SERVER_PORT, DHCP_V6_CLIENT_PORT, DHCP_V6_SERVER_PORT, DNS_PORT,
+};
 use crate::controller::{Firewall, Rules};
 use crate::discovery::normalize_path;
 
@@ -92,8 +94,8 @@ impl V6Guard {
     /// 需要重试：有程序添加失败，或者之前不存在的程序现在出现了。两类原因分别判断，互不掩盖。
     fn needs_retry(&self) -> bool {
         !self.failed.is_empty()
-            || self.missing.values().any(|p| p.exists())
-            || self.global.as_ref().is_some_and(|g| g.failed || g.missing.iter().any(|p| p.exists()))
+            || self.missing.values().any(|p| may_exist(p))
+            || self.global.as_ref().is_some_and(|g| g.failed || g.missing.iter().any(|p| may_exist(p)))
     }
 
     fn all_ids(&self) -> Vec<u64> {
@@ -123,6 +125,15 @@ pub struct WfpFirewall {
     /// 本工具自身，全局断网时始终放行（否则无法再检测出口 IP）。
     self_exe: Option<PathBuf>,
     v6guard: Option<V6Guard>,
+    /// 放行后仍保留的受控程序阻断：「始终阻断 IPv6」时这些程序的 IPv6 阻断没能加上，
+    /// 放行会让它们的 IPv6 失去覆盖，所以整套阻断留着，等 IPv6 阻断补上后再撤。
+    retained: HashMap<String, Vec<u64>>,
+}
+
+/// 文件可能存在：只有确认「不存在」才算不存在。权限不足等其他错误照常尝试加规则
+/// （加不上记为失败并重试），而不是当作文件不存在悄悄跳过。
+fn may_exist(p: &Path) -> bool {
+    !matches!(p.try_exists(), Ok(false))
 }
 
 /// 新加上的全局断网规则。
@@ -187,6 +198,7 @@ impl WfpFirewall {
             warned: HashSet::new(),
             self_exe: std::env::current_exe().ok(),
             v6guard: None,
+            retained: HashMap::new(),
         };
 
         let mut sl_name = wide("egress-guard sublayer");
@@ -314,8 +326,18 @@ impl WfpFirewall {
                 let mut c = [cond_flags(FWP_CONDITION_FLAG_IS_LOOPBACK)];
                 ids.push(self.add_filter(layer, "allow loopback", true, W_PERMIT, &mut c)?);
 
-                let port = if layer.v6 { DHCP_V6_CLIENT_PORT } else { DHCP_V4_CLIENT_PORT };
-                let mut c = [cond_u8(FWPM_CONDITION_IP_PROTOCOL, IPPROTO_UDP), cond_u16(FWPM_CONDITION_IP_LOCAL_PORT, port)];
+                // 只放行 DHCP 客户端与服务器端口之间的 UDP（连接层是发往服务器，接受层是服务器的回复），
+                // 而不是本地 68/546 端口发往任意端口的流量
+                let (client, server) = if layer.v6 {
+                    (DHCP_V6_CLIENT_PORT, DHCP_V6_SERVER_PORT)
+                } else {
+                    (DHCP_V4_CLIENT_PORT, DHCP_V4_SERVER_PORT)
+                };
+                let mut c = [
+                    cond_u8(FWPM_CONDITION_IP_PROTOCOL, IPPROTO_UDP),
+                    cond_u16(FWPM_CONDITION_IP_LOCAL_PORT, client),
+                    cond_u16(FWPM_CONDITION_IP_REMOTE_PORT, server),
+                ];
                 ids.push(self.add_filter(layer, "allow dhcp", true, W_PERMIT, &mut c)?);
 
                 if policy.allow_dns && layer.connect {
@@ -359,7 +381,7 @@ impl WfpFirewall {
         let mut failed = false;
         for app in self.self_exe.iter().chain(policy.allow_apps.iter()) {
             let key = format!("allow:{}", normalize_path(app));
-            if !app.exists() {
+            if !may_exist(app) {
                 missing.push(app.clone());
                 warnings.push((key, format!("例外程序不存在，暂时跳过: {}", app.display())));
                 continue;
@@ -414,7 +436,7 @@ impl WfpFirewall {
             }
             // 单个程序失败（文件不存在、路径无效等）只跳过它，不影响其他程序的阻断
             for (k, app) in &to_add {
-                if !app.exists() {
+                if !may_exist(app) {
                     pending.insert(k.clone());
                     warnings.push((k.clone(), format!("程序不存在，暂时跳过: {}", app.display())));
                     continue;
@@ -526,10 +548,10 @@ impl WfpFirewall {
         let want_global = self.rules.block_all.clone();
         let global_stale = match (&guard.global, &want_global) {
             (None, None) => false,
-            (Some(g), Some(p)) => g.policy != *p || g.failed || g.missing.iter().any(|a| a.exists()),
+            (Some(g), Some(p)) => g.policy != *p || g.failed || g.missing.iter().any(|a| may_exist(a)),
             _ => true,
         };
-        let work = !to_remove.is_empty() || global_stale || to_add.iter().any(|(_, p)| p.exists());
+        let work = !to_remove.is_empty() || global_stale || to_add.iter().any(|(_, p)| may_exist(p));
         if !work {
             guard.missing = to_add.into_iter().collect();
             guard.failed.clear();
@@ -548,7 +570,7 @@ impl WfpFirewall {
             fw.delete_ids(&remove_ids)?;
             let layers = v6_layers();
             for (k, app) in &to_add {
-                if !app.exists() {
+                if !may_exist(app) {
                     missing.insert(k.clone(), app.clone());
                     warnings.push((format!("v6:{k}"), format!("程序不存在，暂时跳过: {}", app.display())));
                     continue;
@@ -614,6 +636,47 @@ impl WfpFirewall {
                 }
             );
         }
+        Ok(())
+    }
+
+    /// 「始终阻断 IPv6」时，IPv6 阻断还没加上的受控程序（有主阻断规则的那些）。
+    /// 放行时它们的主阻断要保留，否则 IPv6 没有任何覆盖。
+    fn uncovered_v6(&self) -> HashSet<String> {
+        if !self.rules.block_ipv6 {
+            return HashSet::new();
+        }
+        self.filters
+            .keys()
+            .filter(|k| self.v6guard.as_ref().is_none_or(|g| !g.apps.contains_key(*k)))
+            .cloned()
+            .collect()
+    }
+
+    /// 撤掉不再需要保留的主阻断：IPv6 阻断已经补上、程序不再受控，或者不再「始终阻断 IPv6」。
+    fn release_retained(&mut self) -> Result<()> {
+        if self.retained.is_empty() {
+            return Ok(());
+        }
+        let wanted: HashSet<String> = self.rules.apps.iter().map(|p| normalize_path(p)).collect();
+        let release: Vec<String> = self
+            .retained
+            .keys()
+            .filter(|k| {
+                !self.rules.block_ipv6
+                    || !wanted.contains(*k)
+                    || self.v6guard.as_ref().is_some_and(|g| g.apps.contains_key(*k))
+            })
+            .cloned()
+            .collect();
+        if release.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<u64> = release.iter().flat_map(|k| self.retained[k].iter().copied()).collect();
+        self.in_transaction(|fw| fw.delete_ids(&ids))?;
+        for k in &release {
+            self.retained.remove(k);
+        }
+        log::info!("{} 个程序的 IPv6 阻断已补上（或不再需要），撤掉保留的阻断", release.len());
         Ok(())
     }
 
@@ -700,6 +763,9 @@ impl Firewall for WfpFirewall {
         if self.blocked {
             return Ok(());
         }
+        // 放行期间保留的阻断仍然有效：并回主规则，不重复添加
+        let retained: Vec<(String, Vec<u64>)> = self.retained.drain().collect();
+        self.filters.extend(retained);
         let s = self.sync_filters()?;
         self.blocked = true;
         self.kill_connections(&s, true);
@@ -710,10 +776,13 @@ impl Firewall for WfpFirewall {
         if !self.blocked {
             return Ok(());
         }
+        // IPv6 阻断没加上的受控程序：放行后 IPv6 没有覆盖，保留它们的整套阻断（IPv4 也不放行），稍后重试
+        let keep = self.uncovered_v6();
         let ids: Vec<u64> = self
             .filters
-            .values()
-            .flatten()
+            .iter()
+            .filter(|(k, _)| !keep.contains(*k))
+            .flat_map(|(_, v)| v.iter())
             .chain(self.global.iter().flat_map(|g| g.ids.iter()))
             .copied()
             .collect();
@@ -724,7 +793,14 @@ impl Firewall for WfpFirewall {
             Ok(())
         })?;
         log::info!("WFP 已删除 {} 个过滤器", ids.len());
-        self.filters.clear();
+        self.retained = self.filters.drain().filter(|(k, _)| keep.contains(k)).collect();
+        if !self.retained.is_empty() {
+            log::warn!(
+                "{} 个受控程序的 IPv6 阻断没能加上，放行期间仍保持完全阻断，稍后重试: {}",
+                self.retained.len(),
+                self.retained.keys().cloned().collect::<Vec<_>>().join("、")
+            );
+        }
         self.global = None;
         self.pending.clear();
         self.blocked = false;
@@ -738,6 +814,7 @@ impl Firewall for WfpFirewall {
     fn has_pending(&self) -> bool {
         (self.blocked && (!self.pending.is_empty() || self.global.as_ref().is_some_and(|g| !g.complete)))
             || self.v6guard.as_ref().is_some_and(V6Guard::needs_retry)
+            || !self.retained.is_empty()
     }
 
     fn set_rules(&mut self, rules: Rules) -> Result<()> {
@@ -747,8 +824,20 @@ impl Firewall for WfpFirewall {
         if self.blocked {
             let s = self.sync_filters()?;
             self.kill_connections(&s, false);
+        } else {
+            // IPv6 阻断补上之后才撤掉放行期间保留的阻断
+            self.release_retained()?;
         }
         v6
+    }
+
+    fn degraded(&self) -> Option<String> {
+        (!self.retained.is_empty()).then(|| {
+            format!(
+                "{} 个受控应用的「始终阻断 IPv6」规则没能加上，为避免 IPv6 泄露，放行期间这些应用仍完全断网，每 5 秒重试一次",
+                self.retained.len()
+            )
+        })
     }
 }
 
