@@ -90,7 +90,10 @@ fn allowed_key(s: &Status) -> Option<Key> {
         && s.degraded.is_none()
         && s.config_apply_error.is_none()
         && s.whitelisted == Some(true)
-        && s.v6_whitelisted != Some(false);
+        && s.v6_whitelisted != Some(false)
+        // 出口是在当前这一代网络上测的（网卡、VPN 变了之后显示的还是旧出口，不能据此开始测试）。
+        // 旧版本的服务不报告这一项，按原来的方式判断
+        && s.verified_generation.is_none_or(|g| g == s.generation);
     ok.then_some(())?;
     Some((s.egress_ip?, s.egress_v6, s.generation))
 }
@@ -311,6 +314,7 @@ mod tests {
             egress_ip: Some("203.0.113.9".parse().unwrap()),
             whitelisted: Some(true),
             generation: 3,
+            verified_generation: Some(3),
             ..Default::default()
         }
     }
@@ -322,8 +326,13 @@ mod tests {
         assert!(allowed_key(&Status { simulated: true, ..allowed() }).is_none(), "模拟模式不测");
         assert!(allowed_key(&Status { apply_error: Some("放行未生效".into()), ..allowed() }).is_none());
         assert!(allowed_key(&Status { v6_whitelisted: Some(false), ..allowed() }).is_none());
-        // 网络变了（代次不同）：之前开始的测试作废
-        assert_ne!(allowed_key(&Status { generation: 4, ..allowed() }), allowed_key(&allowed()));
+        // 网络变了（代次不同）：之前开始的测试作废；新一代还没有检测结果时不测（旧出口只用来显示）
+        assert!(allowed_key(&Status { generation: 4, ..allowed() }).is_none());
+        let next = Status { generation: 4, verified_generation: Some(4), ..allowed() };
+        assert_ne!(allowed_key(&next), allowed_key(&allowed()));
+        assert!(allowed_key(&next).is_some());
+        // 检测失败后没有当前代次的结果
+        assert!(allowed_key(&Status { verified_generation: None, ..allowed() }).is_some(), "旧版本服务");
         // 默认不允许后台自动测试
         assert!(!RawConfig::default().leak_test.auto);
     }

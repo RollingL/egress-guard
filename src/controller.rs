@@ -48,6 +48,9 @@ pub struct Rules {
     pub kill_existing_tcp: bool,
     /// 放行期间也始终阻断 IPv6（受控应用；开启全局断网时为全部 IPv6）。
     pub block_ipv6: bool,
+    /// 「始终阻断 IPv6」只是改为「检测 IPv6 出口」后的过渡保留：本工具自己的出口检测要能走 IPv6，
+    /// 否则 IPv6 永远验证不了（macOS 全局断网时 pf 的 IPv6 规则会挡住检测子进程）。
+    pub v6_probe: bool,
 }
 
 /// 防火墙后端抽象。Windows 上由 WFP 实现，macOS 上由 pf 实现，--dry-run 时只打日志。
@@ -80,6 +83,11 @@ pub trait Firewall {
     }
     /// 拦截后端的其他问题（例如网络扩展不支持当前规则用到的功能），界面上提示。
     fn degraded(&self) -> Option<String> {
+        None
+    }
+    /// 保护范围的已知限制（不是故障，不影响自动诊断）：例如 macOS 没有网络扩展时，
+    /// 受控应用只由 pf 全局断网覆盖，全局断网的例外对它们同样放行。
+    fn limitation(&self) -> Option<String> {
         None
     }
 }
@@ -168,6 +176,9 @@ pub struct Controller {
     /// 从「始终阻断 IPv6」改为「检测 IPv6 出口」后，IPv6 还没有验证过：常驻的 IPv6 阻断先保留，
     /// 等第一次完整的双栈检测之后再撤掉，而不是改设置的那一刻就放开受控应用的 IPv6。
     hold_v6_block: bool,
+    /// 按当前测量路径完整验证过 IPv6：保留的 IPv6 阻断可以撤了，但要等这次检测的决定真正提交之后
+    /// （阻断失败、只装上一部分时继续保留，重试成功后再撤）。网络变化、测量路径变化时作废。
+    v6_hold_release: bool,
 }
 
 impl Controller {
@@ -187,6 +198,7 @@ impl Controller {
             apply_error: None,
             measured: None,
             hold_v6_block: false,
+            v6_hold_release: false,
         }
     }
 
@@ -269,6 +281,11 @@ impl Controller {
         self.fw.degraded()
     }
 
+    /// 保护范围的已知限制。
+    pub fn limitation(&self) -> Option<String> {
+        self.fw.limitation()
+    }
+
     /// 阻断范围的描述，用于日志。
     fn scope(&self) -> &'static str {
         if self.cfg.block_all.enabled { "全部网络" } else { "受控应用" }
@@ -343,6 +360,7 @@ impl Controller {
             block_all: self.cfg.block_all_policy(),
             kill_existing_tcp: self.cfg.behavior.kill_existing_tcp,
             block_ipv6: self.cfg.ipv6.mode == Ipv6Mode::Block || self.hold_v6_block,
+            v6_probe: self.hold_v6_block,
         }
     }
 
@@ -387,6 +405,9 @@ impl Controller {
     /// 出口已经过时（网络变化、VPN 断开）时，丢掉还没生效的放行：它依据的是旧网络上的检测，
     /// 不能在之后的重试里生效。已经生效的规则不动，等新的检测结果再决定。
     fn drop_stale_unblock(&mut self) {
+        if self.stale {
+            self.v6_hold_release = false;
+        }
         if self.stale && matches!(self.pending_switch, Some((false, _))) {
             log::info!("网络已变化，取消还没生效的放行，等待重新检测");
             self.pending_switch = None;
@@ -403,7 +424,26 @@ impl Controller {
         if self.apps_dirty || self.fw.has_pending() {
             self.push_apps()?;
         }
+        self.release_v6_hold();
         Ok(())
+    }
+
+    /// 撤掉改设置时保留的 IPv6 阻断：只在完整的双栈检测已经验证了 IPv6、并且这次检测的决定已经提交
+    /// （没有待重试的切换；要阻断时阻断规则全部装上）之后。任何一步没完成都继续保留原来的覆盖。
+    fn release_v6_hold(&mut self) {
+        if !self.hold_v6_block || !self.v6_hold_release || self.cfg.ipv6.mode != Ipv6Mode::Check {
+            return;
+        }
+        if self.pending_switch.is_some() || (self.fw.is_blocked() && self.fw.has_pending()) {
+            log::info!("IPv6 出口已验证，但新的决定还没有完全生效，暂时保留 IPv6 阻断");
+            return;
+        }
+        log::info!("IPv6 出口已验证，撤掉切换设置时保留的 IPv6 阻断");
+        self.hold_v6_block = false;
+        self.v6_hold_release = false;
+        if let Err(e) = self.push_apps() {
+            log::warn!("撤掉保留的 IPv6 阻断失败，稍后重试: {e:#}");
+        }
     }
 
     /// 应用新配置。受控应用变化会立即反映到防火墙规则上。
@@ -426,7 +466,20 @@ impl Controller {
         // 白名单可能已变化：用最近一次的出口 IP 立即重新决策。
         // 出口已经过时（VPN 断开、网络变化后还没重新检测）、是按另一条测量路径测的（IPv6 处理方式、
         // 代理或查询服务变了），或者有地址族没验证成功时只能收紧，不能据此放行
-        let stale = self.stale || self.measured.as_ref() != Some(&MeasureKey::of(&self.cfg));
+        let path_changed = self.measured.as_ref() != Some(&MeasureKey::of(&self.cfg));
+        let stale = self.stale || path_changed;
+        if path_changed {
+            // 测量路径变了：旧结果（包括还没生效、等着重试的放行）不能再用来放行或撤掉 IPv6 保留
+            self.v6_hold_release = false;
+            if matches!(self.pending_switch, Some((false, _))) {
+                log::info!("检测方式已变化，取消还没生效的放行，等待重新检测");
+                self.pending_switch = None;
+                self.apply_error = None;
+            }
+        }
+        if self.cfg.ipv6.mode != Ipv6Mode::Check {
+            self.v6_hold_release = false;
+        }
         if let Some(e) = self.last_egress() {
             if egress_allowed(&self.cfg, &e) {
                 if stale {
@@ -440,10 +493,21 @@ impl Controller {
         sync
     }
 
-    /// 网络变化时调用：按配置先行阻断。
-    pub fn on_network_change(&mut self) -> Result<()> {
+    /// 最近一次检测到的出口作废（VPN 网卡增减、换了地址等），但不先行阻断：
+    /// 还没生效的放行取消，之后只有新的检测结果才能放行。
+    pub fn invalidate(&mut self) {
         self.stale = true;
         self.drop_stale_unblock();
+    }
+
+    /// 最近一次检测到的出口是否仍然有效（没有因为网络变化、VPN 变化而作废）。
+    pub fn egress_current(&self) -> bool {
+        !self.stale && self.last_ip.is_some()
+    }
+
+    /// 网络变化时调用：按配置先行阻断。
+    pub fn on_network_change(&mut self) -> Result<()> {
+        self.invalidate();
         if self.cfg.behavior.block_on_network_change && !self.fw.is_blocked() {
             self.switch(true, "网络发生变化，等待重新检测出口 IP".into())?;
         }
@@ -497,19 +561,16 @@ impl Controller {
             (Err(_), Some(true)) => format!("连续 {} 次无法检测出口 IP（检测失败时阻断）", self.failures),
             (Err(_), _) => format!("连续 {} 次无法检测出口 IP（检测失败时放行）", self.failures),
         };
+        // 完整的双栈检测已经验证了 IPv6：决定提交之后才撤掉改设置时保留的 IPv6 阻断。
+        // 要阻断时先阻断；阻断没生效或只装上一部分时继续保留，由 retry_pending 在重试成功后再撤
+        if let Ok(e) = &detection {
+            self.v6_hold_release = !e.v6_unverified && self.cfg.ipv6.mode == Ipv6Mode::Check;
+        }
         let r = match target {
             Some(block) => self.switch(block, reason),
             None => Ok(()),
         };
-        // 完整的双栈检测已经验证了 IPv6：撤掉改设置时保留的 IPv6 阻断（要阻断时上面已经先阻断了）
-        let verified = matches!(&detection, Ok(e) if !e.v6_unverified) && self.cfg.ipv6.mode == Ipv6Mode::Check;
-        if self.hold_v6_block && verified {
-            log::info!("IPv6 出口已验证，撤掉切换设置时保留的 IPv6 阻断");
-            self.hold_v6_block = false;
-            if let Err(e) = self.push_apps() {
-                log::warn!("撤掉保留的 IPv6 阻断失败，稍后重试: {e:#}");
-            }
-        }
+        self.release_v6_hold();
         r
     }
 }
@@ -723,6 +784,9 @@ mod tests {
     struct Rec {
         blocked: bool,
         fail_unblock: bool,
+        fail_block: bool,
+        /// 阻断返回成功，但有程序没加上规则（has_pending）。
+        partial: bool,
         /// 依次的调用："block" / "unblock" / "rules v6=<bool>"
         calls: Vec<String>,
         rules: Rules,
@@ -733,9 +797,16 @@ mod tests {
     impl Firewall for RecFirewall {
         fn block(&mut self) -> Result<()> {
             let mut r = self.0.borrow_mut();
+            if r.fail_block {
+                r.calls.push("block failed".into());
+                return Err(anyhow!("WFP 暂时不可用"));
+            }
             r.calls.push("block".into());
             r.blocked = true;
             Ok(())
+        }
+        fn has_pending(&self) -> bool {
+            self.0.borrow().partial
         }
         fn unblock(&mut self) -> Result<()> {
             let mut r = self.0.borrow_mut();
@@ -944,6 +1015,90 @@ mod tests {
         assert!(!r.borrow().rules.block_ipv6);
         c.reconfigure(check).unwrap();
         assert!(!r.borrow().rules.block_ipv6);
+    }
+
+    /// 从「始终阻断 IPv6」改为「检测 IPv6 出口」后放行中，完整检测要求阻断：
+    /// 阻断失败、只装上一部分时，保留的 IPv6 阻断不能撤；重试成功后才撤。
+    #[test]
+    fn ipv6_hold_survives_failed_or_partial_block() {
+        let check = cfg("[ipv6]\nmode=\"check\"");
+        let setup = || {
+            let (r, fw) = rec(false);
+            let mut c = Controller::new(cfg("[ipv6]\nmode=\"block\""), fw);
+            c.apply_rules().unwrap();
+            c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+            c.reconfigure(check.clone()).unwrap();
+            assert!(!c.is_blocked() && r.borrow().rules.block_ipv6 && r.borrow().rules.v6_probe);
+            (r, c)
+        };
+
+        // 1. 主阻断返回错误：保持 IPv6 保留（主阻断和 IPv6 保护不能同时为假）
+        let (r, mut c) = setup();
+        r.borrow_mut().fail_block = true;
+        assert!(c.on_detection(Ok(eg("203.0.113.9", Some("2001:db8::9")))).is_err());
+        assert!(!c.is_blocked());
+        assert!(r.borrow().rules.block_ipv6, "阻断失败后 IPv6 保留被撤掉了: {:?}", r.borrow().calls);
+        // 重试仍失败：继续保留
+        assert!(c.retry_pending().is_err());
+        assert!(r.borrow().rules.block_ipv6);
+        // 重试成功：先阻断，再撤保留
+        r.borrow_mut().fail_block = false;
+        r.borrow_mut().calls.clear();
+        c.retry_pending().unwrap();
+        assert!(c.is_blocked() && !r.borrow().rules.block_ipv6);
+        assert_eq!(r.borrow().calls, vec!["block".to_owned(), "rules v6=false".to_owned()]);
+
+        // 2. 阻断返回成功但只覆盖一部分：继续保留，补全后再撤
+        let (r, mut c) = setup();
+        r.borrow_mut().partial = true;
+        c.on_detection(Ok(eg("203.0.113.9", Some("2001:db8::9")))).unwrap();
+        assert!(c.is_blocked() && r.borrow().rules.block_ipv6);
+        c.retry_pending().unwrap();
+        assert!(r.borrow().rules.block_ipv6, "还有程序没加上规则");
+        r.borrow_mut().partial = false;
+        c.retry_pending().unwrap();
+        assert!(!r.borrow().rules.block_ipv6 && !r.borrow().rules.v6_probe);
+
+        // 3. 阻断失败后网络变化：验证结果作废，重试阻断成功也不撤保留，等新的完整检测
+        let (r, mut c) = setup();
+        r.borrow_mut().fail_block = true;
+        let _ = c.on_detection(Ok(eg("203.0.113.9", Some("2001:db8::9"))));
+        r.borrow_mut().fail_block = false;
+        c.on_network_change().unwrap();
+        c.retry_pending().unwrap();
+        assert!(c.is_blocked() && r.borrow().rules.block_ipv6);
+        c.on_detection(Ok(eg("203.0.113.9", Some("203.0.113.10")))).unwrap();
+        assert!(!c.is_blocked() && !r.borrow().rules.block_ipv6);
+    }
+
+    /// 放行没生效、等着重试时换了检测服务或代理：旧结果不是按新路径测的，重试不能再放行。
+    #[test]
+    fn measurement_change_cancels_pending_unblock() {
+        for change in ["[detect]\nservices=[\"https://ip.example.org\"]", "[detect]\nproxy=\"socks5://127.0.0.1:1080\""] {
+            let (r, fw) = rec(true);
+            let mut c = Controller::new(cfg("[ipv6]\nmode=\"off\""), fw);
+            r.borrow_mut().fail_unblock = true;
+            assert!(c.on_detection(Ok(eg("203.0.113.9", None))).is_err());
+            assert!(c.is_blocked() && c.needs_retry());
+            let new = Config::parse(&format!("whitelist=[\"203.0.113.0/24\"]\napps=['C:\\a.exe']\n[ipv6]\nmode=\"off\"\n{change}")).unwrap();
+            c.reconfigure(new).unwrap();
+            r.borrow_mut().fail_unblock = false;
+            c.retry_pending().unwrap();
+            assert!(c.is_blocked(), "{change}：没有新测量就放行了");
+            assert!(c.apply_error().is_none());
+            // 新路径上的测量到了：放行
+            c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+            assert!(!c.is_blocked());
+        }
+        // 只改白名单：照样用同一路径的完整测量重新决策（等着重试的放行保留）
+        let (r, fw) = rec(true);
+        let mut c = Controller::new(cfg("[ipv6]\nmode=\"off\""), fw);
+        r.borrow_mut().fail_unblock = true;
+        let _ = c.on_detection(Ok(eg("203.0.113.9", None)));
+        c.reconfigure(Config::parse("whitelist=[\"203.0.113.0/24\",\"192.0.2.0/24\"]\napps=['C:\\a.exe']\n[ipv6]\nmode=\"off\"").unwrap()).ok();
+        r.borrow_mut().fail_unblock = false;
+        c.retry_pending().unwrap();
+        assert!(!c.is_blocked());
     }
 
     #[test]

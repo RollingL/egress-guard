@@ -79,8 +79,14 @@ pub struct Status {
     pub apply_error: Option<String>,
     /// 拦截后端的其他问题（例如 macOS 网络扩展版本太旧，不支持当前设置）。
     pub degraded: Option<String>,
+    /// 保护范围的已知限制（不是故障）：例如 macOS 没有网络扩展时，全局断网的例外对受控应用同样放行。
+    pub limitation: Option<String>,
     /// 网络 / 配置代次：网络变化、VPN 网卡增减、应用新配置时加一。界面的后台任务据此丢弃过期的结果。
     pub generation: u64,
+    /// 最近一次检测结果所属的代次（这一代上真正测过出口）。与 `generation` 不同时，
+    /// 上面的出口 IP 只是上一代的结果，可以显示，但自动诊断等不能据此认为当前网络已经验证。
+    /// 旧版本的服务没有这一项（None）。
+    pub verified_generation: Option<u64>,
     /// 模拟模式（--dry-run 或拦截后端打开失败）。
     pub simulated: bool,
     /// 拦截后端现在能否按应用阻断（macOS 需要网络扩展已连接；否则只有 pf 全局断网）。
@@ -372,8 +378,11 @@ fn run(
             Ok(Event::Adapters(a)) => {
                 adapters = a;
                 let before = vpn_links.clone();
-                // VPN 网卡有增减、被重建或换了地址时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废
-                if check_vpn!() || vpn_links != before {
+                // VPN 网卡有增减、被重建或换了地址时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废；
+                // 之前的出口也作废（还没生效的放行取消），但不先行阻断：是否先阻断仍由「网络变化时先阻断」和系统的网络变化通知决定
+                let vpn_blocked = check_vpn!();
+                if vpn_blocked || vpn_links != before {
+                    ctrl.invalidate();
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
@@ -384,9 +393,11 @@ fn run(
             Ok(Event::Detected { generation: g, result }) => {
                 checking = false;
                 if g == generation {
+                    let ok = result.is_ok();
                     if let Err(e) = ctrl.on_detection(result) {
                         log::error!("{e:#}");
                     }
+                    status.verified_generation = if ok { Some(generation) } else { None };
                     status.last_check = Some(logbuf::now_hms());
                     // 放行时记下正在使用的 VPN 网卡，之后它一断开就立即阻断
                     let vcfg = &ctrl.config().vpn;
@@ -411,67 +422,77 @@ fn run(
                     start_check(&mut checking, &detector, generation);
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                let now = Instant::now();
-                if debounce_until.is_some_and(|d| d <= now) {
-                    debounce_until = None;
-                    after_change = true;
-                    log::info!("网络发生变化，重新检测出口 IP");
-                    start_check(&mut checking, &detector, generation);
-                }
-                if next_check.is_some_and(|d| d <= now) {
-                    next_check = None;
-                    start_check(&mut checking, &detector, generation);
-                }
-                if backend_retry.due(now) {
-                    match open_backend(ctrl.config(), tx.clone()) {
-                        Ok(fw) => {
-                            backend_retry.done();
-                            log::info!("拦截引擎已恢复，退出模拟模式");
-                            status.simulated = false;
-                            status.backend_error = None;
-                            if let Err(e) = ctrl.replace_firewall(fw) {
-                                log::error!("{e:#}");
-                            }
-                            // 模拟期间的检测不算数：重新检测
-                            generation += 1;
-                            next_check = None;
-                            start_check(&mut checking, &detector, generation);
+            // 到期的定时任务在下面统一处理：持续有事件时也照样按时执行
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        // 到期的定时任务（防抖后的检测、定时检测、后端恢复、监听恢复、规则重试）。每处理一个事件之后都检查一次，
+        // 而不只在等待超时时：网卡事件、刷新持续不断时，它们也不会被一直推迟
+        {
+            let now = Instant::now();
+            if debounce_until.is_some_and(|d| d <= now) {
+                debounce_until = None;
+                after_change = true;
+                log::info!("网络发生变化，重新检测出口 IP");
+                start_check(&mut checking, &detector, generation);
+            }
+            if next_check.is_some_and(|d| d <= now) {
+                next_check = None;
+                start_check(&mut checking, &detector, generation);
+            }
+            if backend_retry.due(now) {
+                match open_backend(ctrl.config(), tx.clone()) {
+                    Ok(fw) => {
+                        backend_retry.done();
+                        log::info!("拦截引擎已恢复，退出模拟模式");
+                        status.simulated = false;
+                        status.backend_error = None;
+                        if let Err(e) = ctrl.replace_firewall(fw) {
+                            log::error!("{e:#}");
                         }
-                        Err(e) => {
-                            let wait = backend_retry.failed();
-                            log::warn!("拦截引擎仍不可用，{} 秒后再试: {e:#}", wait.as_secs());
-                            status.backend_error = Some(format!("{e:#}"));
-                        }
+                        // 模拟期间的检测不算数：重新检测
+                        generation += 1;
+                        next_check = None;
+                        start_check(&mut checking, &detector, generation);
+                    }
+                    Err(e) => {
+                        let wait = backend_retry.failed();
+                        log::warn!("拦截引擎仍不可用，{} 秒后再试: {e:#}", wait.as_secs());
+                        status.backend_error = Some(format!("{e:#}"));
                     }
                 }
-                if watch_retry.due(now) {
-                    watcher = start_netwatch(tx.clone());
-                    if watcher.is_some() {
-                        watch_retry.done();
-                        log::info!("网卡变化监听已恢复");
-                        // 监听中断期间可能错过了变化：按网络变化处理
-                        let _ = tx.send(Event::NetworkChanged);
-                    } else {
-                        watch_retry.failed();
-                    }
+            }
+            if watch_retry.due(now) {
+                watcher = start_netwatch(tx.clone());
+                if watcher.is_some() {
+                    watch_retry.done();
+                    log::info!("网卡变化监听已恢复");
+                    // 监听中断期间可能错过了变化：按网络变化处理
+                    let _ = tx.send(Event::NetworkChanged);
+                } else {
+                    watch_retry.failed();
                 }
-                if next_retry.is_some_and(|d| d <= now) {
-                    next_retry = None;
-                    let was_blocked = ctrl.is_blocked();
-                    if let Err(e) = ctrl.retry_pending() {
-                        log::warn!("重试同步阻断规则失败，稍后再试: {e:#}");
+            }
+            if next_retry.is_some_and(|d| d <= now) {
+                next_retry = None;
+                let was_blocked = ctrl.is_blocked();
+                match ctrl.retry_pending() {
+                    Err(e) => log::warn!("重试同步阻断规则失败，稍后再试: {e:#}"),
+                    // 应用新配置时没完成的部分已经重试成功：这一版配置现在生效了
+                    Ok(()) if !ctrl.needs_retry() && status.config_apply_error.take().is_some() => {
+                        log::info!("配置（版本 {}）已生效", status.config_version);
                     }
-                    // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
-                    if was_blocked && !ctrl.is_blocked() {
-                        let vcfg = &ctrl.config().vpn;
-                        guarded = if vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
-                        if !guarded.is_empty() {
-                            log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
-                            if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
-                                let soon = later(Duration::from_secs(vcfg.check_interval_secs));
-                                next_check = Some(next_check.map_or(soon, |n| n.min(soon)));
-                            }
+                    Ok(()) => {}
+                }
+                // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
+                if was_blocked && !ctrl.is_blocked() {
+                    let vcfg = &ctrl.config().vpn;
+                    guarded = if vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    if !guarded.is_empty() {
+                        log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
+                        if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
+                            let soon = later(Duration::from_secs(vcfg.check_interval_secs));
+                            next_check = Some(next_check.map_or(soon, |n| n.min(soon)));
                         }
                     }
                 }
@@ -550,6 +571,7 @@ fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {
     s.failures = ctrl.failures();
     s.apply_error = ctrl.apply_error().map(str::to_owned);
     s.degraded = ctrl.degraded();
+    s.limitation = ctrl.limitation();
 }
 
 fn make_detector(cfg: &Config) -> Detectors {
@@ -594,7 +616,7 @@ fn snapshot_fn() -> discovery::SnapshotFn {
 #[cfg(windows)]
 fn open_backend(cfg: &Config, tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
     let _ = (cfg, tx);
-    Ok(Box::new(crate::win::wfp::WfpFirewall::open()?))
+    Ok(Box::new(crate::win::wfp::open()?))
 }
 
 /// macOS：pf 负责全局断网，网络扩展（连上后）负责按应用阻断。

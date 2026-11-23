@@ -37,7 +37,7 @@ pub struct PfFirewall {
 }
 
 /// 取得锚点的独占锁；已被其他进程持有时返回 Ok(None)。
-fn try_lock() -> Result<Option<std::fs::File>> {
+pub(crate) fn try_lock() -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new()
@@ -189,7 +189,7 @@ impl PfFirewall {
             }
             // 放行期间「始终阻断 IPv6」：只装 IPv6 的规则
             (Some(policy), false) if self.rules.block_ipv6 => {
-                let text = pfrules::render_v6(&policy);
+                let text = pfrules::render_v6(&policy, self.rules.v6_probe);
                 log::debug!("装入 pf 规则:\n{text}");
                 pfctl(&["-a", ANCHOR, "-f", "-"], Some(&text))?;
                 self.enable()?;
@@ -238,7 +238,9 @@ impl Firewall for PfFirewall {
     }
 
     fn set_rules(&mut self, rules: Rules) -> Result<()> {
-        let changed = rules.block_all != self.rules.block_all || rules.block_ipv6 != self.rules.block_ipv6;
+        let changed = rules.block_all != self.rules.block_all
+            || rules.block_ipv6 != self.rules.block_ipv6
+            || rules.v6_probe != self.rules.v6_probe;
         // 第一次设置规则时（启动）也同步一次：「始终阻断 IPv6」在放行状态下也要生效
         let first = !self.synced_once;
         self.synced_once = true;

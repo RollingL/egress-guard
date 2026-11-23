@@ -1,16 +1,16 @@
-//! WFP（Windows Filtering Platform）用户态阻断。
+//! WFP（Windows Filtering Platform）用户态阻断：底层调用。
 //!
 //! - 使用动态会话（FWPM_SESSION_FLAG_DYNAMIC）：本进程退出、崩溃或被结束时，
 //!   本会话添加的子层和过滤器全部由系统自动删除，不会残留规则。
 //! - 按应用 ID（FWPM_CONDITION_ALE_APP_ID）在 ALE 连接/接受层阻断 IPv4 与 IPv6。
 //! - 全局断网时再加一条不带条件的兜底阻断，以及若干放行例外。
-//!   同一子层内按权重裁决：受控应用阻断（15）> 例外放行（8）> 兜底阻断（0），
-//!   因此受控应用在全局断网时也不享受局域网等例外。
+//!
+//! 什么时候加、删哪些过滤器、过滤器归谁所有在 [`crate::wfpcore`]（与平台无关，有模拟事务的测试）；
+//! 这里只把它要的过滤器翻译成 WFP 调用。
 
-use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use ipnet::IpNet;
@@ -20,45 +20,19 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::tcpkill;
-use crate::blockall::{
-    lan_nets, BlockAllPolicy, DHCP_V4_CLIENT_PORT, DHCP_V4_SERVER_PORT, DHCP_V6_CLIENT_PORT, DHCP_V6_SERVER_PORT, DNS_PORT,
-};
-use crate::controller::{Firewall, Rules};
-use crate::discovery::normalize_path;
+use crate::blockall::DNS_PORT;
+use crate::wfpcore::{Api, Filter, Kill, Layer, Wfp};
 
 /// 本工具子层的固定 GUID。固定值便于识别"已有实例在运行"。
 const SUBLAYER_KEY: GUID = GUID::from_u128(0x6a1e_93c4_2b7d_4f0e_9c51_3e8a_d4b2_7f10);
 
-struct Layer {
-    key: GUID,
-    name: &'static str,
-    v6: bool,
-    /// 出站连接层（另一类是入站接受层）。
-    connect: bool,
-}
-
-/// 阻断的 ALE 层：出站连接 + 入站接受，覆盖 TCP 与 UDP。
-static LAYERS: [Layer; 4] = [
-    Layer { key: FWPM_LAYER_ALE_AUTH_CONNECT_V4, name: "connect-v4", v6: false, connect: true },
-    Layer { key: FWPM_LAYER_ALE_AUTH_CONNECT_V6, name: "connect-v6", v6: true, connect: true },
-    Layer { key: FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, name: "accept-v4", v6: false, connect: false },
-    Layer { key: FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, name: "accept-v6", v6: true, connect: false },
+/// [`crate::wfpcore::LAYERS`] 各层对应的 WFP 层。
+const LAYER_KEYS: [GUID; 4] = [
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
 ];
-
-/// 全部层。
-fn all_layers() -> Vec<&'static Layer> {
-    LAYERS.iter().collect()
-}
-
-/// 只有 IPv6 的层（「始终阻断 IPv6」）。
-fn v6_layers() -> Vec<&'static Layer> {
-    LAYERS.iter().filter(|l| l.v6).collect()
-}
-
-/// 过滤器权重（FWP_UINT8 权重档位，0–15）。
-const W_APP_BLOCK: u8 = 15;
-const W_PERMIT: u8 = 8;
-const W_CATCH_ALL: u8 = 0;
 
 const IPPROTO_UDP: u8 = 17;
 
@@ -66,88 +40,11 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 const E_ACCESSDENIED: u32 = 0x8007_0005;
 const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
 
-/// 「始终阻断 IPv6」的过滤器：放行期间也在 IPv6 层阻断受控应用（全局断网时为全部 IPv6）。
-/// 与阻断状态无关。和主规则一样按程序增量同步：已经生效的阻断在新程序加不上时保持不动，
-/// 不会出现「先删掉旧的一整套、新的只加上一半」的情况。阻断期间与主规则重复，不影响结果。
-#[derive(Default)]
-struct V6Guard {
-    /// 规范化路径 → 该程序在 IPv6 层的阻断过滤器。
-    apps: HashMap<String, Vec<u64>>,
-    /// 因为文件不存在而暂未加上的程序：等它出现再加。
-    missing: HashMap<String, PathBuf>,
-    /// 添加失败的程序：定时重试。
-    failed: HashSet<String>,
-    /// 全局断网时的 IPv6 兜底阻断与例外。
-    global: Option<V6Global>,
-}
+pub type WfpFirewall = Wfp<WinApi>;
 
-struct V6Global {
-    policy: BlockAllPolicy,
-    ids: Vec<u64>,
-    /// 不存在的例外程序（出现后重建）。
-    missing: Vec<PathBuf>,
-    /// 有例外程序添加失败（定时重试）。
-    failed: bool,
-}
-
-impl V6Guard {
-    /// 需要重试：有程序添加失败，或者之前不存在的程序现在出现了。两类原因分别判断，互不掩盖。
-    fn needs_retry(&self) -> bool {
-        !self.failed.is_empty()
-            || self.missing.values().any(|p| may_exist(p))
-            || self.global.as_ref().is_some_and(|g| g.failed || g.missing.iter().any(|p| may_exist(p)))
-    }
-
-    fn all_ids(&self) -> Vec<u64> {
-        self.apps.values().flatten().chain(self.global.iter().flat_map(|g| g.ids.iter())).copied().collect()
-    }
-}
-
-/// 已生效的全局断网规则。
-struct Global {
-    policy: BlockAllPolicy,
-    ids: Vec<u64>,
-    /// 例外程序是否全部加上了（有程序暂不存在等情况时为 false，稍后重试）。
-    complete: bool,
-}
-
-pub struct WfpFirewall {
+/// 打开的 WFP 动态会话。
+pub struct WinApi {
     engine: HANDLE,
-    rules: Rules,
-    /// 规范化路径 → 该受控程序的过滤器 ID。
-    filters: HashMap<String, Vec<u64>>,
-    global: Option<Global>,
-    blocked: bool,
-    /// 本轮未能加上规则的受控程序（文件不存在或添加失败），等待重试。
-    pending: HashSet<String>,
-    /// 已经警告过的程序，成功前不再重复警告。
-    warned: HashSet<String>,
-    /// 本工具自身，全局断网时始终放行（否则无法再检测出口 IP）。
-    self_exe: Option<PathBuf>,
-    v6guard: Option<V6Guard>,
-    /// 放行后仍保留的受控程序阻断：「始终阻断 IPv6」时这些程序的 IPv6 阻断没能加上，
-    /// 放行会让它们的 IPv6 失去覆盖，所以整套阻断留着，等 IPv6 阻断补上后再撤。
-    retained: HashMap<String, Vec<u64>>,
-}
-
-/// 文件可能存在：只有确认「不存在」才算不存在。权限不足等其他错误照常尝试加规则
-/// （加不上记为失败并重试），而不是当作文件不存在悄悄跳过。
-fn may_exist(p: &Path) -> bool {
-    !matches!(p.try_exists(), Ok(false))
-}
-
-/// 新加上的全局断网规则。
-struct GlobalAdded {
-    ids: Vec<u64>,
-    missing: Vec<PathBuf>,
-    failed: bool,
-}
-
-/// 同步结果。
-#[derive(Default)]
-struct Synced {
-    added_apps: Vec<PathBuf>,
-    global_applied: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -167,8 +64,8 @@ fn check(code: u32, what: &str) -> Result<()> {
     }
 }
 
-impl WfpFirewall {
-    pub fn open() -> Result<Self> {
+impl WinApi {
+    fn open() -> Result<Self> {
         let mut session_name = wide("egress-guard");
         let mut session_desc = wide("Egress IP based app network control (dynamic session)");
         let session = FWPM_SESSION0 {
@@ -187,19 +84,7 @@ impl WfpFirewall {
             },
             "FwpmEngineOpen0",
         )?;
-
-        let fw = Self {
-            engine,
-            rules: Rules::default(),
-            filters: HashMap::new(),
-            global: None,
-            blocked: false,
-            pending: HashSet::new(),
-            warned: HashSet::new(),
-            self_exe: std::env::current_exe().ok(),
-            v6guard: None,
-            retained: HashMap::new(),
-        };
+        let api = Self { engine };
 
         let mut sl_name = wide("egress-guard sublayer");
         let sublayer = FWPM_SUBLAYER0 {
@@ -211,37 +96,21 @@ impl WfpFirewall {
             weight: 0xFFFF, // 最高子层权重
             ..Default::default()
         };
-        check(unsafe { FwpmSubLayerAdd0(fw.engine, &sublayer, None) }, "FwpmSubLayerAdd0")?;
-        Ok(fw)
-    }
-
-    fn in_transaction(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        check(unsafe { FwpmTransactionBegin0(self.engine, 0) }, "FwpmTransactionBegin0")?;
-        match f(self) {
-            Ok(()) => check(unsafe { FwpmTransactionCommit0(self.engine) }, "FwpmTransactionCommit0"),
-            Err(e) => {
-                unsafe { FwpmTransactionAbort0(self.engine) };
-                Err(e)
-            }
-        }
+        check(unsafe { FwpmSubLayerAdd0(api.engine, &sublayer, None) }, "FwpmSubLayerAdd0")?;
+        Ok(api)
     }
 
     /// 添加一个过滤器。权限阻断会清除动作权限，低优先级子层的放行无法覆盖。
-    fn add_filter(
-        &self,
-        layer: &Layer,
-        what: &str,
-        permit: bool,
-        weight: u8,
-        conds: &mut [FWPM_FILTER_CONDITION0],
-    ) -> Result<u64> {
+    fn add_raw(&self, layer: &Layer, f: &Filter<'_>, conds: &mut [FWPM_FILTER_CONDITION0]) -> Result<u64> {
+        let what = f.describe();
+        let permit = f.permit();
         let mut name = wide(&format!("egress-guard {what} {}", layer.name));
         let filter = FWPM_FILTER0 {
             displayData: FWPM_DISPLAY_DATA0 { name: PWSTR(name.as_mut_ptr()), description: PWSTR::null() },
             flags: if permit { FWPM_FILTER_FLAG_NONE } else { FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT },
-            layerKey: layer.key,
+            layerKey: LAYER_KEYS[layer.index],
             subLayerKey: SUBLAYER_KEY,
-            weight: FWP_VALUE0 { r#type: FWP_UINT8, Anonymous: FWP_VALUE0_0 { uint8: weight } },
+            weight: FWP_VALUE0 { r#type: FWP_UINT8, Anonymous: FWP_VALUE0_0 { uint8: f.weight() } },
             numFilterConditions: conds.len() as u32,
             filterCondition: if conds.is_empty() { std::ptr::null_mut() } else { conds.as_mut_ptr() },
             action: FWPM_ACTION0 {
@@ -257,98 +126,39 @@ impl WfpFirewall {
         )?;
         Ok(id)
     }
+}
 
-    fn delete_ids(&self, ids: &[u64]) -> Result<()> {
-        for id in ids {
-            check(unsafe { FwpmFilterDeleteById0(self.engine, *id) }, "FwpmFilterDeleteById0")?;
-        }
-        Ok(())
+impl Api for WinApi {
+    fn begin(&mut self) -> Result<()> {
+        check(unsafe { FwpmTransactionBegin0(self.engine, 0) }, "FwpmTransactionBegin0")
     }
 
-    /// 为单个程序在给定的层上添加过滤器（阻断或放行），返回过滤器 ID。
-    /// 任一层失败时删掉已加上的部分，不留半套规则：这时返回 `Ok(Err(..))`，调用方可以跳过这个程序继续；
-    /// 清理本身失败时返回外层的 `Err`，调用方必须中止整个事务（否则会提交半套规则）。
-    fn add_app_filters(&self, app: &Path, permit: bool, layers: &[&Layer]) -> Result<Result<Vec<u64>>> {
-        let path_w = wide(&app.to_string_lossy());
-        let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
-        if let Err(e) = check(
-            unsafe { FwpmGetAppIdFromFileName0(PCWSTR(path_w.as_ptr()), &mut app_id) },
-            &format!("FwpmGetAppIdFromFileName0({})", app.display()),
-        ) {
-            return Ok(Err(e));
-        }
-        let (what, weight) = if permit { ("allow app", W_PERMIT) } else { ("block app", W_APP_BLOCK) };
-        let mut ids = Vec::with_capacity(layers.len());
-        let mut result = Ok(());
-        for layer in layers {
-            let mut cond = [FWPM_FILTER_CONDITION0 {
-                fieldKey: FWPM_CONDITION_ALE_APP_ID,
-                matchType: FWP_MATCH_EQUAL,
-                conditionValue: FWP_CONDITION_VALUE0 {
-                    r#type: FWP_BYTE_BLOB_TYPE,
-                    Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
-                },
-            }];
-            match self.add_filter(layer, what, permit, weight, &mut cond) {
-                Ok(id) => ids.push(id),
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            }
-        }
-        let mut p = app_id as *mut c_void;
-        unsafe { FwpmFreeMemory0(&mut p) };
-        match result {
-            Ok(()) => Ok(Ok(ids)),
-            Err(e) => {
-                self.delete_ids(&ids).map_err(|d| d.context(format!("清理 {} 的部分过滤器失败", app.display())))?;
-                Ok(Err(e))
-            }
-        }
+    fn commit(&mut self) -> Result<()> {
+        check(unsafe { FwpmTransactionCommit0(self.engine) }, "FwpmTransactionCommit0")
     }
 
-    /// 添加全局断网的兜底阻断与例外放行。基础规则失败时返回错误（整个事务回滚）；
-    /// 单个例外程序失败只跳过它：不存在的记进 missing（等它出现），添加失败的把 failed 记为 true（定时重试）。
-    fn add_global_filters(
-        &self,
-        policy: &BlockAllPolicy,
-        layers: &[&Layer],
-        warnings: &mut Vec<(String, String)>,
-        ok_keys: &mut Vec<String>,
-    ) -> Result<GlobalAdded> {
-        let mut ids = Vec::new();
-        let mut remote: Vec<IpNet> = if policy.allow_lan { lan_nets() } else { Vec::new() };
-        remote.extend(policy.allow_remote.iter().copied());
+    fn abort(&mut self) {
+        unsafe { FwpmTransactionAbort0(self.engine) };
+    }
 
-        let base = (|| -> Result<()> {
-            for layer in layers {
-                let mut c = [cond_flags(FWP_CONDITION_FLAG_IS_LOOPBACK)];
-                ids.push(self.add_filter(layer, "allow loopback", true, W_PERMIT, &mut c)?);
-
-                // 只放行 DHCP 客户端与服务器端口之间的 UDP（连接层是发往服务器，接受层是服务器的回复），
-                // 而不是本地 68/546 端口发往任意端口的流量
-                let (client, server) = if layer.v6 {
-                    (DHCP_V6_CLIENT_PORT, DHCP_V6_SERVER_PORT)
-                } else {
-                    (DHCP_V4_CLIENT_PORT, DHCP_V4_SERVER_PORT)
-                };
-                let mut c = [
+    fn add(&mut self, layer: &Layer, f: &Filter<'_>) -> Result<u64> {
+        match f {
+            Filter::Loopback => self.add_raw(layer, f, &mut [cond_flags(FWP_CONDITION_FLAG_IS_LOOPBACK)]),
+            Filter::Dhcp { client, server } => self.add_raw(
+                layer,
+                f,
+                &mut [
                     cond_u8(FWPM_CONDITION_IP_PROTOCOL, IPPROTO_UDP),
-                    cond_u16(FWPM_CONDITION_IP_LOCAL_PORT, client),
-                    cond_u16(FWPM_CONDITION_IP_REMOTE_PORT, server),
-                ];
-                ids.push(self.add_filter(layer, "allow dhcp", true, W_PERMIT, &mut c)?);
-
-                if policy.allow_dns && layer.connect {
-                    let mut c = [cond_u16(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORT)];
-                    ids.push(self.add_filter(layer, "allow dns", true, W_PERMIT, &mut c)?);
-                }
-
-                // 同一字段的多个条件之间是"或"关系
+                    cond_u16(FWPM_CONDITION_IP_LOCAL_PORT, *client),
+                    cond_u16(FWPM_CONDITION_IP_REMOTE_PORT, *server),
+                ],
+            ),
+            Filter::Dns => self.add_raw(layer, f, &mut [cond_u16(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORT)]),
+            // 同一字段的多个条件之间是"或"关系
+            Filter::Remote(nets) => {
                 let mut v4: Vec<FWP_V4_ADDR_AND_MASK> = Vec::new();
                 let mut v6: Vec<FWP_V6_ADDR_AND_MASK> = Vec::new();
-                for net in &remote {
+                for net in nets.iter() {
                     match net {
                         IpNet::V4(n) if !layer.v6 => v4.push(FWP_V4_ADDR_AND_MASK {
                             addr: u32::from(n.network()),
@@ -361,348 +171,45 @@ impl WfpFirewall {
                         _ => {}
                     }
                 }
-                let mut c: Vec<FWPM_FILTER_CONDITION0> = if layer.v6 {
-                    v6.iter_mut().map(cond_v6).collect()
-                } else {
-                    v4.iter_mut().map(cond_v4).collect()
-                };
-                if !c.is_empty() {
-                    ids.push(self.add_filter(layer, "allow remote", true, W_PERMIT, &mut c)?);
+                let mut c: Vec<FWPM_FILTER_CONDITION0> =
+                    if layer.v6 { v6.iter_mut().map(cond_v6).collect() } else { v4.iter_mut().map(cond_v4).collect() };
+                if c.is_empty() {
+                    bail!("没有 {} 的例外地址", layer.name);
                 }
-
-                ids.push(self.add_filter(layer, "block all", false, W_CATCH_ALL, &mut [])?);
+                self.add_raw(layer, f, &mut c)
             }
-            Ok(())
-        })();
-        // 出错时整个事务会回滚，不必逐个删除
-        base?;
-
-        let mut missing = Vec::new();
-        let mut failed = false;
-        for app in self.self_exe.iter().chain(policy.allow_apps.iter()) {
-            let key = format!("allow:{}", normalize_path(app));
-            if !may_exist(app) {
-                missing.push(app.clone());
-                warnings.push((key, format!("例外程序不存在，暂时跳过: {}", app.display())));
-                continue;
-            }
-            match self.add_app_filters(app, true, layers)? {
-                Ok(mut v) => {
-                    ids.append(&mut v);
-                    ok_keys.push(key);
-                }
-                Err(e) => {
-                    failed = true;
-                    warnings.push((key, format!("无法放行例外程序 {}，稍后重试: {e:#}", app.display())));
-                }
+            Filter::BlockAll => self.add_raw(layer, f, &mut []),
+            Filter::App { path, .. } => {
+                let path_w = wide(&path.to_string_lossy());
+                let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
+                check(
+                    unsafe { FwpmGetAppIdFromFileName0(PCWSTR(path_w.as_ptr()), &mut app_id) },
+                    &format!("FwpmGetAppIdFromFileName0({})", path.display()),
+                )?;
+                let mut cond = [FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_BYTE_BLOB_TYPE,
+                        Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: app_id },
+                    },
+                }];
+                let r = self.add_raw(layer, f, &mut cond);
+                let mut p = app_id as *mut c_void;
+                unsafe { FwpmFreeMemory0(&mut p) };
+                r
             }
         }
-        Ok(GlobalAdded { ids, missing, failed })
     }
 
-    /// 在一个事务里让过滤器与规则一致：为缺少的程序添加、为多余的程序删除，
-    /// 全局断网规则有变化时整体替换。整个过程没有"先全部删除再添加"的放行空档。
-    fn sync_filters(&mut self) -> Result<Synced> {
-        let wanted: HashMap<String, PathBuf> =
-            self.rules.apps.iter().map(|p| (normalize_path(p), p.clone())).collect();
-        let to_remove: Vec<String> =
-            self.filters.keys().filter(|k| !wanted.contains_key(*k)).cloned().collect();
-        let to_add: Vec<(String, PathBuf)> = wanted
-            .iter()
-            .filter(|(k, _)| !self.filters.contains_key(*k))
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
-        let want_global = self.rules.block_all.clone();
-        let global_stale = match (&self.global, &want_global) {
-            (None, None) => false,
-            (Some(g), Some(p)) => g.policy != *p || !g.complete,
-            _ => true,
-        };
-        if to_remove.is_empty() && to_add.is_empty() && !global_stale {
-            self.pending.clear();
-            return Ok(Synced::default());
-        }
-
-        let mut added: Vec<(String, PathBuf, Vec<u64>)> = Vec::new();
-        let mut pending = HashSet::new();
-        let mut warnings = Vec::new();
-        let mut ok_keys = Vec::new();
-        let mut new_global: Option<Option<Global>> = None;
-        self.in_transaction(|fw| {
-            for k in &to_remove {
-                for id in &fw.filters[k] {
-                    check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
-                }
-            }
-            // 单个程序失败（文件不存在、路径无效等）只跳过它，不影响其他程序的阻断
-            for (k, app) in &to_add {
-                if !may_exist(app) {
-                    pending.insert(k.clone());
-                    warnings.push((k.clone(), format!("程序不存在，暂时跳过: {}", app.display())));
-                    continue;
-                }
-                match fw.add_app_filters(app, false, &all_layers())? {
-                    Ok(ids) => {
-                        ok_keys.push(k.clone());
-                        added.push((k.clone(), app.clone(), ids));
-                    }
-                    Err(e) => {
-                        pending.insert(k.clone());
-                        warnings.push((k.clone(), format!("无法阻断 {}，稍后重试: {e:#}", app.display())));
-                    }
-                }
-            }
-            if global_stale {
-                if let Some(g) = &fw.global {
-                    for id in &g.ids {
-                        check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
-                    }
-                }
-                new_global = Some(match &want_global {
-                    Some(p) => {
-                        let g = fw.add_global_filters(p, &all_layers(), &mut warnings, &mut ok_keys)?;
-                        let complete = g.missing.is_empty() && !g.failed;
-                        Some(Global { policy: p.clone(), ids: g.ids, complete })
-                    }
-                    None => None,
-                });
-            }
-            Ok(())
-        })?;
-
-        for k in &ok_keys {
-            self.warned.remove(k);
-        }
-        for (k, msg) in warnings {
-            if self.warned.insert(k) {
-                log::warn!("{msg}");
-            }
-        }
-        self.pending = pending;
-
-        let mut global_applied = false;
-        if let Some(g) = new_global {
-            match &g {
-                Some(g) => {
-                    global_applied = true;
-                    log::info!(
-                        "全局断网规则已生效：{} 个过滤器（局域网{}，DNS {}，例外程序 {} 个，例外地址 {} 条）",
-                        g.ids.len(),
-                        if g.policy.allow_lan { "放行" } else { "阻断" },
-                        if g.policy.allow_dns { "放行" } else { "阻断" },
-                        g.policy.allow_apps.len(),
-                        g.policy.allow_remote.len()
-                    );
-                }
-                None => log::info!("全局断网规则已移除，只阻断受控应用"),
-            }
-            self.global = g;
-        }
-
-        for k in &to_remove {
-            self.filters.remove(k);
-        }
-        let mut added_apps = Vec::new();
-        for (k, app, ids) in added {
-            self.filters.insert(k, ids);
-            added_apps.push(app);
-        }
-        if !added_apps.is_empty() || !to_remove.is_empty() {
-            let total: usize = self.filters.values().map(Vec::len).sum();
-            log::info!(
-                "WFP 规则已更新：新增 {} 个程序，移除 {} 个，受控应用共 {} 个过滤器",
-                added_apps.len(),
-                to_remove.len(),
-                total
-            );
-        }
-        Ok(Synced { added_apps, global_applied })
+    fn delete(&mut self, id: u64) -> Result<()> {
+        check(unsafe { FwpmFilterDeleteById0(self.engine, id) }, "FwpmFilterDeleteById0")
     }
 
-    /// 让「始终阻断 IPv6」的过滤器与规则一致（与阻断状态无关）。
-    ///
-    /// 在一个事务里：删除不再受控的程序、为新程序添加、全局断网规则变化时整体替换。
-    /// 已经生效的程序阻断不会被重建，新程序加不上只记下来（报告具体路径并稍后重试）；
-    /// 删除失败或全局部分的基础规则失败时回滚整个事务，原来的保护保持不变。
-    fn sync_v6guard(&mut self) -> Result<()> {
-        if !self.rules.block_ipv6 {
-            if let Some(g) = &self.v6guard {
-                let ids = g.all_ids();
-                self.in_transaction(|fw| fw.delete_ids(&ids))?;
-                log::info!("已移除「始终阻断 IPv6」的 {} 个过滤器", ids.len());
-            }
-            self.v6guard = None;
-            return Ok(());
-        }
-        let first = self.v6guard.is_none();
-        let guard = self.v6guard.get_or_insert_with(V6Guard::default);
-        let wanted: HashMap<String, PathBuf> =
-            self.rules.apps.iter().map(|p| (normalize_path(p), p.clone())).collect();
-        let to_remove: Vec<String> = guard.apps.keys().filter(|k| !wanted.contains_key(*k)).cloned().collect();
-        // 还没加上的（新程序、之前不存在的、之前添加失败的）都在这里；仍然不存在的不必进事务
-        let to_add: Vec<(String, PathBuf)> = wanted
-            .iter()
-            .filter(|(k, _)| !guard.apps.contains_key(*k))
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
-        let want_global = self.rules.block_all.clone();
-        let global_stale = match (&guard.global, &want_global) {
-            (None, None) => false,
-            (Some(g), Some(p)) => g.policy != *p || g.failed || g.missing.iter().any(|a| may_exist(a)),
-            _ => true,
-        };
-        let work = !to_remove.is_empty() || global_stale || to_add.iter().any(|(_, p)| may_exist(p));
-        if !work {
-            guard.missing = to_add.into_iter().collect();
-            guard.failed.clear();
-            return Ok(());
-        }
-
-        let old_global_ids: Vec<u64> = guard.global.as_ref().map(|g| g.ids.clone()).unwrap_or_default();
-        let remove_ids: Vec<u64> = to_remove.iter().flat_map(|k| guard.apps[k].iter().copied()).collect();
-        let mut added: Vec<(String, Vec<u64>)> = Vec::new();
-        let mut missing = HashMap::new();
-        let mut failed = HashSet::new();
-        let mut warnings = Vec::new();
-        let mut ok_keys = Vec::new();
-        let mut new_global: Option<Option<V6Global>> = None;
-        self.in_transaction(|fw| {
-            fw.delete_ids(&remove_ids)?;
-            let layers = v6_layers();
-            for (k, app) in &to_add {
-                if !may_exist(app) {
-                    missing.insert(k.clone(), app.clone());
-                    warnings.push((format!("v6:{k}"), format!("程序不存在，暂时跳过: {}", app.display())));
-                    continue;
-                }
-                match fw.add_app_filters(app, false, &layers)? {
-                    Ok(ids) => {
-                        ok_keys.push(format!("v6:{k}"));
-                        added.push((k.clone(), ids));
-                    }
-                    Err(e) => {
-                        failed.insert(k.clone());
-                        warnings.push((
-                            format!("v6:{k}"),
-                            format!("无法阻断 {} 的 IPv6，稍后重试: {e:#}", app.display()),
-                        ));
-                    }
-                }
-            }
-            if global_stale {
-                fw.delete_ids(&old_global_ids)?;
-                new_global = Some(match &want_global {
-                    Some(p) => {
-                        let g = fw.add_global_filters(p, &layers, &mut warnings, &mut ok_keys)?;
-                        Some(V6Global { policy: p.clone(), ids: g.ids, missing: g.missing, failed: g.failed })
-                    }
-                    None => None,
-                });
-            }
-            Ok(())
-        })?;
-
-        for k in &ok_keys {
-            self.warned.remove(k);
-        }
-        for (k, msg) in warnings {
-            if self.warned.insert(k) {
-                log::warn!("{msg}");
-            }
-        }
-        let guard = self.v6guard.as_mut().expect("上面已经创建");
-        for k in &to_remove {
-            guard.apps.remove(k);
-        }
-        let added_n = added.len();
-        for (k, ids) in added {
-            guard.apps.insert(k, ids);
-        }
-        guard.missing = missing;
-        guard.failed = failed;
-        if let Some(g) = new_global {
-            guard.global = g;
-        }
-        if first || added_n > 0 || !to_remove.is_empty() || global_stale {
-            let n = guard.all_ids().len();
-            log::info!(
-                "始终阻断 IPv6：{n} 个过滤器（受控应用 {} 个{}{}）",
-                guard.apps.len(),
-                if guard.global.is_some() { "，全部 IPv6，例外同全局断网" } else { "" },
-                if guard.missing.is_empty() && guard.failed.is_empty() {
-                    String::new()
-                } else {
-                    format!("，{} 个暂未加上", guard.missing.len() + guard.failed.len())
-                }
-            );
-        }
-        Ok(())
-    }
-
-    /// 「始终阻断 IPv6」时，IPv6 阻断还没加上的受控程序（有主阻断规则的那些）。
-    /// 放行时它们的主阻断要保留，否则 IPv6 没有任何覆盖。
-    fn uncovered_v6(&self) -> HashSet<String> {
-        if !self.rules.block_ipv6 {
-            return HashSet::new();
-        }
-        self.filters
-            .keys()
-            .filter(|k| self.v6guard.as_ref().is_none_or(|g| !g.apps.contains_key(*k)))
-            .cloned()
-            .collect()
-    }
-
-    /// 撤掉不再需要保留的主阻断：IPv6 阻断已经补上、程序不再受控，或者不再「始终阻断 IPv6」。
-    fn release_retained(&mut self) -> Result<()> {
-        if self.retained.is_empty() {
-            return Ok(());
-        }
-        let wanted: HashSet<String> = self.rules.apps.iter().map(|p| normalize_path(p)).collect();
-        let release: Vec<String> = self
-            .retained
-            .keys()
-            .filter(|k| {
-                !self.rules.block_ipv6
-                    || !wanted.contains(*k)
-                    || self.v6guard.as_ref().is_some_and(|g| g.apps.contains_key(*k))
-            })
-            .cloned()
-            .collect();
-        if release.is_empty() {
-            return Ok(());
-        }
-        let ids: Vec<u64> = release.iter().flat_map(|k| self.retained[k].iter().copied()).collect();
-        self.in_transaction(|fw| fw.delete_ids(&ids))?;
-        for k in &release {
-            self.retained.remove(k);
-        }
-        log::info!("{} 个程序的 IPv6 阻断已补上（或不再需要），撤掉保留的阻断", release.len());
-        Ok(())
-    }
-
-    /// 主动断开现有 IPv4 TCP 连接。全局断网刚生效时断开所有非例外连接，
-    /// 否则只断开新加入阻断的受控程序。
-    fn kill_connections(&self, s: &Synced, entering_block: bool) {
-        if !self.rules.kill_existing_tcp {
-            return;
-        }
-        let result = match &self.global {
-            Some(g) if entering_block || s.global_applied => {
-                let apps: HashSet<String> = self.rules.apps.iter().map(|p| normalize_path(p)).collect();
-                let allowed: HashSet<String> =
-                    self.self_exe.iter().chain(g.policy.allow_apps.iter()).map(|p| normalize_path(p)).collect();
-                tcpkill::kill_tcp_where(|path, ip, port| {
-                    if path.is_some_and(|p| apps.contains(p)) {
-                        return true;
-                    }
-                    if path.is_some_and(|p| allowed.contains(p)) {
-                        return false;
-                    }
-                    !g.policy.permits_remote(IpAddr::V4(ip), port)
-                })
-            }
-            _ if !s.added_apps.is_empty() => tcpkill::kill_tcp_connections(&s.added_apps),
-            _ => return,
+    fn kill(&self, k: Kill) {
+        let result = match &k {
+            Kill::Apps(apps) => tcpkill::kill_tcp_connections(apps),
+            Kill::Global { .. } => tcpkill::kill_tcp_where(|path, ip, port| k.matches(path, IpAddr::V4(ip), port)),
         };
         match result {
             Ok(0) => {}
@@ -710,6 +217,20 @@ impl WfpFirewall {
             Err(e) => log::warn!("断开现有 TCP 连接失败: {e:#}"),
         }
     }
+}
+
+impl Drop for WinApi {
+    fn drop(&mut self) {
+        // 关闭动态会话后，系统自动删除本会话的全部子层与过滤器
+        unsafe { FwpmEngineClose0(self.engine) };
+        log::info!("WFP 会话已关闭，所有阻断规则已移除");
+    }
+}
+
+/// 打开 WFP 动态会话。
+pub fn open() -> Result<WfpFirewall> {
+    let self_exe: Option<PathBuf> = std::env::current_exe().ok();
+    Ok(Wfp::new(WinApi::open()?, self_exe))
 }
 
 fn cond_u8(field: GUID, v: u8) -> FWPM_FILTER_CONDITION0 {
@@ -755,96 +276,5 @@ fn cond_v6(m: &mut FWP_V6_ADDR_AND_MASK) -> FWPM_FILTER_CONDITION0 {
             r#type: FWP_V6_ADDR_MASK,
             Anonymous: FWP_CONDITION_VALUE0_0 { v6AddrMask: m },
         },
-    }
-}
-
-impl Firewall for WfpFirewall {
-    fn block(&mut self) -> Result<()> {
-        if self.blocked {
-            return Ok(());
-        }
-        // 放行期间保留的阻断仍然有效：并回主规则，不重复添加
-        let retained: Vec<(String, Vec<u64>)> = self.retained.drain().collect();
-        self.filters.extend(retained);
-        let s = self.sync_filters()?;
-        self.blocked = true;
-        self.kill_connections(&s, true);
-        Ok(())
-    }
-
-    fn unblock(&mut self) -> Result<()> {
-        if !self.blocked {
-            return Ok(());
-        }
-        // IPv6 阻断没加上的受控程序：放行后 IPv6 没有覆盖，保留它们的整套阻断（IPv4 也不放行），稍后重试
-        let keep = self.uncovered_v6();
-        let ids: Vec<u64> = self
-            .filters
-            .iter()
-            .filter(|(k, _)| !keep.contains(*k))
-            .flat_map(|(_, v)| v.iter())
-            .chain(self.global.iter().flat_map(|g| g.ids.iter()))
-            .copied()
-            .collect();
-        self.in_transaction(|fw| {
-            for id in &ids {
-                check(unsafe { FwpmFilterDeleteById0(fw.engine, *id) }, "FwpmFilterDeleteById0")?;
-            }
-            Ok(())
-        })?;
-        log::info!("WFP 已删除 {} 个过滤器", ids.len());
-        self.retained = self.filters.drain().filter(|(k, _)| keep.contains(k)).collect();
-        if !self.retained.is_empty() {
-            log::warn!(
-                "{} 个受控程序的 IPv6 阻断没能加上，放行期间仍保持完全阻断，稍后重试: {}",
-                self.retained.len(),
-                self.retained.keys().cloned().collect::<Vec<_>>().join("、")
-            );
-        }
-        self.global = None;
-        self.pending.clear();
-        self.blocked = false;
-        Ok(())
-    }
-
-    fn is_blocked(&self) -> bool {
-        self.blocked
-    }
-
-    fn has_pending(&self) -> bool {
-        (self.blocked && (!self.pending.is_empty() || self.global.as_ref().is_some_and(|g| !g.complete)))
-            || self.v6guard.as_ref().is_some_and(V6Guard::needs_retry)
-            || !self.retained.is_empty()
-    }
-
-    fn set_rules(&mut self, rules: Rules) -> Result<()> {
-        self.rules = rules;
-        // 「始终阻断 IPv6」失败不影响主规则的同步，错误最后再返回
-        let v6 = self.sync_v6guard();
-        if self.blocked {
-            let s = self.sync_filters()?;
-            self.kill_connections(&s, false);
-        } else {
-            // IPv6 阻断补上之后才撤掉放行期间保留的阻断
-            self.release_retained()?;
-        }
-        v6
-    }
-
-    fn degraded(&self) -> Option<String> {
-        (!self.retained.is_empty()).then(|| {
-            format!(
-                "{} 个受控应用的「始终阻断 IPv6」规则没能加上，为避免 IPv6 泄露，放行期间这些应用仍完全断网，每 5 秒重试一次",
-                self.retained.len()
-            )
-        })
-    }
-}
-
-impl Drop for WfpFirewall {
-    fn drop(&mut self) {
-        // 关闭动态会话后，系统自动删除本会话的全部子层与过滤器
-        unsafe { FwpmEngineClose0(self.engine) };
-        log::info!("WFP 会话已关闭，所有阻断规则已移除");
     }
 }

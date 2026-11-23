@@ -22,7 +22,10 @@ pub const ANCHOR: &str = "com.apple/egress-guard";
 pub const PROBE_USER: &str = "nobody";
 
 /// 生成「始终阻断 IPv6」的规则文本：放行期间只切断 IPv6（例外与全局断网相同），IPv4 不受影响。
-pub fn render_v6(policy: &BlockAllPolicy) -> String {
+///
+/// `probe`：这份规则只是从「始终阻断 IPv6」改为「检测 IPv6 出口」后的过渡保留，要放行本工具的出口检测
+/// （与全局断网相同，按检测子进程的用户放行 TCP），否则 IPv6 出口永远验证不了。
+pub fn render_v6(policy: &BlockAllPolicy, probe: bool) -> String {
     let mut s = String::from("# egress-guard：始终阻断 IPv6\n");
     let mut line = |l: &str| {
         s.push_str(l);
@@ -36,6 +39,9 @@ pub fn render_v6(policy: &BlockAllPolicy) -> String {
         "pass in quick inet6 proto udp from any port {DHCP_V6_SERVER_PORT} to any port {DHCP_V6_CLIENT_PORT} no state"
     ));
     line("pass quick inet6 proto ipv6-icmp all icmp6-type { routersol, routeradv, neighbrsol, neighbradv } no state");
+    if probe {
+        line(&format!("pass out quick inet6 proto tcp from any to any user {PROBE_USER} flags S/SA keep state"));
+    }
     if policy.allow_dns {
         line(&format!("pass out quick inet6 proto {{ tcp, udp }} from any to any port {DNS_PORT} no state"));
         line(&format!("pass in quick inet6 proto {{ tcp, udp }} from any port {DNS_PORT} to any no state"));
@@ -179,7 +185,7 @@ mod tests {
             allow_apps: vec![],
             allow_remote: vec!["198.51.100.7/32".parse().unwrap(), "2001:db8::/32".parse().unwrap()],
         };
-        let text = render_v6(&p);
+        let text = render_v6(&p, false);
         let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
         // 除了回环，每条规则都只针对 IPv6，IPv4 不受影响
         assert!(lines.iter().filter(|l| !l.contains(" on lo0 ")).all(|l| l.contains(" inet6 ")), "{text}");
@@ -189,8 +195,14 @@ mod tests {
         assert!(text.contains("neighbrsol"));
         assert_eq!(lines[lines.len() - 2], "block drop out quick inet6 all");
         assert_eq!(lines[lines.len() - 1], "block drop in quick inet6 all");
-        let strict = render_v6(&BlockAllPolicy::default());
+        let strict = render_v6(&BlockAllPolicy::default(), false);
         assert!(!strict.contains("port 53") && !strict.contains("fe80::/10"));
+        // 常驻的「始终阻断 IPv6」不放行检测子进程；改为检测 IPv6 出口的过渡期间放行它的 IPv6 TCP
+        assert!(!strict.contains("user nobody"));
+        let probe = render_v6(&BlockAllPolicy::default(), true);
+        assert!(probe.contains("pass out quick inet6 proto tcp from any to any user nobody flags S/SA keep state"), "{probe}");
+        let lines: Vec<&str> = probe.lines().collect();
+        assert_eq!(lines[lines.len() - 2], "block drop out quick inet6 all");
     }
 
     #[test]

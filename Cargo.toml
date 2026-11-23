@@ -1,6 +1,6 @@
 [package]
 name = "egress-guard"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2021"
 description = "根据本机公网出口 IP 判断是否阻断选中应用（Windows：WFP；macOS：网络扩展）或全部网络（Windows：WFP；macOS：pf）的连接"
 
@@ -50,6 +50,11 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Rpc",
+    # 开机自启：直接从内存向任务计划程序注册（不经过临时文件）
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Variant",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",

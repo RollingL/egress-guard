@@ -46,14 +46,19 @@ jobs:
             exit 1
           fi
           # 标签已经存在、却指向别的提交：不能把这个提交的安装包挂到别人的标签上
-          if tag=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$V" --jq '.object.sha' 2>&1); then
-            if [[ "$tag" != "$GITHUB_SHA" ]]; then
-              # 附注标签指向标签对象，再取一层
-              tag=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag" --jq '.object.sha' 2>/dev/null || echo "$tag")
-            fi
-            [[ "$tag" == "$GITHUB_SHA" ]] || { echo "::error::标签 v$V 已存在并指向 $tag，不是 $GITHUB_SHA"; exit 1; }
-          elif ! grep -q "HTTP 404" <<<"$tag"; then
-            echo "::error::查询标签失败：$tag"
+          # 附注标签可能套几层：与发布脚本一样逐层剥离（最多 5 层），查询失败时让发布失败
+          if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$V" 2>&1); then
+            type=$(jq -r .object.type <<<"$ref")
+            tag=$(jq -r .object.sha <<<"$ref")
+            for _ in 1 2 3 4 5; do
+              [[ "$type" == tag ]] || break
+              obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag" 2>&1) || { echo "::error::读取标签对象失败：$obj"; exit 1; }
+              type=$(jq -r .object.type <<<"$obj")
+              tag=$(jq -r .object.sha <<<"$obj")
+            done
+            [[ "$type" == commit && "$tag" == "$GITHUB_SHA" ]] || { echo "::error::标签 v$V 已存在并指向 $type $tag，不是 $GITHUB_SHA"; exit 1; }
+          elif ! grep -q "HTTP 404" <<<"$ref"; then
+            echo "::error::查询标签失败：$ref"
             exit 1
           fi
           echo "将发布 v$V"

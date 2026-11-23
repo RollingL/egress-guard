@@ -23,8 +23,10 @@ pub mod logbuf;
 pub mod mac;
 pub mod netext;
 pub mod pfrules;
+pub mod uninstall;
 pub mod update;
 pub mod vpn;
+pub mod wfpcore;
 #[cfg(windows)]
 pub mod win;
 

@@ -165,7 +165,7 @@ pub fn dns_summary(r: &dns::DnsReport) -> (Level, String) {
     }
     let coverage = if notes.is_empty() { String::new() } else { format!("（{}）", notes.join("；")) };
     if ecs_leak > 0 {
-        (Level::Leak, format!("解析器向外透露了 {ecs_leak} 个与白名单完全不重叠的客户端网段（ECS）：域名查询来自白名单以外的出口{coverage}"))
+        (Level::Leak, format!("解析器披露了 {ecs_leak} 个与白名单完全不重叠的客户端网段（ECS）：域名查询经由白名单以外的网络发出{coverage}"))
     } else if unknown > 0 {
         (
             Level::Warn,
@@ -254,22 +254,26 @@ impl Judge {
     }
 
     /// 解析器转发给权威服务器的客户端网段（EDNS Client Subnet）。
-    /// 这是解析器看到的「你」的网段：
-    /// - 整个网段都在白名单内，或者包含测试时的出口：查询来自白名单出口（或者就是当前出口）；
-    /// - 网段比白名单条目宽、只有一部分重叠（例如白名单是 /32、网段是 /24）：证据不足；
-    /// - 完全不重叠：查询是从白名单以外的出口发给解析器的，算泄露。
+    /// 这是解析器看到的「你」的网段。先按它与同一地址族白名单的关系分级：
+    /// - 整个网段都在白名单内：查询来自白名单出口；
+    /// - 与白名单完全不相交：解析器披露了白名单以外的网段，算泄露。测试时的出口（基线）恰好在这个网段里
+    ///   也不能消除这个证据（那只说明基线本身就在白名单以外）；
+    /// - 部分重叠（例如白名单是 /32、网段是 /24）：测试时的出口在网段里且在白名单内时算来自白名单出口，
+    ///   否则证据不足。
     pub fn client_subnet(&self, subnet: IpNet, egress: Option<IpAddr>) -> Verdict {
         let subnet = subnet.trunc();
-        if self.whitelist.iter().any(|n| n.contains(&subnet)) {
+        let v6 = matches!(subnet, IpNet::V6(_));
+        let family: Vec<&IpNet> = self.whitelist.iter().filter(|n| matches!(n, IpNet::V6(_)) == v6).collect();
+        if family.iter().any(|n| n.contains(&subnet)) {
             return Verdict::Whitelisted;
         }
-        if let Some(e) = egress.map(normalize).filter(|e| subnet.contains(e)) {
-            return if self.whitelisted(e) { Verdict::Whitelisted } else { Verdict::SameNetwork };
+        let overlaps = family.iter().any(|n| subnet.contains(&n.network()) || n.contains(&subnet.network()));
+        if !overlaps {
+            return Verdict::Leak;
         }
-        if self.whitelist.iter().any(|n| subnet.contains(&n.network())) {
-            Verdict::Inconclusive
-        } else {
-            Verdict::Leak
+        match egress.map(normalize) {
+            Some(e) if subnet.contains(&e) && self.whitelisted(e) => Verdict::Whitelisted,
+            _ => Verdict::Inconclusive,
         }
     }
 
@@ -494,10 +498,17 @@ mod tests {
         assert_eq!(j.client_subnet(net("203.0.113.128/25"), None), Verdict::Whitelisted);
         // 网段比白名单宽：只部分重叠，证据不足
         assert_eq!(j.client_subnet(net("203.0.0.0/16"), None), Verdict::Inconclusive);
-        // 包含测试时的出口：与出口一致（出口不在白名单时只算同网络）
+        // 部分重叠、包含测试时的白名单出口：来自白名单出口
         assert_eq!(j.client_subnet(net("203.0.0.0/16"), Some(ip("203.0.113.7"))), Verdict::Whitelisted);
-        assert_eq!(j.client_subnet(net("198.51.100.0/24"), Some(ip("198.51.100.9"))), Verdict::SameNetwork);
+        // 完全不相交：即使测试时的出口（基线）就在这个网段里也是泄露
+        assert_eq!(j.client_subnet(net("198.51.100.0/24"), Some(ip("198.51.100.9"))), Verdict::Leak);
         assert_eq!(j.client_subnet(net("198.51.100.0/24"), Some(ip("203.0.113.7"))), Verdict::Leak);
+        assert_eq!(j.client_subnet(net("198.51.100.0/24"), None), Verdict::Leak);
+        // IPv6 网段只和 IPv6 白名单比较
+        assert_eq!(j.client_subnet(net("2001:db8:1::/48"), None), Verdict::Whitelisted);
+        assert_eq!(j.client_subnet(net("2001:db8::/32"), None), Verdict::Inconclusive);
+        assert_eq!(j.client_subnet(net("2001:db8::/32"), Some(ip("2001:db8:1::5"))), Verdict::Whitelisted);
+        assert_eq!(j.client_subnet(net("2001:db9::/48"), Some(ip("2001:db9::5"))), Verdict::Leak);
         // 白名单是 /32、ECS 是包含它的 /24
         let j32 = Judge::from_strings(&["192.0.2.10".to_owned()], &[]);
         assert_eq!(j32.client_subnet(net("192.0.2.0/24"), Some(ip("198.51.100.1"))), Verdict::Inconclusive);
@@ -510,6 +521,44 @@ mod tests {
         assert_eq!(j.host(ip("192.168.1.5")), Verdict::Local);
         assert_eq!(j.host(ip("2001:db8:1::5")), Verdict::Whitelisted);
         assert_eq!(j.host(ip("2001:db8:2::5")), Verdict::Exposed);
+    }
+
+    /// 复审报告的离线样例：白名单 203.0.113.7/32、基线 198.51.100.9、ECS 198.51.100.0/24、解析器可信。
+    /// 网段与白名单完全不相交，结论是泄露（--fail-on-leak 据此返回 2）。
+    #[test]
+    fn disjoint_ecs_is_leak_even_with_trusted_resolver_and_baseline() {
+        use super::dns::{ClientSubnet, DnsReport, Resolver, SourceStatus};
+        let j = Judge::from_strings(&["203.0.113.7/32".to_owned()], &["192.0.2.53".to_owned()]);
+        let mut r = DnsReport {
+            resolvers: vec![Resolver {
+                ip: ip("192.0.2.53"),
+                queries: 3,
+                sources: vec![],
+                protos: vec![],
+                info: None,
+                verdict: Verdict::Unknown,
+            }],
+            client_subnets: vec![ClientSubnet { subnet: "198.51.100.0/24".parse().unwrap(), info: None, verdict: Verdict::Unknown }],
+            egress: Some(ip("198.51.100.9")),
+            egress_info: None,
+            queries: 3,
+            sources: vec![SourceStatus { name: "dnscheck".into(), ok: true, detail: String::new() }],
+        };
+        r = r.judged(&j);
+        assert_eq!(r.resolvers[0].verdict, Verdict::Trusted);
+        assert_eq!(r.client_subnets[0].verdict, Verdict::Leak);
+        let (level, text) = dns_summary(&r);
+        assert_eq!(level, Level::Leak, "{text}");
+        assert!(text.contains("1 个"), "{text}");
+        // 只有未知解析器：维持「需要留意」
+        r.client_subnets.clear();
+        r.resolvers[0].ip = ip("192.0.2.99");
+        r = r.judged(&j);
+        assert_eq!(dns_summary(&r).0, Level::Warn);
+        // 没有基线：照样按网段关系判定
+        r.egress = None;
+        r.client_subnets.push(ClientSubnet { subnet: "198.51.100.0/24".parse().unwrap(), info: None, verdict: Verdict::Unknown });
+        assert_eq!(dns_summary(&r.judged(&j)).0, Level::Leak);
     }
 
     #[test]

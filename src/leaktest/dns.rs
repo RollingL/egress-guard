@@ -432,10 +432,14 @@ fn collect(
 ) -> Result<Option<Vec<WatchMsg>>> {
     let host = format!("ws.{zone}");
     let url = format!("wss://{host}/watch/{id}");
+    // 每一步发出新的网络请求之前都检查取消：取消之后不再解析、连接、握手或发出查询
+    let check = || if cancel() { Err(anyhow!("测试已取消")) } else { Ok(()) };
+    check()?;
     let addrs: Vec<_> = (host.as_str(), 443).to_socket_addrs().with_context(|| format!("无法解析 {host}"))?.collect();
     let mut last = anyhow!("无法解析 {host}");
     let mut stream = None;
     for a in addrs {
+        check()?;
         match TcpStream::connect_timeout(&a, Duration::from_secs(8)) {
             Ok(s) => {
                 stream = Some(s);
@@ -448,7 +452,15 @@ fn collect(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let control = stream.try_clone()?;
+    if let Err(e) = check() {
+        let _ = control.shutdown(Shutdown::Both);
+        return Err(e);
+    }
     let (mut ws, _) = tungstenite::client_tls(url.as_str(), stream).map_err(|e| anyhow!("无法连接 {host}：{e}"))?;
+    if let Err(e) = check() {
+        let _ = control.shutdown(Shutdown::Both);
+        return Err(e);
+    }
     // 握手完成后读取不再超时，由下面的 shutdown 结束
     control.set_read_timeout(None)?;
 
@@ -457,12 +469,21 @@ fn collect(
         let reader_tx = tx.clone();
         s.spawn(move || read_loop(&mut ws, reader_tx));
 
-        // 服务器在握手应答之后才登记这个 ID；稍等一下再发查询
-        std::thread::sleep(Duration::from_millis(300));
+        // 服务器在握手应答之后才登记这个 ID；稍等一下再发查询（分段等待，及时发现取消）
+        for _ in 0..6 {
+            if cancel() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 取消后查询线程不再发出新的查询：同一个标志在开始之前就已经置上
+        let stop = Arc::new(AtomicBool::new(cancel()));
+        if stop.load(Ordering::SeqCst) {
+            let _ = control.shutdown(Shutdown::Both);
+            return Err(anyhow!("测试已取消"));
+        }
         let names = query_names(zone, id);
         let lookup_tx = tx.clone();
-        // 取消后查询线程不再发出新的查询
-        let stop = Arc::new(AtomicBool::new(false));
         let stop_lookups = stop.clone();
         // getaddrinfo 没有超时，放在独立线程里，不等它结束
         std::thread::spawn(move || {
@@ -544,6 +565,22 @@ fn read_loop<S: Read + Write>(ws: &mut tungstenite::WebSocket<S>, tx: mpsc::Send
 
 #[cfg(test)]
 mod tests {
+
+    /// 已经取消的测试不再解析、连接控制服务器（不发出任何新的请求）。
+    #[test]
+    fn cancelled_collect_sends_nothing() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let cancel = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+        // 解析会失败的域名：如果真的去解析了，错误会是「无法解析」
+        let e = collect("dnscheck.invalid", "abcd1234", &|_| {}, &cancel).unwrap_err();
+        assert!(format!("{e:#}").contains("已取消"), "{e:#}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let e = run_dnscheck("dnscheck.invalid", &|_| {}, &cancel).unwrap_err();
+        assert!(format!("{e:#}").contains("已取消"));
+    }
     use super::*;
 
     #[test]

@@ -215,9 +215,30 @@ fn real_main(cli: Cli) -> Result<()> {
             Some(Command::Apply { file }) => {
                 let text = std::fs::read_to_string(file).with_context(|| format!("无法读取 {}", file.display()))?;
                 let cfg = Config::parse(&text).with_context(|| format!("{} 有误", file.display()))?;
-                client.set_config(cfg.to_raw(), t)?;
-                println!("已应用 {}", file.display());
-                return Ok(());
+                let version = client.set_config(cfg.to_raw(), t)?;
+                // 保存不等于生效：等服务按这一版配置更新规则（旧版本的服务不返回版本，无法确认）
+                if version == 0 {
+                    println!("已保存 {}（服务版本较旧，无法确认规则是否已按它更新）", file.display());
+                    return Ok(());
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                loop {
+                    let s = client.status()?;
+                    if s.config_version >= version {
+                        match &s.config_apply_error {
+                            None => println!("已保存并生效 {}", file.display()),
+                            Some(e) if s.config_version == version => {
+                                anyhow::bail!("已保存 {}，但规则没有按它更新（服务每 5 秒重试）：{e}", file.display())
+                            }
+                            Some(_) => println!("已保存 {}（之后又有更新的配置）", file.display()),
+                        }
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!("已保存 {}，但服务还没有应用它（第 {version} 版）", file.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
             Some(Command::CheckNow) => return client.command(&Request::CheckNow, t),
             Some(Command::Stop) => return client.command(&Request::Stop, t),

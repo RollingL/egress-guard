@@ -327,6 +327,30 @@ impl Firewall for FeedFirewall {
         None
     }
 
+    /// 网络扩展没有连接、开着全局断网（pf）时，受控应用只由 pf 覆盖：pf 不能按程序区分，
+    /// 全局断网放行的例外（DNS、局域网、例外地址）对受控应用同样放行。这是范围限制，不算故障。
+    fn limitation(&self) -> Option<String> {
+        if self.hub.connected().is_some() || self.rules.apps.is_empty() {
+            return None;
+        }
+        let p = self.rules.block_all.as_ref()?;
+        let mut ex = Vec::new();
+        if p.allow_dns {
+            ex.push("DNS");
+        }
+        if p.allow_lan {
+            ex.push("局域网");
+        }
+        if !p.allow_remote.is_empty() {
+            ex.push("例外地址");
+        }
+        (!ex.is_empty()).then(|| {
+            format!(
+                "网络扩展没有连接，受控应用由全局断网（pf）覆盖：全局断网放行的{}对受控应用同样放行",
+                ex.join("、")
+            )
+        })
+    }
 
     fn set_rules(&mut self, rules: Rules) -> Result<()> {
         self.rules = rules.clone();
@@ -413,6 +437,7 @@ mod tests {
             block_all: None,
             kill_existing_tcp: true,
             block_ipv6: false,
+            v6_probe: false,
         })
         .unwrap();
         assert_eq!(hub.wait_newer(0, Duration::from_millis(1)).0, 0, "做出第一次决定之前不推送");
@@ -496,6 +521,48 @@ mod tests {
         fail.set(false);
         c.retry_pending().unwrap();
         assert!(c.is_blocked() && !c.needs_retry() && c.apply_error().is_none());
+    }
+
+    /// 没有网络扩展、开着全局断网：受控应用只由 pf 覆盖，例外对它们同样放行。作为范围限制单独报告，不算降级。
+    #[test]
+    fn pf_only_reports_shared_exceptions_as_limitation() {
+        let hub: &'static FilterHub = Box::leak(Box::default());
+        let mut fw = FeedFirewall::new(Box::new(crate::controller::DryRunFirewall::default()), hub);
+        let policy = crate::blockall::BlockAllPolicy { allow_dns: true, allow_lan: true, ..Default::default() };
+        fw.set_rules(Rules { apps: vec!["/Applications/A.app".into()], block_all: Some(policy), ..Default::default() }).unwrap();
+        fw.block().unwrap();
+        assert!(fw.degraded().is_none());
+        let l = fw.limitation().unwrap();
+        assert!(l.contains("DNS、局域网"), "{l}");
+        // 严格的全局断网（没有例外）、没有受控应用、扩展已连接：都没有这个限制
+        fw.set_rules(Rules { apps: vec!["/Applications/A.app".into()], block_all: Some(Default::default()), ..Default::default() }).unwrap();
+        assert!(fw.limitation().is_none());
+        let ext = hub.register(FilterHello { version: "1".into(), protocol: 1, caps: vec!["ack".into()] });
+        fw.set_rules(Rules { apps: vec!["/Applications/A.app".into()], block_all: Some(policy_dns()), ..Default::default() }).unwrap();
+        assert!(fw.limitation().is_none());
+        drop(ext);
+        assert!(fw.limitation().is_some());
+    }
+
+    fn policy_dns() -> crate::blockall::BlockAllPolicy {
+        crate::blockall::BlockAllPolicy { allow_dns: true, ..Default::default() }
+    }
+
+    /// 先登记已发送、再写出：扩展抢在写入返回前回复的确认也能被接受。
+    #[test]
+    fn ack_right_after_send_is_accepted() {
+        let hub: &'static FilterHub = Box::leak(Box::default());
+        hub.set(FilterState { apps: vec!["/Applications/A.app".into()], ..Default::default() });
+        let reg = hub.register(FilterHello { version: "1".into(), protocol: 1, caps: vec!["ack".into()] });
+        let v = hub.version();
+        hub.applied(&reg, v);
+        assert_eq!(hub.connected_hello().unwrap().applied, 0, "没发出过的版本不能确认");
+        hub.sent(&reg, v);
+        hub.applied(&reg, v);
+        assert_eq!(hub.connected_hello().unwrap().applied, v);
+        // 心跳重复确认同一版：幂等
+        hub.applied(&reg, v);
+        assert_eq!(hub.connected_hello().unwrap().applied, v);
     }
 
     #[test]
