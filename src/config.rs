@@ -265,13 +265,21 @@ impl Config {
         if !crate::leaktest::valid_zone(&leak_test.dnscheck_zone) {
             bail!("DNS 泄露测试服务的域名有误: {:?}", leak_test.dnscheck_zone);
         }
-        leak_test.dns_sources.retain(|s| !s.trim().is_empty());
-        for s in &mut leak_test.dns_sources {
-            *s = s.trim().to_ascii_lowercase();
-            if !crate::leaktest::dns::all_source_names().contains(s) {
-                bail!("未知的 DNS 检测源: {s:?}（可用：{}）", crate::leaktest::dns::all_source_names().join("、"));
+        // 未知的检测源只忽略、不报错：检测源以后可能增删，不能因为这一项让整个配置（以及断网保护）失效
+        let known = crate::leaktest::dns::all_source_names();
+        let mut sources: Vec<String> = Vec::new();
+        for s in &leak_test.dns_sources {
+            let s = s.trim().to_ascii_lowercase();
+            if s.is_empty() || sources.contains(&s) {
+                continue;
+            }
+            if known.contains(&s) {
+                sources.push(s);
+            } else {
+                log::warn!("忽略未知的 DNS 检测源: {s:?}（可用：{}）", known.join("、"));
             }
         }
+        leak_test.dns_sources = sources;
         leak_test.stun_servers = leak_test.stun_servers.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
         for s in &leak_test.stun_servers {
             crate::leaktest::stun::split_host_port(s).with_context(|| format!("STUN 服务器有误: {s:?}"))?;
@@ -451,8 +459,8 @@ apps = ['C:\Program Files\App\app.exe']
         assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ntrusted_dns=[\"ASx\"]")).is_err());
         assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\nstun_servers=[\"stun.example.org\"]")).is_err());
         assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndnscheck_zone=\"a b\"")).is_err());
-        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"Fastly\", \"dnscheck\"]")).is_ok());
-        assert!(Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"nope\"]")).is_err());
+        let cfg = Config::parse(&format!("{SAMPLE}\n[leak_test]\ndns_sources=[\"Fastly\", \"dnscheck\", \"fastly\", \"nope\"]")).unwrap();
+        assert_eq!(cfg.leak_test.dns_sources, vec!["fastly", "dnscheck"]);
     }
 
     #[test]

@@ -224,13 +224,21 @@ fn real_main(cli: Cli) -> Result<()> {
         _ => resolve_config_path(cli.config.clone())?,
     };
     #[cfg(not(target_os = "macos"))]
-    let config_path = resolve_config_path(cli.config)?;
+    let config_path = resolve_config_path(cli.config.clone())?;
     if let Some(Command::LeakTest { dns, webrtc, json, fail_on_leak }) = cli.command {
         // 没有配置文件时按默认设置测试（白名单为空）
-        let cfg = if config_path.exists() {
+        let cfg = if cli.config.is_some() {
             Config::load(&config_path)?
         } else {
-            Config::from_raw(Default::default())?
+            // 没有用 -c 指定时，默认配置读不了（不存在、macOS 上没有权限读后台服务的配置等）也照样测试
+            match config_path.exists().then(|| Config::load(&config_path)) {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    eprintln!("警告：无法读取配置文件 {}，按默认设置测试（白名单为空）：{e:#}", config_path.display());
+                    Config::from_raw(Default::default())?
+                }
+                None => Config::from_raw(Default::default())?,
+            }
         };
         return leak_test(&cfg, !webrtc, !dns, json, fail_on_leak);
     }

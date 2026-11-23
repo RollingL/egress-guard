@@ -158,8 +158,10 @@ fn probe(iface: Option<String>, local: IpAddr, servers: &[(String, Vec<SocketAdd
         }
     };
     let mut last = None;
+    let mut tried = 0;
     for (name, addrs) in servers {
         for a in addrs.iter().filter(|a| a.is_ipv4() == local.is_ipv4()) {
+            tried += 1;
             match stun::query(&sock, *a, PER_SERVER) {
                 Ok(m) => {
                     path.mapped = Some(m);
@@ -171,9 +173,11 @@ fn probe(iface: Option<String>, local: IpAddr, servers: &[(String, Vec<SocketAdd
             }
         }
     }
-    path.error = Some(last.unwrap_or_else(|| {
-        if local.is_ipv4() { "没有可用的 IPv4 STUN 服务器" } else { "没有可用的 IPv6 STUN 服务器" }.to_owned()
-    }));
+    path.error = Some(match last {
+        Some(e) if tried > 1 => format!("{tried} 个 STUN 服务器都没有结果（最后一个：{e}）"),
+        Some(e) => e,
+        None => if local.is_ipv4() { "没有可用的 IPv4 STUN 服务器" } else { "没有可用的 IPv6 STUN 服务器" }.to_owned(),
+    });
     path
 }
 

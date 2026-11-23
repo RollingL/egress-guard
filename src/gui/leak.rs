@@ -169,7 +169,12 @@ impl App {
                         }
                         ctx.request_repaint();
                     };
-                    let r = dns::run(&lt.dnscheck_zone, &lt.dns_sources, egress, &judge, &progress);
+                    let zone = lt.dnscheck_zone.trim().trim_matches('.').to_ascii_lowercase();
+                    let r = if leaktest::valid_zone(&zone) {
+                        dns::run(&zone, &lt.dns_sources, egress, &judge, &progress)
+                    } else {
+                        Err(anyhow::anyhow!("DNS 测试服务的域名有误：{:?}", lt.dnscheck_zone))
+                    };
                     match &r {
                         Ok(r) => log::info!("DNS 泄露测试：{}", leaktest::dns_summary(r).1),
                         Err(e) => log::warn!("DNS 泄露测试失败：{e:#}"),

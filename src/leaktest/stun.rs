@@ -134,11 +134,15 @@ pub fn query(sock: &UdpSocket, server: SocketAddr, timeout: Duration) -> Result<
     let deadline = start + timeout;
     let resend_at = start + timeout / 2;
     let mut resent = false;
+    let mut refused = false;
     sock.send_to(&req, server).map_err(|e| anyhow!("发送失败：{e}"))?;
     let mut buf = [0u8; 1024];
     loop {
         let now = Instant::now();
         if now >= deadline {
+            if refused {
+                bail!("{server} 拒绝连接");
+            }
             bail!("{server} 无响应");
         }
         let wait = if resent { deadline - now } else { resend_at.saturating_duration_since(now).max(Duration::from_millis(1)) };
@@ -156,8 +160,9 @@ pub fn query(sock: &UdpSocket, server: SocketAddr, timeout: Duration) -> Result<
                     let _ = sock.send_to(&req, server);
                 }
             }
-            // Windows：之前发出的包收到 ICMP 端口不可达时，下一次接收会报 ConnectionReset
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => bail!("{server} 拒绝连接"),
+            // Windows：之前发出的包收到 ICMP 端口不可达时，下一次接收会报 ConnectionReset。
+            // 同一个套接字先前问过别的服务器，这个错误可能是那边迟到的，所以不立即放弃，继续等到超时。
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => refused = true,
             Err(e) => bail!("接收失败：{e}"),
         }
     }

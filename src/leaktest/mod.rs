@@ -32,8 +32,8 @@ pub enum Trusted {
 impl Trusted {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
-        if let Some(n) = s.strip_prefix("AS").or_else(|| s.strip_prefix("as")).or_else(|| s.strip_prefix("As")) {
-            return match n.parse::<u32>() {
+        if s.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("as")) {
+            return match s[2..].parse::<u32>() {
                 Ok(n) => Ok(Trusted::Asn(n)),
                 Err(_) => bail!("无法解析为 IP、CIDR 或自治系统号（如 AS13335）: {s:?}"),
             };
@@ -301,6 +301,9 @@ impl IpInfo {
     }
 }
 
+/// 同时进行的归属查询数上限（解析器可能有几十个，不要一下子开几十个连接）。
+const LOOKUP_PARALLEL: usize = 8;
+
 /// 查询多个 IP 的归属（并行，失败的为 None）。
 pub fn lookup_info(ips: &[IpAddr]) -> Vec<Option<IpInfo>> {
     use ureq::tls::{TlsConfig, TlsProvider};
@@ -310,28 +313,51 @@ pub fn lookup_info(ips: &[IpAddr]) -> Vec<Option<IpInfo>> {
         .user_agent(concat!("egress-guard/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
-    std::thread::scope(|s| {
-        let jobs: Vec<_> = ips
-            .iter()
-            .map(|ip| {
-                let agent = agent.clone();
-                s.spawn(move || -> Option<IpInfo> {
-                    let body = agent
-                        .get(&format!("https://ip.addr.tools/{ip}"))
-                        .header("Accept", "application/json")
-                        .call()
-                        .ok()?
-                        .body_mut()
-                        .with_config()
-                        .limit(16 * 1024)
-                        .read_to_string()
-                        .ok()?;
-                    serde_json::from_str(&body).ok()
+    // 同一个 IP 只查一次（例如 ECS 网段与出口相同时）
+    let mut uniq: Vec<IpAddr> = ips.to_vec();
+    uniq.sort();
+    uniq.dedup();
+    let found = parallel_map(&uniq, LOOKUP_PARALLEL, |ip| -> Option<IpInfo> {
+        let body = agent
+            .get(&format!("https://ip.addr.tools/{ip}"))
+            .header("Accept", "application/json")
+            .call()
+            .ok()?
+            .body_mut()
+            .with_config()
+            .limit(16 * 1024)
+            .read_to_string()
+            .ok()?;
+        serde_json::from_str(&body).ok()
+    });
+    ips.iter().map(|ip| uniq.binary_search(ip).ok().and_then(|i| found[i].clone().flatten())).collect()
+}
+
+/// 用最多 `workers` 个线程对每一项执行 `f`，结果按原顺序返回（线程异常退出时对应项为 None）。
+fn parallel_map<T: Sync, R: Send>(items: &[T], workers: usize, f: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let done: Vec<(usize, R)> = std::thread::scope(|s| {
+        let jobs: Vec<_> = (0..workers.min(items.len()))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        done.push((i, f(item)));
+                    }
+                    done
                 })
             })
             .collect();
-        jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
-    })
+        jobs.into_iter().flat_map(|j| j.join().unwrap_or_default()).collect()
+    });
+    let mut out: Vec<Option<R>> = items.iter().map(|_| None).collect();
+    for (i, r) in done {
+        out[i] = Some(r);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -346,6 +372,7 @@ mod tests {
     fn trusted_entries() {
         assert_eq!(Trusted::parse("AS13335").unwrap(), Trusted::Asn(13335));
         assert_eq!(Trusted::parse(" as15169 ").unwrap().to_string(), "AS15169");
+        assert_eq!(Trusted::parse("aS64500").unwrap(), Trusted::Asn(64500));
         assert_eq!(Trusted::parse("1.1.1.1").unwrap().to_string(), "1.1.1.1");
         assert_eq!(Trusted::parse("172.70.9.9/16").unwrap().to_string(), "172.70.0.0/16");
         assert!(Trusted::parse("AS").is_err());
@@ -428,6 +455,14 @@ mod tests {
         let (l, t) = webrtc_summary(&r);
         assert_eq!(l, Level::Leak);
         assert!(t.contains("198.51.100.9"), "{t}");
+    }
+
+    #[test]
+    fn parallel_map_keeps_order() {
+        let items: Vec<u32> = (0..37).collect();
+        let out = parallel_map(&items, 8, |x| x * 2);
+        assert_eq!(out, items.iter().map(|x| Some(x * 2)).collect::<Vec<_>>());
+        assert!(parallel_map(&Vec::<u32>::new(), 8, |x| *x).is_empty());
     }
 
     #[test]
