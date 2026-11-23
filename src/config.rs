@@ -133,7 +133,11 @@ pub struct LeakTestConfig {
     pub dns_sources: Vec<String>,
     /// WebRTC 泄露测试用的 STUN 服务器（主机:端口），按顺序尝试。
     pub stun_servers: Vec<String>,
-    /// 网络变化后、出口刚回到白名单时自动测试一次（界面运行时）。
+    /// 允许界面在后台自动测试（总开关，默认关闭）。自动测试会绕过系统代理直连上面的 DNS 检测源，
+    /// 用系统 DNS 解析它们的随机子域名，并从默认路由和每个网卡地址向 STUN 服务器发 UDP：
+    /// 只靠代理上网的用户会因此向这些第三方暴露直连的公网地址。0.9.0 的配置升级后也是关闭的。
+    pub auto: bool,
+    /// 网络变化后、出口刚回到白名单时自动测试一次（界面运行、`auto` 开启时）。
     pub auto_after_change: bool,
     /// 放行期间每隔多少分钟自动测试一次，0 表示不定时测试。
     pub interval_mins: u64,
@@ -153,6 +157,7 @@ impl Default for LeakTestConfig {
                 "stun.l.google.com:19302".into(),
                 "stun.miwifi.com:3478".into(),
             ],
+            auto: false,
             auto_after_change: true,
             interval_mins: 60,
             notify: true,
@@ -462,20 +467,16 @@ impl Config {
     }
 
     /// 写入 TOML 文件（注释不会保留）。
+    ///
+    /// 先在同一目录写临时文件再替换：写到一半中断时原配置保持完整。带 GitHub 令牌时临时文件一创建就只有
+    /// 所有者能读写（Unix 0600；Windows 只给 SYSTEM、管理员组和所有者），令牌不会经过可读的窗口。
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = format!(
             "# egress-guard 配置（由程序保存，说明见 config.example.toml）\n\n{}",
             toml::to_string_pretty(&self.to_raw())?
         );
-        std::fs::write(path, text).with_context(|| format!("无法写入 {}", path.display()))?;
-        // 带 GitHub 令牌时只让文件所有者读写（macOS 上配置由 root 保存，其他账户不应读到令牌）
-        #[cfg(unix)]
-        if !self.update.token.is_empty() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("无法设置 {} 的权限", path.display()))?;
-        }
-        Ok(())
+        let private = !self.update.token.is_empty();
+        write_atomic(path, text.as_bytes(), Some(private).filter(|p| *p))
     }
 
     /// 出口 IP 是否命中白名单。
@@ -483,6 +484,94 @@ impl Config {
         let ip = normalize(ip);
         self.whitelist.iter().any(|net| net.contains(&ip))
     }
+}
+
+/// 原子地写入文件：在同一目录用 `create_new` 创建临时文件，写完并同步到磁盘后替换原文件。
+/// 任何一步失败时删除临时文件，原文件保持不变。
+///
+/// `private = Some(true)`：只让所有者读写（Unix 上临时文件创建时就是 0600；Windows 上设置受保护的 ACL）。
+/// 否则 Unix 上沿用原文件的权限（没有原文件时为 0644）。
+pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<()> {
+    use std::io::Write;
+    let private = private.unwrap_or(false);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let mut tmp = None;
+    for i in 0..100u32 {
+        let candidate = dir.join(format!(".{name}.tmp-{}-{i}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let mode = if private {
+                0o600
+            } else {
+                std::fs::metadata(path).map(|m| m.mode() & 0o777).unwrap_or(0o644)
+            };
+            opts.mode(mode);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => {
+                tmp = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("无法写入 {}", path.display()))),
+        }
+    }
+    let Some((tmp_path, mut f)) = tmp else { bail!("无法在 {} 创建临时文件", dir.display()) };
+    let result = (|| -> Result<()> {
+        #[cfg(unix)]
+        if private {
+            // umask 只会去掉权限，不会加；再确认一次
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        if private {
+            restrict_acl(&tmp_path)?;
+        }
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.context(format!("无法写入 {}", path.display())));
+    }
+    Ok(())
+}
+
+/// Windows：只让 SYSTEM、管理员组和文件所有者访问（不继承目录的权限）。
+#[cfg(windows)]
+fn restrict_acl(path: &Path) -> Result<()> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    let sddl = HSTRING::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)");
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut sd, None)
+            .context("无法生成文件权限")?;
+        let file = HSTRING::from(path.as_os_str());
+        let ok = SetFileSecurityW(
+            PCWSTR(file.as_ptr()),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            sd,
+        );
+        let err = std::io::Error::last_os_error();
+        LocalFree(Some(HLOCAL(sd.0)));
+        if !ok.as_bool() {
+            bail!("无法设置 {} 的权限: {err}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// 解析单个 IP 或 CIDR。
@@ -631,6 +720,10 @@ apps = ['C:\Program Files\App\app.exe']
         assert!(!cfg.ipv6.services.is_empty());
         assert!(cfg.update.check && cfg.update.repo == "RollingL/egress-guard");
         assert!(cfg.leak_test.auto_after_change && cfg.leak_test.notify);
+        // 后台直连探测默认关闭，0.9.0 保存的配置（有 auto_after_change、interval_mins，没有 auto）升级后也关闭
+        assert!(!cfg.leak_test.auto);
+        let old = Config::parse(&format!("{SAMPLE}\n[leak_test]\nauto_after_change=true\ninterval_mins=60")).unwrap();
+        assert!(!old.leak_test.auto);
         let cfg = Config::parse(&format!(
             "{SAMPLE}\n[vpn]\ninterfaces=[\" utun4 \", \"\"]\n[ipv6]\nmode=\"block\"\nservices=[]\n[update]\nrepo=\" a/b/ \""
         ))
@@ -643,6 +736,45 @@ apps = ['C:\Program Files\App\app.exe']
         assert!(Config::parse(&format!("{SAMPLE}\n[update]\nrepo=\"nope\"")).is_err());
         // 关闭检查更新时仓库可以留空
         assert!(Config::parse(&format!("{SAMPLE}\n[update]\ncheck=false\nrepo=\"\"")).is_ok());
+    }
+
+    #[test]
+    fn save_is_atomic_and_private() {
+        let dir = std::env::temp_dir().join(format!("eg-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cfg = Config::parse(SAMPLE).unwrap();
+        cfg.save(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 已有一份大家都能读的配置，第一次加入令牌
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            cfg.update.token = "ghp_secret".into();
+            cfg.save(&path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(std::fs::read_to_string(&path).unwrap().contains("ghp_secret"));
+            // 没有令牌时沿用原来的权限
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            cfg.update.token.clear();
+            cfg.save(&path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        }
+        // 替换失败（目标是目录）时原文件不变，也不留临时文件
+        let before = std::fs::read_to_string(&path).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+        assert!(cfg.save(&blocker).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

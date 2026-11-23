@@ -107,31 +107,46 @@ impl EventLog {
             self.rewrite();
             return;
         }
-        let r = OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| writeln!(f, "{line}"));
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // 记录里有出口 IP 和时间：只让写入它的账户读（macOS 上是 root 后台服务，界面通过本地套接字读取）
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let r = opts.open(path).and_then(|mut f| writeln!(f, "{line}"));
         match r {
             Ok(()) => self.file_lines += 1,
             Err(e) => log::warn!("无法写入连接记录 {}: {e}", path.display()),
         }
     }
 
-    /// 只保留内存里的最近记录，重写文件。
+    /// 只保留内存里的最近记录，重写文件。先写临时文件再替换，写到一半中断时原文件保持完整。
     fn rewrite(&mut self) {
-        let Some(path) = &self.path else { return };
+        if let Err(e) = self.try_rewrite() {
+            log::warn!("{e:#}");
+        }
+    }
+
+    fn try_rewrite(&mut self) -> anyhow::Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
         let text: String =
             self.items.iter().filter_map(|e| serde_json::to_string(e).ok()).map(|l| l + "\n").collect();
-        match std::fs::write(path, text) {
-            Ok(()) => self.file_lines = self.items.len(),
-            Err(e) => log::warn!("无法写入连接记录 {}: {e}", path.display()),
-        }
+        crate::config::write_atomic(path, text.as_bytes(), Some(true))?;
+        self.file_lines = self.items.len();
+        Ok(())
     }
 
     pub fn recent(&self) -> Vec<ConnEvent> {
         self.items.iter().cloned().collect()
     }
 
-    pub fn clear(&mut self) {
-        self.items.clear();
-        self.rewrite();
+    /// 清空记录。文件没能清空时返回错误，内存里的记录保持不变（界面不会显示「已清空」而文件里还在）。
+    pub fn clear(&mut self) -> anyhow::Result<()> {
+        let items = std::mem::take(&mut self.items);
+        if let Err(e) = self.try_rewrite() {
+            self.items = items;
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -151,15 +166,23 @@ pub fn init(path: &Path) {
 }
 
 pub fn record(e: ConnEvent) {
+    #[cfg(test)]
+    TEST_RECORDED.with(|r| r.borrow_mut().push(e.clone()));
     global().lock().unwrap().record(e);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 测试用：本线程写入的记录（全局记录本被并行的测试共用）。
+    pub static TEST_RECORDED: std::cell::RefCell<Vec<ConnEvent>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub fn recent() -> Vec<ConnEvent> {
     global().lock().unwrap().recent()
 }
 
-pub fn clear() {
-    global().lock().unwrap().clear();
+pub fn clear() -> anyhow::Result<()> {
+    global().lock().unwrap().clear()
 }
 
 #[cfg(test)]
@@ -196,9 +219,16 @@ mod tests {
         // 重新打开后最新的那条还在
         assert_eq!(EventLog::open(&path).recent().last(), l.recent().last());
 
-        l.clear();
+        l.clear().unwrap();
         assert!(EventLog::open(&path).recent().is_empty());
         let _ = std::fs::remove_file(&path);
+
+        // 文件写不进去：清空失败，内存里的记录还在
+        let dir = std::env::temp_dir().join(format!("eg-events-missing-{}", std::process::id()));
+        let mut l = EventLog::open(&dir.join("sub").join("log.jsonl"));
+        l.items.push_back(ConnEvent::now(Kind::Block, "x"));
+        assert!(l.clear().is_err());
+        assert_eq!(l.recent().len(), 1);
     }
 
     #[test]

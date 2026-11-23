@@ -61,6 +61,15 @@ pub trait Firewall {
     fn extension(&self) -> Option<String> {
         None
     }
+    /// 后端还没有提交过任何阻断/放行状态（例如 macOS 网络扩展还没收到第一份规则）。
+    /// 这时即使目标状态与 `is_blocked()` 相同，也要调用一次 block/unblock 把规则发下去。
+    fn needs_initial_commit(&self) -> bool {
+        false
+    }
+    /// 拦截后端的其他问题（例如网络扩展不支持当前规则用到的功能），界面上提示。
+    fn degraded(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 出口是否通过白名单：主出口在白名单内，并且（检测 IPv6 出口时）IPv6 出口也在白名单内。
@@ -112,6 +121,12 @@ pub struct Controller {
     apps_dirty: bool,
     /// 最近一次检测到的出口已经过时（VPN 断开、网络变化之后），在下一次检测前不能据此放行。
     stale: bool,
+    /// 没能提交的切换（目标是否阻断、原因）：定时重试切换本身，直到成功或被新的决定取代。
+    pending_switch: Option<(bool, String)>,
+    /// 上一次切换失败的原因（界面显示「阻断未生效」）。
+    apply_error: Option<String>,
+    /// 最近一次成功检测时的 IPv6 处理方式。换了方式之后，旧结果没有覆盖新方式要求验证的地址族。
+    measured_mode: Option<Ipv6Mode>,
 }
 
 impl Controller {
@@ -127,6 +142,9 @@ impl Controller {
             reason: None,
             apps_dirty: false,
             stale: false,
+            pending_switch: None,
+            apply_error: None,
+            measured_mode: None,
         }
     }
 
@@ -172,14 +190,33 @@ impl Controller {
         self.failures
     }
 
+    /// 上一次切换没能生效的原因（正在重试）。
+    pub fn apply_error(&self) -> Option<&str> {
+        self.apply_error.as_deref()
+    }
+
+    /// 目标是阻断：已经阻断，或者正在重试一次没能生效的阻断。
+    pub fn wants_block(&self) -> bool {
+        self.pending_switch.as_ref().map_or_else(|| self.fw.is_blocked(), |p| p.0)
+    }
+
+    /// 拦截后端的其他问题。
+    pub fn degraded(&self) -> Option<String> {
+        self.fw.degraded()
+    }
+
     /// 阻断范围的描述，用于日志。
     fn scope(&self) -> &'static str {
         if self.cfg.block_all.enabled { "全部网络" } else { "受控应用" }
     }
 
     /// 切换为阻断或放行，并写入连接记录。已经处于目标状态时什么也不做。
+    ///
+    /// 后端失败时记下目标状态，`retry_pending` 定时重试切换本身；新的决定会取代还没生效的旧决定。
+    /// 连接记录只在切换真正生效时写一次。
     fn switch(&mut self, block: bool, reason: String) -> Result<()> {
-        if block == self.fw.is_blocked() {
+        let was = self.fw.is_blocked();
+        if block == was && self.pending_switch.is_none() && !self.fw.needs_initial_commit() {
             // 已经在阻断：更新为最新的原因（例如启动时先阻断，之后检测到出口不在白名单）
             if block && self.reason.as_deref() != Some(&reason) {
                 log::info!("保持阻断：{reason}");
@@ -187,18 +224,33 @@ impl Controller {
             }
             return Ok(());
         }
-        if block {
-            log::warn!("切换为【阻断】{}：{reason}", self.scope());
-            self.fw.block()?;
-        } else {
-            log::info!("切换为【放行】{}：{reason}", self.scope());
-            self.fw.unblock()?;
+        // 有还没生效的切换、或者后端还没提交过规则时，即使看起来已经是目标状态也再提交一次：
+        // 上一次失败可能留下了一半（例如网络扩展已经收到阻断，pf 没装上）
+        if block != was {
+            if block {
+                log::warn!("切换为【阻断】{}：{reason}", self.scope());
+            } else {
+                log::info!("切换为【放行】{}：{reason}", self.scope());
+            }
         }
-        let mut e = ConnEvent::now(if block { Kind::Block } else { Kind::Restore }, reason.clone());
-        e.egress = self.last_ip;
-        e.egress_v6 = self.last_v6;
-        e.scope = self.scope().to_owned();
-        eventlog::record(e);
+        let r = if block { self.fw.block() } else { self.fw.unblock() };
+        if let Err(e) = r {
+            let what = if block { "阻断" } else { "放行" };
+            self.apply_error = Some(format!("{what}未生效（{reason}）：{e:#}"));
+            self.pending_switch = Some((block, reason));
+            return Err(e.context(format!("{what}未生效，5 秒后重试")));
+        }
+        if self.apply_error.take().is_some() {
+            log::info!("{}已生效", if block { "阻断" } else { "放行" });
+        }
+        self.pending_switch = None;
+        if block != was {
+            let mut e = ConnEvent::now(if block { Kind::Block } else { Kind::Restore }, reason.clone());
+            e.egress = self.last_ip;
+            e.egress_v6 = self.last_v6;
+            e.scope = self.scope().to_owned();
+            eventlog::record(e);
+        }
         self.reason = Some(reason);
         Ok(())
     }
@@ -257,17 +309,20 @@ impl Controller {
         self.push_apps()
     }
 
-    /// 是否有未完成的规则同步需要重试。
+    /// 是否有没能生效的切换、或未完成的规则同步需要重试。
     pub fn needs_retry(&self) -> bool {
-        self.apps_dirty || self.fw.has_pending()
+        self.pending_switch.is_some() || self.apps_dirty || self.fw.has_pending()
     }
 
-    /// 重试之前失败或未完成的规则同步。
+    /// 重试之前失败的切换，以及失败或未完成的规则同步。
     pub fn retry_pending(&mut self) -> Result<()> {
-        if !self.needs_retry() {
-            return Ok(());
+        if let Some((block, reason)) = self.pending_switch.clone() {
+            self.switch(block, reason)?;
         }
-        self.push_apps()
+        if self.apps_dirty || self.fw.has_pending() {
+            self.push_apps()?;
+        }
+        Ok(())
     }
 
     /// 应用新配置。受控应用变化会立即反映到防火墙规则上。
@@ -282,10 +337,12 @@ impl Controller {
             self.last_v6 = None;
         }
         // 白名单可能已变化：用最近一次的出口 IP 立即重新决策。
-        // 出口已经过时（VPN 断开、网络变化后还没重新检测）时只能收紧，不能据此放行
+        // 出口已经过时（VPN 断开、网络变化后还没重新检测），或者是按另一种 IPv6 处理方式测的
+        // （例如从「不单独处理」改为「检测 IPv6 出口」，IPv6 还没验证过）时只能收紧，不能据此放行
+        let stale = self.stale || self.measured_mode != Some(self.cfg.ipv6.mode);
         if let Some(e) = self.last_egress() {
             if egress_allowed(&self.cfg, &e) {
-                if self.stale {
+                if stale {
                     return sync;
                 }
                 self.switch(false, format!("新白名单包含当前出口 IP {}", e.ip))?;
@@ -312,6 +369,7 @@ impl Controller {
             Ok(e) => {
                 self.failures = 0;
                 self.last_error = None;
+                self.measured_mode = Some(self.cfg.ipv6.mode);
                 let v6 = if self.cfg.ipv6.mode == Ipv6Mode::Check { e.extra_v6() } else { None };
                 if self.last_ip != Some(e.ip) {
                     log::info!(
@@ -573,6 +631,108 @@ mod tests {
 
         c.reconfigure(cfg("")).unwrap();
         assert!(applied.borrow().block_all.is_none());
+    }
+
+    /// block/unblock 前 N 次失败的测试后端。
+    struct SwitchFlaky {
+        fail_left: std::rc::Rc<std::cell::Cell<u32>>,
+        blocked: bool,
+    }
+
+    impl Firewall for SwitchFlaky {
+        fn block(&mut self) -> Result<()> {
+            if self.fail_left.get() > 0 {
+                self.fail_left.set(self.fail_left.get() - 1);
+                return Err(anyhow!("FwpmTransactionCommit0 失败"));
+            }
+            self.blocked = true;
+            Ok(())
+        }
+        fn unblock(&mut self) -> Result<()> {
+            if self.fail_left.get() > 0 {
+                self.fail_left.set(self.fail_left.get() - 1);
+                return Err(anyhow!("FwpmTransactionCommit0 失败"));
+            }
+            self.blocked = false;
+            Ok(())
+        }
+        fn is_blocked(&self) -> bool {
+            self.blocked
+        }
+        fn set_rules(&mut self, _: Rules) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn recorded() -> Vec<ConnEvent> {
+        crate::eventlog::TEST_RECORDED.with(|r| r.borrow_mut().drain(..).collect())
+    }
+
+    #[test]
+    fn failed_first_block_is_retried_without_new_events() {
+        recorded();
+        let fail = std::rc::Rc::new(std::cell::Cell::new(2));
+        let mut c = Controller::new(cfg(""), Box::new(SwitchFlaky { fail_left: fail.clone(), blocked: false }));
+        // VPN 断开：第一次阻断失败
+        assert!(c.block_for("VPN 断开（utun4）").is_err());
+        assert!(!c.is_blocked() && c.wants_block() && c.needs_retry());
+        assert!(c.apply_error().unwrap().starts_with("阻断未生效（VPN 断开（utun4））"));
+        // 没有新的网络事件或检测结果：只靠定时重试
+        assert!(c.retry_pending().is_err());
+        assert!(c.needs_retry());
+        c.retry_pending().unwrap();
+        assert!(c.is_blocked() && !c.needs_retry() && c.apply_error().is_none());
+        assert_eq!(c.block_reason(), Some("VPN 断开（utun4）"), "成功前保留断线原因");
+        let ev = recorded();
+        assert_eq!(ev.len(), 1, "只记一次成功的阻断");
+        assert_eq!(ev[0].kind, Kind::Block);
+        c.retry_pending().unwrap();
+        assert!(recorded().is_empty());
+    }
+
+    #[test]
+    fn failed_first_unblock_is_retried_and_can_be_superseded() {
+        recorded();
+        let fail = std::rc::Rc::new(std::cell::Cell::new(1));
+        let mut c = Controller::new(cfg(""), Box::new(SwitchFlaky { fail_left: fail.clone(), blocked: true }));
+        assert!(c.on_detection(Ok(eg("203.0.113.9", None))).is_err());
+        assert!(c.is_blocked() && !c.wants_block() && c.needs_retry());
+        assert!(c.apply_error().unwrap().starts_with("放行未生效"));
+        c.retry_pending().unwrap();
+        assert!(!c.is_blocked() && !c.needs_retry());
+        assert_eq!(recorded().len(), 1);
+
+        // 阻断失败后，新的检测结果（回到白名单）取代还没生效的阻断：不再重试，也不记录
+        fail.set(1);
+        assert!(c.on_detection(Ok(eg("198.51.100.1", None))).is_err());
+        assert!(c.wants_block());
+        c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+        assert!(!c.is_blocked() && !c.wants_block() && !c.needs_retry() && c.apply_error().is_none());
+        assert!(recorded().is_empty());
+    }
+
+    #[test]
+    fn switching_to_ipv6_check_waits_for_new_detection() {
+        // 「不单独处理 IPv6」时测到的结果不能在改为「检测 IPv6 出口」后直接用来放行
+        let mut c = Controller::new(cfg("[ipv6]\nmode=\"off\""), Box::new(DryRunFirewall { blocked: true }));
+        c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+        assert!(!c.is_blocked());
+        c.block_for("网络发生变化").unwrap();
+        c.on_detection(Ok(eg("203.0.113.9", None))).unwrap();
+        c.on_network_change().unwrap();
+        c.on_detection(Ok(eg("198.51.100.1", None))).unwrap();
+        assert!(c.is_blocked());
+        // off 下测到 198.51.100.1（阻断）；改白名单让它命中、同时改成 check：不能放行
+        let mut raw = cfg("").to_raw();
+        raw.whitelist.push("198.51.100.0/24".into());
+        c.reconfigure(Config::from_raw(raw.clone()).unwrap()).unwrap();
+        assert!(c.is_blocked(), "IPv6 处理方式变了，要等新的检测");
+        c.on_detection(Ok(eg("198.51.100.1", None))).unwrap();
+        assert!(!c.is_blocked());
+        // 方式不变时照常用最近的结果
+        raw.whitelist.retain(|w| w != "198.51.100.0/24");
+        c.reconfigure(Config::from_raw(raw).unwrap()).unwrap();
+        assert!(c.is_blocked());
     }
 
     #[test]

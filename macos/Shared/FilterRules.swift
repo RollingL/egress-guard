@@ -3,6 +3,7 @@
 // 后台服务推送的 JSON：
 //   {"kind":"filter","data":{"blocked":true,"inspect_existing":true,"apps":["/Applications/Foo.app", "/usr/local/bin/x"],"block_ipv6":false}}
 // block_ipv6：放行期间也丢弃受控应用的 IPv6 连接（「始终阻断 IPv6」）。
+// rev：规则版本号。扩展应用后回复 {"cmd":"filter_applied","arg":rev}，后台服务据此确认扩展用的是最新规则。
 // apps 里的条目可以是可执行文件的完整路径，也可以是 .app 应用包（包里的所有程序都算）。
 // 路径比较不区分大小写（与 Rust 一侧的 discovery::normalize 一致；APFS 默认也不区分大小写）。
 
@@ -59,6 +60,16 @@ struct FilterRules: Equatable {
             apps: data["apps"] as? [String] ?? [],
             blockIPv6: data["block_ipv6"] as? Bool ?? false
         )
+    }
+
+    /// 规则的版本号（data.rev，0.9.1 起）；没有时为 nil。扩展应用规则后回复 filter_applied。
+    static func parseRev(line: Data) -> UInt64? {
+        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              obj["kind"] as? String == "filter",
+              let data = obj["data"] as? [String: Any],
+              let rev = data["rev"] as? NSNumber
+        else { return nil }
+        return rev.uint64Value
     }
 
     /// 后台服务回复的错误文字（{"kind":"err","data":"..."}）。

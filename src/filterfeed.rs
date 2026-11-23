@@ -27,7 +27,21 @@ pub struct FilterState {
     pub apps: Vec<String>,
     /// 放行期间也阻断受控应用的 IPv6 连接（「始终阻断 IPv6」）。
     pub block_ipv6: bool,
+    /// 规则的版本号（发送时填入）。支持 [`CAP_ACK`] 的扩展应用规则后回复 `filter_applied`。
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rev: u64,
 }
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// 网络扩展支持「始终阻断 IPv6」（0.9.0 起）。
+pub const CAP_BLOCK_IPV6: &str = "block_ipv6";
+/// 网络扩展应用规则后会回复已应用的规则版本。
+pub const CAP_ACK: &str = "ack";
+/// 规则更新后等扩展确认的宽限时间，超过仍未确认时在界面上提示。
+pub const ACK_GRACE: Duration = Duration::from_secs(3);
 
 /// 网络扩展连接时报告的信息。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -35,6 +49,35 @@ pub struct FilterState {
 pub struct FilterHello {
     /// 网络扩展的版本。
     pub version: String,
+    /// 协议版本：0.9.0 及以前的扩展不发（0），之后为 1。
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub protocol: u32,
+    /// 支持的功能（见 `CAP_*`）。旧扩展不发，按版本号推断。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// 已连接的网络扩展。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExtInfo {
+    pub version: String,
+    pub caps: Vec<String>,
+    /// 扩展确认已应用的规则版本（不支持确认时为 0）。
+    pub applied: u64,
+}
+
+impl ExtInfo {
+    pub fn supports(&self, cap: &str) -> bool {
+        if self.caps.iter().any(|c| c == cap) {
+            return true;
+        }
+        // 没有能力列表的旧扩展：0.9.0 支持 block_ipv6，但不会确认
+        cap == CAP_BLOCK_IPV6 && self.caps.is_empty() && crate::update::is_newer(&self.version, "0.8.99")
+    }
 }
 
 /// 后台服务运行期间存在的标记文件（套接字旁的 `.running`）。
@@ -52,11 +95,24 @@ type Notify = Box<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 pub struct FilterHub {
     state: Mutex<(u64, FilterState)>,
+    /// 当前规则版本是什么时候设置的。
+    since: Mutex<Option<std::time::Instant>>,
     cv: Condvar,
-    clients: Mutex<HashMap<u64, FilterHello>>,
+    clients: Mutex<HashMap<u64, ExtInfo>>,
     next_id: AtomicU64,
     /// 网络扩展连上或断开时调用（让引擎刷新状态）。
     notify: Mutex<Option<Notify>>,
+}
+
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use crate::update::is_newer;
+    if is_newer(a, b) {
+        std::cmp::Ordering::Greater
+    } else if is_newer(b, a) {
+        std::cmp::Ordering::Less
+    } else {
+        a.cmp(b)
+    }
 }
 
 /// 后台服务进程里唯一的实例。
@@ -87,7 +143,21 @@ impl FilterHub {
         }
         g.0 += 1;
         g.1 = s;
+        *self.since.lock().unwrap() = Some(std::time::Instant::now());
         self.cv.notify_all();
+    }
+
+    /// 当前规则的版本号（0 表示引擎还没写入过规则）。
+    pub fn version(&self) -> u64 {
+        self.state.lock().unwrap().0
+    }
+
+    /// 版本 `v` 设置以来过了多久（已经不是当前版本时为 0）。
+    pub fn pending_for(&self, v: u64) -> Duration {
+        if self.version() != v {
+            return Duration::ZERO;
+        }
+        self.since.lock().unwrap().map(|t| t.elapsed()).unwrap_or_default()
     }
 
     pub fn current(&self) -> FilterState {
@@ -103,16 +173,38 @@ impl FilterHub {
 
     pub fn register(&self, hello: FilterHello) -> Registration<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.lock().unwrap().insert(id, hello);
+        let info = ExtInfo { version: hello.version, caps: hello.caps, applied: 0 };
+        self.clients.lock().unwrap().insert(id, info);
         self.fire();
         Registration { hub: self, id }
     }
 
+    /// 扩展确认已应用版本 `rev` 的规则。
+    pub fn applied(&self, reg: &Registration<'_>, rev: u64) {
+        let changed = {
+            let mut g = self.clients.lock().unwrap();
+            match g.get_mut(&reg.id) {
+                Some(c) if rev > c.applied => {
+                    c.applied = rev;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.fire();
+        }
+    }
+
     /// 已连接网络扩展的版本；没有连接时为 None。
     pub fn connected(&self) -> Option<String> {
+        self.connected_hello().map(|h| h.version)
+    }
+
+    /// 已连接的网络扩展。系统升级扩展时新旧两个进程可能短暂同时在线，取版本号最大的。
+    pub fn connected_hello(&self) -> Option<ExtInfo> {
         let g = self.clients.lock().unwrap();
-        // 系统升级扩展时新旧两个进程可能短暂同时在线，取版本号最大的
-        g.values().map(|h| h.version.clone()).max()
+        g.values().max_by(|a, b| version_cmp(&a.version, &b.version)).cloned()
     }
 
     pub fn set_notify(&self, f: impl Fn() + Send + Sync + 'static) {
@@ -155,6 +247,7 @@ impl FeedFirewall {
             inspect_existing: self.rules.kill_existing_tcp,
             apps: self.rules.apps.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
             block_ipv6: self.rules.block_ipv6,
+            rev: 0,
         });
     }
 
@@ -183,9 +276,33 @@ impl Firewall for FeedFirewall {
         self.inner.unblock()
     }
 
+    /// 扩展和 pf 都已经阻断才算阻断（pf 没装上时控制器会重试，界面显示「阻断未生效」）。
     fn is_blocked(&self) -> bool {
-        self.blocked
+        self.blocked && self.inner.is_blocked()
     }
+
+    /// 还没有向扩展发过规则：第一次决定是「放行」时也要发，扩展才能拿到「始终阻断 IPv6」等规则。
+    fn needs_initial_commit(&self) -> bool {
+        !self.decided
+    }
+
+    fn degraded(&self) -> Option<String> {
+        let ext = self.hub.connected_hello()?;
+        if self.rules.block_ipv6 && !ext.supports(CAP_BLOCK_IPV6) {
+            return Some(format!(
+                "网络扩展 {} 不支持「始终阻断 IPv6」，受控应用的 IPv6 连接不会被阻断。请更新网络扩展（重新打开界面会自动更新）",
+                ext.version
+            ));
+        }
+        if self.decided && ext.supports(CAP_ACK) {
+            let want = self.hub.version();
+            if want > 0 && ext.applied < want && self.hub.pending_for(want) > ACK_GRACE {
+                return Some(format!("网络扩展还没有确认收到最新规则（第 {want} 版，已确认第 {} 版）", ext.applied));
+            }
+        }
+        None
+    }
+
 
     fn set_rules(&mut self, rules: Rules) -> Result<()> {
         self.rules = rules.clone();
@@ -252,8 +369,8 @@ mod tests {
             f.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(hub.connected(), None);
-        let a = hub.register(FilterHello { version: "0.7.0".into() });
-        let b = hub.register(FilterHello { version: "0.7.1".into() });
+        let a = hub.register(FilterHello { version: "0.7.0".into(), ..Default::default() });
+        let b = hub.register(FilterHello { version: "0.7.1".into(), ..Default::default() });
         assert_eq!(hub.connected().as_deref(), Some("0.7.1"));
         drop(b);
         assert_eq!(hub.connected().as_deref(), Some("0.7.0"));
@@ -279,7 +396,7 @@ mod tests {
         fw.block().unwrap();
         let s = hub.current();
         assert!(s.blocked && s.inspect_existing && s.apps == ["/Applications/A.app"]);
-        let reg = hub.register(FilterHello { version: "1".into() });
+        let reg = hub.register(FilterHello { version: "1".into(), ..Default::default() });
         assert!(fw.per_app());
         assert_eq!(fw.extension().as_deref(), Some("1"));
         drop(reg);
@@ -288,6 +405,99 @@ mod tests {
         fw.block().unwrap();
         drop(fw);
         assert!(!hub.current().blocked, "退出时放行");
+    }
+
+    /// start_blocked=false、「始终阻断 IPv6」、第一次检测就命中白名单：控制器不切换状态，
+    /// 但扩展必须立即收到应用列表和 IPv6 规则。
+    #[test]
+    fn first_allow_decision_is_published() {
+        use crate::config::Config;
+        use crate::controller::{Controller, DryRunFirewall, Egress};
+        let hub: &'static FilterHub = Box::leak(Box::default());
+        let fw = FeedFirewall::new(Box::new(DryRunFirewall::default()), hub);
+        let cfg = Config::parse(
+            "whitelist=[\"203.0.113.0/24\"]\napps=['/Applications/A.app']\n[behavior]\nstart_blocked=false\n[ipv6]\nmode=\"block\"",
+        )
+        .unwrap();
+        let mut c = Controller::new(cfg, Box::new(fw));
+        c.apply_rules().unwrap();
+        assert_eq!(hub.version(), 0, "做出第一次决定之前不推送");
+        c.on_detection(Ok(Egress::v4("203.0.113.9".parse().unwrap()))).unwrap();
+        assert!(!c.is_blocked());
+        assert_eq!(hub.version(), 1, "第一次决定是放行也要推送");
+        let s = hub.current();
+        assert!(!s.blocked && s.block_ipv6 && s.apps == ["/Applications/A.app"]);
+        // 之后同样的决定不再重复推送
+        c.on_detection(Ok(Egress::v4("203.0.113.9".parse().unwrap()))).unwrap();
+        assert_eq!(hub.version(), 1);
+    }
+
+    /// pf 失败：阻断没生效时不报告已阻断，控制器定时重试，成功后只记一次。
+    #[test]
+    fn pf_failure_is_reported_and_retried() {
+        use crate::config::Config;
+        use crate::controller::{Controller, Egress};
+        struct FailingPf {
+            fail: std::rc::Rc<std::cell::Cell<bool>>,
+            blocked: bool,
+        }
+        impl Firewall for FailingPf {
+            fn block(&mut self) -> Result<()> {
+                if self.fail.get() {
+                    anyhow::bail!("pfctl 失败");
+                }
+                self.blocked = true;
+                Ok(())
+            }
+            fn unblock(&mut self) -> Result<()> {
+                self.blocked = false;
+                Ok(())
+            }
+            fn is_blocked(&self) -> bool {
+                self.blocked
+            }
+            fn set_rules(&mut self, _: Rules) -> Result<()> {
+                Ok(())
+            }
+        }
+        let hub: &'static FilterHub = Box::leak(Box::default());
+        let fail = std::rc::Rc::new(std::cell::Cell::new(true));
+        let fw = FeedFirewall::new(Box::new(FailingPf { fail: fail.clone(), blocked: false }), hub);
+        let cfg = Config::parse("whitelist=[\"203.0.113.0/24\"]\napps=['/Applications/A.app']\n[behavior]\nstart_blocked=false").unwrap();
+        let mut c = Controller::new(cfg, Box::new(fw));
+        assert!(c.on_detection(Ok(Egress::v4("198.51.100.1".parse().unwrap()))).is_err());
+        assert!(!c.is_blocked(), "pf 没装上：不能报告已阻断");
+        assert!(c.wants_block() && c.needs_retry());
+        assert!(c.apply_error().unwrap().contains("阻断未生效"));
+        assert!(hub.current().blocked, "扩展已经收到阻断");
+        fail.set(false);
+        c.retry_pending().unwrap();
+        assert!(c.is_blocked() && !c.needs_retry() && c.apply_error().is_none());
+    }
+
+    #[test]
+    fn old_extension_capabilities() {
+        let hub: &'static FilterHub = Box::leak(Box::default());
+        let mut fw = FeedFirewall::new(Box::new(crate::controller::DryRunFirewall::default()), hub);
+        fw.set_rules(Rules { apps: vec!["/Applications/A.app".into()], block_ipv6: true, ..Default::default() }).unwrap();
+        fw.unblock().unwrap();
+        assert_eq!(fw.degraded(), None, "没有扩展连接时由 per_app 提示");
+        let old = hub.register(FilterHello { version: "0.8.0".into(), ..Default::default() });
+        assert!(fw.degraded().unwrap().contains("不支持「始终阻断 IPv6」"));
+        drop(old);
+        // 0.9.0 的扩展没有能力列表但支持 IPv6，也不会确认
+        let v090 = hub.register(FilterHello { version: "0.9.0".into(), ..Default::default() });
+        assert_eq!(fw.degraded(), None);
+        drop(v090);
+        let new = hub.register(FilterHello {
+            version: "0.9.1".into(),
+            protocol: 1,
+            caps: vec![CAP_BLOCK_IPV6.into(), CAP_ACK.into()],
+        });
+        assert_eq!(fw.degraded(), None, "宽限时间内不提示");
+        hub.applied(&new, hub.version());
+        assert_eq!(hub.connected_hello().unwrap().applied, hub.version());
+        assert_eq!(fw.degraded(), None);
     }
 
     #[test]
@@ -300,10 +510,16 @@ mod tests {
 
     #[test]
     fn json_shape() {
-        let s = FilterState { blocked: true, inspect_existing: false, apps: vec!["/Applications/A.app".into()], block_ipv6: false };
+        let s = FilterState { blocked: true, inspect_existing: false, apps: vec!["/Applications/A.app".into()], block_ipv6: false, rev: 0 };
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
             r#"{"blocked":true,"inspect_existing":false,"apps":["/Applications/A.app"],"block_ipv6":false}"#
+        );
+        let s = FilterState { rev: 7, ..s };
+        assert!(serde_json::to_string(&s).unwrap().ends_with(r#""block_ipv6":false,"rev":7}"#));
+        assert_eq!(
+            serde_json::to_string(&FilterHello { version: "1".into(), protocol: 1, caps: vec!["ack".into()] }).unwrap(),
+            r#"{"version":"1","protocol":1,"caps":["ack"]}"#
         );
     }
 }

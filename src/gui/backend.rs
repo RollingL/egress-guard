@@ -97,8 +97,7 @@ impl Backend for Local {
     }
 
     fn clear_events(&self) -> Result<()> {
-        eventlog::clear();
-        Ok(())
+        eventlog::clear()
     }
 
     fn record_event(&self, e: ConnEvent) {

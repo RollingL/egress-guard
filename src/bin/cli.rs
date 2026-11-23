@@ -255,28 +255,17 @@ fn real_main(cli: Cli) -> Result<()> {
             run(cfg, dry_run, learned_file(&config_path))
         }
         Command::Ip => {
-            let det = EgressDetector::with_family(
-                cfg.detect.services.clone(),
-                Duration::from_secs(cfg.detect.timeout_secs),
-                egress_guard::egress::Family::for_main(cfg.ipv6.mode),
-            );
-            let ip = det.detect()?;
-            let mut egress = egress_guard::controller::Egress::v4(ip);
+            let egress = egress_guard::egress::Detectors::new(&cfg).detect()?;
+            let ip = egress.ip;
             println!("出口 IP: {ip}（{}）", if cfg.is_whitelisted(ip) { "在白名单内" } else { "不在白名单内" });
-            if cfg.ipv6.mode == egress_guard::config::Ipv6Mode::Check {
-                let v6 = EgressDetector::with_family(
-                    cfg.ipv6.services.clone(),
-                    Duration::from_secs(cfg.detect.timeout_secs),
-                    egress_guard::egress::Family::V6,
-                );
-                match v6.detect() {
-                    Ok(v) if v != ip => {
-                        println!("IPv6 出口: {v}（{}）", if cfg.is_whitelisted(v) { "在白名单内" } else { "不在白名单内" });
-                        egress.v6 = Some(v);
-                    }
-                    Ok(_) => {}
-                    Err(e) => println!("IPv6 出口: 没有检测到（{e:#}）"),
+            match egress.extra_v6() {
+                Some(v) => {
+                    println!("IPv6 出口: {v}（{}）", if cfg.is_whitelisted(v) { "在白名单内" } else { "不在白名单内" })
                 }
+                None if cfg.ipv6.mode == egress_guard::config::Ipv6Mode::Check && ip.is_ipv4() => {
+                    println!("IPv6 出口: 本机没有 IPv6 路由")
+                }
+                None => {}
             }
             let ok = egress_guard::controller::egress_allowed(&cfg, &egress);
             println!("白名单: {}", if ok { "命中 → 放行" } else { "未命中 → 阻断" });
@@ -315,7 +304,7 @@ fn leak_test(cfg: &Config, do_dns: bool, do_webrtc: bool, json: bool, fail_on_le
     };
     let (dns_r, rtc_r) = std::thread::scope(|s| {
         let d = do_dns.then(|| s.spawn(|| dns::run(&lt.dnscheck_zone, &lt.dns_sources, egress, &judge, &|_| {})));
-        let w = do_webrtc.then(|| s.spawn(|| webrtc::run(&lt.stun_servers, egress, &judge)));
+        let w = do_webrtc.then(|| s.spawn(|| webrtc::run(&lt.stun_servers, egress, &judge, &|| false)));
         (d.map(|j| j.join().expect("DNS 测试线程异常")), w.map(|j| j.join().expect("WebRTC 测试线程异常")))
     });
 

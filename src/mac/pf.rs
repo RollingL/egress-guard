@@ -150,15 +150,27 @@ impl PfFirewall {
     }
 }
 
+impl PfFirewall {
+    /// 切换阻断状态。规则装上之后才改 `blocked`：失败时仍报告原来的状态（控制器会重试这次切换），
+    /// 不会让界面先显示目标状态。
+    fn set_blocked(&mut self, blocked: bool) -> Result<()> {
+        let before = self.blocked;
+        self.blocked = blocked;
+        let r = self.sync();
+        if r.is_err() {
+            self.blocked = before;
+        }
+        r
+    }
+}
+
 impl Firewall for PfFirewall {
     fn block(&mut self) -> Result<()> {
-        self.blocked = true;
-        self.sync()
+        self.set_blocked(true)
     }
 
     fn unblock(&mut self) -> Result<()> {
-        self.blocked = false;
-        self.sync()
+        self.set_blocked(false)
     }
 
     fn is_blocked(&self) -> bool {

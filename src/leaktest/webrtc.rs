@@ -85,7 +85,13 @@ impl WebRtcReport {
 }
 
 /// 运行测试。`servers` 为「主机:端口」列表，按顺序尝试。
-pub fn run(servers: &[String], egress: Option<IpAddr>, judge: &Judge) -> WebRtcReport {
+/// `cancel` 返回 true 时不再发出新的探测（例如自动测试期间网络变了），已经发出的照常收尾。
+pub fn run(
+    servers: &[String],
+    egress: Option<IpAddr>,
+    judge: &Judge,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> WebRtcReport {
     // 解析 STUN 服务器（每个服务器每种地址族只用第一个地址）
     let mut resolved: Vec<(String, Vec<SocketAddr>)> = Vec::new();
     let mut unresolved = Vec::new();
@@ -131,7 +137,7 @@ pub fn run(servers: &[String], egress: Option<IpAddr>, judge: &Judge) -> WebRtcR
             .into_iter()
             .map(|(iface, local)| {
                 let resolved = &resolved;
-                s.spawn(move || probe(iface, local, resolved, judge))
+                s.spawn(move || probe(iface, local, resolved, judge, cancel))
             })
             .collect();
         jobs.into_iter().filter_map(|j| j.join().ok()).collect()
@@ -148,7 +154,13 @@ fn candidate(ip: IpAddr) -> bool {
     }
 }
 
-fn probe(iface: Option<String>, local: IpAddr, servers: &[(String, Vec<SocketAddr>)], judge: &Judge) -> StunPath {
+fn probe(
+    iface: Option<String>,
+    local: IpAddr,
+    servers: &[(String, Vec<SocketAddr>)],
+    judge: &Judge,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> StunPath {
     let mut path = StunPath { iface, local, mapped: None, server: None, error: None, verdict: Verdict::NoResponse };
     let sock = match UdpSocket::bind(SocketAddr::new(local, 0)) {
         Ok(s) => s,
@@ -161,6 +173,10 @@ fn probe(iface: Option<String>, local: IpAddr, servers: &[(String, Vec<SocketAdd
     let mut tried = 0;
     for (name, addrs) in servers {
         for a in addrs.iter().filter(|a| a.is_ipv4() == local.is_ipv4()) {
+            if cancel() {
+                path.error = Some("测试已取消".into());
+                return path;
+            }
             tried += 1;
             match stun::query(&sock, *a, PER_SERVER) {
                 Ok(m) => {
