@@ -613,7 +613,7 @@ fn snapshot_fn() -> discovery::SnapshotFn {
 #[cfg(windows)]
 fn open_backend(cfg: &Config, tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
     let _ = (cfg, tx);
-    Ok(Box::new(crate::win::wfp::WfpFirewall::open()?))
+    Ok(Box::new(crate::win::wfp::open()?))
 }
 
 /// macOS：pf 负责全局断网，网络扩展（连上后）负责按应用阻断。

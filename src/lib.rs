@@ -25,6 +25,7 @@ pub mod netext;
 pub mod pfrules;
 pub mod update;
 pub mod vpn;
+pub mod wfpcore;
 #[cfg(windows)]
 pub mod win;
 
