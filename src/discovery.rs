@@ -133,16 +133,15 @@ fn is_direct(key: &str, roots: &Roots) -> bool {
 /// 返回 (进程下标, 所属受控应用)。
 pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> Vec<(usize, Roots)> {
     let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
-    let target_of = |p: &ProcEntry| {
-        if p.path.is_empty() {
-            None
-        } else {
-            lookup_target(&normalize(&p.path), targets)
-        }
-    };
+    // 每个进程只规范化一次路径（祖先链会反复经过同一个进程）
+    let hits: Vec<Option<(&String, &Roots)>> = procs
+        .iter()
+        .map(|p| if p.path.is_empty() { None } else { lookup_target(&normalize(&p.path), targets) })
+        .collect();
+    let target_of = |p: &ProcEntry| by_pid.get(&p.pid).and_then(|&i| hits[i]);
     let mut out = Vec::new();
     for (i, p) in procs.iter().enumerate() {
-        if p.pid <= 4 || target_of(p).is_some_and(|(k, r)| is_direct(k, r)) {
+        if p.pid <= 4 || hits[i].is_some_and(|(k, r)| is_direct(k, r)) {
             continue;
         }
         let mut cur = p;
@@ -337,6 +336,8 @@ impl WatchSettings {
 pub type SnapshotFn = fn() -> Vec<ProcEntry>;
 
 const POLL: Duration = Duration::from_millis(1000);
+/// 没有任何受控应用（及已识别程序）在运行时的扫描间隔：受控应用刚启动时，它的子进程最多晚这么久被识别。
+const IDLE_POLL: Duration = Duration::from_secs(3);
 const DIR_RESCAN: Duration = Duration::from_secs(30);
 
 /// 启动识别线程。识别结果变化时向引擎发送 `Event::ExtraApps`。
@@ -429,16 +430,25 @@ pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, system_di
     collect(s, &learned, &scan_app_dirs(s, system_dirs))
 }
 
+/// 有没有目标进程（受控应用、已识别程序、同目录程序）正在运行。
+fn any_target_running(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> bool {
+    procs.iter().any(|p| !p.path.is_empty() && lookup_target(&normalize(&p.path), targets).is_some())
+}
+
 /// 根据一次进程快照记下受控应用（及已识别程序）启动的子程序和它们的来源。
+/// 返回是否有目标进程正在运行（没有时可以放慢扫描）。
 fn learn_children(
     s: &WatchSettings,
     learned: &mut Learned,
     dir_exes: &[(PathBuf, Roots)],
     procs: &[ProcEntry],
     system_dirs: &[String],
-) {
-    let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
+) -> bool {
     let t = targets(s, learned, dir_exes);
+    if !any_target_running(procs, &t) {
+        return false;
+    }
+    let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
     for (i, roots) in descendants_of_targets(procs, &t) {
         let p = &procs[i];
         if p.path.is_empty() {
@@ -464,6 +474,7 @@ fn learn_children(
             }
         }
     }
+    true
 }
 
 fn run(
@@ -501,10 +512,10 @@ fn run(
             last_scan = Some((Instant::now(), s.version));
         }
 
-        // 子进程识别
-        if s.mode == ChildMode::Tree && !s.apps.is_empty() {
-            learn_children(&s, &mut learned, &dir_exes, &snapshot(), &system_dirs);
-        }
+        // 子进程识别。没有任何目标进程在运行时放慢扫描（它一启动，最多晚 IDLE_POLL 被发现）
+        let busy = s.mode == ChildMode::Tree
+            && !s.apps.is_empty()
+            && learn_children(&s, &mut learned, &dir_exes, &snapshot(), &system_dirs);
 
         let extra = collect(&s, &learned, &dir_exes);
         if last_sent.as_ref() != Some(&extra) {
@@ -514,7 +525,19 @@ fn run(
             last_sent = Some(extra);
         }
 
-        std::thread::sleep(POLL);
+        // 放慢时仍每 POLL 看一次设置：改了配置或要求清空记录时立即重新扫描
+        let wait = if busy { POLL } else { IDLE_POLL };
+        let since = Instant::now();
+        loop {
+            std::thread::sleep(POLL);
+            if since.elapsed() >= wait || Arc::strong_count(&settings) == 1 {
+                break;
+            }
+            let g = settings.lock().unwrap();
+            if g.version != s.version || g.clear_learned {
+                break;
+            }
+        }
     }
 }
 
@@ -631,6 +654,21 @@ mod tests {
         assert_eq!(l3.iter().next().unwrap().2.len(), 2);
         assert_eq!(std::fs::read_to_string(&f).unwrap().lines().filter(|l| !l.starts_with('#')).count(), 2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 没有目标进程在运行时报告空闲（识别线程据此放慢扫描）；受控应用或已识别程序在运行时不空闲。
+    #[test]
+    fn reports_whether_any_target_is_running() {
+        let sys = vec![normalize(r"C:\Windows")];
+        let s = WatchSettings { apps: vec![PathBuf::from(r"C:\Apps\A\a.exe")], mode: ChildMode::Tree, ..Default::default() };
+        let mut learned = Learned::load(None);
+        let others = [p(10, 1, 1, r"C:\Other\x.exe"), p(11, 10, 2, r"C:\Other\y.exe")];
+        assert!(!learn_children(&s, &mut learned, &[], &others, &sys));
+        assert_eq!(learned.iter().count(), 0);
+        assert!(learn_children(&s, &mut learned, &[], &[p(20, 1, 3, r"C:\Apps\A\A.EXE"), p(21, 20, 4, r"D:\h.exe")], &sys));
+        assert_eq!(learned.iter().count(), 1);
+        // 只剩已识别的辅助程序在运行：仍然要按 1 秒扫描（它的子进程也要识别）
+        assert!(learn_children(&s, &mut learned, &[], &[p(30, 1, 5, r"D:\h.exe")], &sys));
     }
 
     /// 两个独立的受控应用先后启动同一个（在两者目录之外的）辅助程序：两个来源都记下，
