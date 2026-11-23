@@ -539,6 +539,8 @@ pub enum Glyph {
     Laptop,
     /// 禁行标志里的横杠。
     Bar,
+    /// 水滴（泄露测试）。
+    Drop,
 }
 
 /// 盾牌轮廓的多边形（凸多边形，坐标归一化到 0..1）。
@@ -599,6 +601,20 @@ pub fn paint_glyph(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Col
             let screen = Rect::from_min_max(at(0.20, 0.22), at(0.80, 0.64));
             painter.rect_stroke(screen, CornerRadius::same((s * 0.05) as u8), st, egui::StrokeKind::Middle);
             painter.line_segment([at(0.14, 0.74), at(0.86, 0.74)], Stroke::new(s * 0.09, color));
+        }
+        Glyph::Drop => {
+            // 顶端一个尖、下面一段圆弧：尖点到圆的两条切线 + 圆弧，组成凸多边形
+            let c = Vec2::new(0.5, 0.60);
+            let (r, d) = (0.25f32, 0.46f32);
+            let a = (r / d).acos();
+            let up = -std::f32::consts::FRAC_PI_2;
+            let (from, to) = (up + a, up - a + std::f32::consts::TAU);
+            let mut pts = vec![at(c.x, c.y - d)];
+            for i in 0..=20 {
+                let t = from + (to - from) * i as f32 / 20.0;
+                pts.push(at(c.x + r * t.cos(), c.y + r * t.sin()));
+            }
+            painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
         }
         Glyph::Bar => {
             painter.line_segment([at(0.26, 0.5), at(0.74, 0.5)], Stroke::new(s * 0.14, color));

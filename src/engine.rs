@@ -26,7 +26,7 @@ pub enum Event {
     /// 立即检测一次出口 IP。
     CheckNow,
     /// 应用新配置。
-    Reconfigure(Config),
+    Reconfigure(Box<Config>),
     /// 退出（移除全部阻断规则）。
     Shutdown,
     /// 内部：检测线程返回结果。
@@ -265,7 +265,7 @@ fn run(
                     *w = WatchSettings::from_config(&new_cfg, watch_version);
                     w.clear_learned = clear;
                 }
-                if let Err(e) = ctrl.reconfigure(new_cfg) {
+                if let Err(e) = ctrl.reconfigure(*new_cfg) {
                     log::error!("应用新配置失败: {e:#}");
                 }
                 generation += 1;

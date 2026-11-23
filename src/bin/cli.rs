@@ -45,6 +45,21 @@ enum Command {
     Ip,
     /// 校验配置文件，并检查应用路径是否存在
     Check,
+    /// DNS 与 WebRTC 泄露测试（不需要管理员权限）
+    LeakTest {
+        /// 只测 DNS
+        #[arg(long, conflicts_with = "webrtc")]
+        dns: bool,
+        /// 只测 WebRTC
+        #[arg(long)]
+        webrtc: bool,
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 发现泄露时以退出码 2 结束
+        #[arg(long)]
+        fail_on_leak: bool,
+    },
     /// 作为后台服务运行（由 launchd 启动；也可以 sudo 手动运行调试）
     #[cfg(unix)]
     Daemon {
@@ -202,7 +217,31 @@ fn real_main(cli: Cli) -> Result<()> {
         }
     }
 
-    let config_path = resolve_config_path(cli.config)?;
+    // macOS：没有指定 -c 时，泄露测试用后台服务的配置（白名单、可信解析器）
+    #[cfg(target_os = "macos")]
+    let config_path = match (&cli.config, &cli.command) {
+        (None, Some(Command::LeakTest { .. })) => default_daemon_config(),
+        _ => resolve_config_path(cli.config.clone())?,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let config_path = resolve_config_path(cli.config.clone())?;
+    if let Some(Command::LeakTest { dns, webrtc, json, fail_on_leak }) = cli.command {
+        // 没有配置文件时按默认设置测试（白名单为空）
+        let cfg = if cli.config.is_some() {
+            Config::load(&config_path)?
+        } else {
+            // 没有用 -c 指定时，默认配置读不了（不存在、macOS 上没有权限读后台服务的配置等）也照样测试
+            match config_path.exists().then(|| Config::load(&config_path)) {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    eprintln!("警告：无法读取配置文件 {}，按默认设置测试（白名单为空）：{e:#}", config_path.display());
+                    Config::from_raw(Default::default())?
+                }
+                None => Config::from_raw(Default::default())?,
+            }
+        };
+        return leak_test(&cfg, !webrtc, !dns, json, fail_on_leak);
+    }
     let cfg = Config::load(&config_path)?;
     log::debug!("使用配置文件 {}", config_path.display());
 
@@ -235,6 +274,116 @@ fn real_main(cli: Cli) -> Result<()> {
         #[allow(unreachable_patterns)]
         _ => unreachable!("已在上面处理"),
     }
+}
+
+fn leak_test(cfg: &Config, do_dns: bool, do_webrtc: bool, json: bool, fail_on_leak: bool) -> Result<()> {
+    use egress_guard::leaktest::{self, dns, webrtc, Judge, Level};
+
+    let lt = &cfg.leak_test;
+    let judge = Judge { whitelist: cfg.whitelist.clone(), trusted: lt.trusted_dns.iter().filter_map(|s| leaktest::Trusted::parse(s).ok()).collect() };
+    let det = EgressDetector::new(cfg.detect.services.clone(), Duration::from_secs(cfg.detect.timeout_secs));
+    let egress = match det.detect() {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            log::warn!("无法检测出口 IP：{e:#}");
+            None
+        }
+    };
+    let (dns_r, rtc_r) = std::thread::scope(|s| {
+        let d = do_dns.then(|| s.spawn(|| dns::run(&lt.dnscheck_zone, &lt.dns_sources, egress, &judge, &|_| {})));
+        let w = do_webrtc.then(|| s.spawn(|| webrtc::run(&lt.stun_servers, egress, &judge)));
+        (d.map(|j| j.join().expect("DNS 测试线程异常")), w.map(|j| j.join().expect("WebRTC 测试线程异常")))
+    });
+
+    let mut leak = false;
+    if json {
+        let out = serde_json::json!({
+            "egress": egress,
+            "egress_whitelisted": egress.map(|ip| cfg.is_whitelisted(ip)),
+            "dns": dns_r.as_ref().map(|r| match r {
+                Ok(r) => serde_json::json!({ "summary": dns_summary_json(r), "report": r }),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            }),
+            "webrtc": rtc_r.as_ref().map(|r| {
+                let (level, text) = leaktest::webrtc_summary(r);
+                serde_json::json!({ "summary": { "level": level, "text": text }, "report": r })
+            }),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    }
+
+    match egress {
+        Some(ip) if !json => {
+            let wl = if cfg.is_whitelisted(ip) { "在白名单内" } else { "不在白名单内" };
+            println!("出口 IP：{ip}（{wl}）");
+        }
+        None if !json => println!("出口 IP：未知"),
+        _ => {}
+    }
+    if let Some(r) = &dns_r {
+        if !json {
+            println!("\n== DNS 泄露测试 ==");
+        }
+        match r {
+            Ok(r) => {
+                let (level, text) = leaktest::dns_summary(r);
+                leak |= level == Level::Leak;
+                if !json {
+                    for s in &r.sources {
+                        println!("  检测源 {}：{}{}", s.name, if s.ok { "" } else { "失败，" }, s.detail);
+                    }
+                    for x in &r.resolvers {
+                        let info = x.info.as_ref().map(|i| i.describe()).unwrap_or_default();
+                        let mut extra = x.sources.join("、");
+                        if x.queries > 0 {
+                            extra = format!("{} {} 次查询，{extra}", x.protos.join("/"), x.queries);
+                        }
+                        println!("  [{}] {}  {info}（{extra}）", x.verdict.label(), x.ip);
+                    }
+                    for x in &r.client_subnets {
+                        let info = x.info.as_ref().map(|i| i.describe()).unwrap_or_default();
+                        println!("  [{}] ECS 客户端网段 {}  {info}", x.verdict.label(), x.subnet);
+                    }
+                    println!("结论：{text}");
+                }
+            }
+            Err(e) if !json => println!("测试失败：{e:#}"),
+            Err(_) => {}
+        }
+    }
+    if let Some(r) = &rtc_r {
+        let (level, text) = leaktest::webrtc_summary(r);
+        leak |= level == Level::Leak;
+        if !json {
+            println!("\n== WebRTC 泄露测试 ==");
+            for u in &r.unresolved {
+                println!("  STUN 服务器无法解析：{u}");
+            }
+            for p in &r.paths {
+                let from = match &p.iface {
+                    None => format!("默认路由（{}）", if p.local.is_ipv4() { "IPv4" } else { "IPv6" }),
+                    Some(n) => format!("{n} {}", p.local),
+                };
+                match (&p.mapped, &p.server) {
+                    (Some(m), Some(s)) => println!("  [{}] {from} → {}（{s}）", p.verdict.label(), m.ip()),
+                    _ => println!("  [{}] {from}：{}", p.verdict.label(), p.error.as_deref().unwrap_or("")),
+                }
+            }
+            for h in &r.hosts {
+                println!("  [{}] 网卡地址 {} {}", h.verdict.label(), h.iface, h.ip);
+            }
+            println!("结论：{text}");
+        }
+    }
+    if fail_on_leak && leak {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn dns_summary_json(r: &egress_guard::leaktest::dns::DnsReport) -> serde_json::Value {
+    let (level, text) = egress_guard::leaktest::dns_summary(r);
+    serde_json::json!({ "level": level, "text": text })
 }
 
 fn resolve_config_path(arg: Option<PathBuf>) -> Result<PathBuf> {

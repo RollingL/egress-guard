@@ -59,6 +59,34 @@ Windows 版提供两个程序：
 
 如果概览页显示"拦截规则未生效"，说明 WFP 打开失败（通常是因为没有以管理员身份运行）。这时程序处于模拟模式，**不会真正阻断**。
 
+## 泄露测试（DNS、WebRTC）
+
+出口 IP 在白名单内，不代表所有流量都走了白名单出口。侧边栏 **泄露测试** 页（或命令行 `egress-guard leak-test`）检查两种常见的泄露，并把结果和出口 IP 白名单对比：
+
+| 测试 | 做法 | 什么算泄露 |
+| --- | --- | --- |
+| DNS | 用系统解析器（和普通应用一样）查询几个随机子域名，由检测服务的权威服务器告诉本程序是哪些递归解析器来查的；同时查询这些解析器的运营商和所在地 | 解析器既不在白名单内、也不在「可信 DNS 解析器」里，也不和白名单内的出口属于同一个网络（自治系统）；或者解析器把白名单以外的客户端网段（ECS）转发了出去 |
+| WebRTC | 像浏览器收集 ICE 候选地址那样，从默认路由（IPv4、IPv6）和每个网卡地址分别向 STUN 服务器发送绑定请求，并列出网卡上的地址 | STUN 看到的公网 IP 不在白名单内（例如 VPN 之外的网卡还能直连外网，或者代理只管 TCP）；网卡上不在白名单内的公网地址标为「公网地址」，网页获得摄像头/麦克风权限后可以读到 |
+
+<p>
+  <img src="docs/leaktest-windows-light.png" width="49%" alt="Windows 泄露测试页：解析器与出口属于同一网络，未发现泄露">
+  <img src="docs/leaktest-macos-dark.png" width="49%" alt="macOS 泄露测试页（深色）：发现白名单以外的解析器和 WebRTC 公网 IP">
+</p>
+
+以上截图来自 GitHub Actions：Windows 虚拟机的解析器与出口同属 AS8075，判为未泄露；macOS 虚拟机用的是 Google 公共 DNS，且 STUN 看到的公网 IP 与出口 IP 不同，所以判为泄露。
+
+- DNS 检测源：主要用 [addr.tools](https://github.com/brianshea2/addr.tools) 的 dnscheck 服务（`wss://ws.dnscheck.tools/watch/<ID>` 实时推送每一个查询的来源，能看到全部解析器和 ECS，服务端开源、可以自建）；另外参考 [MyIP](https://github.com/jason5ng32/MyIP)，并行使用 ip-api、every1dns、fastly、surfshark、ipleak、browserleaks 六个「一次 HTTP 请求」式的检测源，dnscheck 连不上时也能给出结果。这些请求不走代理，域名一定由本机系统解析器解析。
+- 用 Cloudflare、Google 等公共解析器时，它们向外查询的 IP 不固定，可以在结果里点「信任 AS…」，按自治系统信任整个服务商。
+- 解析器和出口 IP 的归属（运营商、自治系统号、国家）来自 `ip.addr.tools`。
+- 测试只在点「开始测试」或运行命令时进行，不会定时运行。测试由 Egress Guard 自己发出：Windows 上全局断网会放行本程序，所以断网时测到的是「不断网时会怎样」；macOS 上测试以当前用户身份运行，全局断网时会被 pf 拦截。
+- 两个参考项目都使用 AGPL-3.0 许可。本程序只调用它们（及上述检测源）的公开服务、按公开的协议自己实现，没有复制它们的代码。
+
+```powershell
+.\egress-guard.exe leak-test             # DNS + WebRTC，按 config.toml 的白名单判定
+.\egress-guard.exe leak-test --dns       # 只测 DNS（--webrtc 只测 WebRTC）
+.\egress-guard.exe leak-test --json      # JSON 输出；加 --fail-on-leak 时发现泄露以退出码 2 结束
+```
+
 ## 命令行版本
 
 ```powershell
@@ -66,6 +94,7 @@ Windows 版提供两个程序：
 .\egress-guard.exe ip               # 检测一次出口 IP（不需要管理员）
 .\egress-guard.exe run --dry-run    # 只打印决策，不改动网络（不需要管理员）
 .\egress-guard.exe run              # 正式运行，需要管理员终端，Ctrl+C 退出
+.\egress-guard.exe leak-test        # DNS / WebRTC 泄露测试（不需要管理员）
 ```
 
 常用参数：`-c <配置文件路径>`、`--log-level debug`。命令行版本和界面版本使用同一种 `config.toml` 格式，但不要同时运行两者。
@@ -88,6 +117,7 @@ Register-ScheduledTask -TaskName "egress-guard-cli" -Action $action -Trigger $tr
 - `detect.fail_mode`：检测失败时 `block`（默认）/ `allow` / `keep`，在连续失败 `failure_threshold` 次后生效。
 - `detect.services`：任意返回包含 IP 文本的 HTTPS 地址都可以。
 - `[block_all]`：全局断网，界面里在 **全局断网** 页设置。默认放行局域网和 DNS。
+- `[leak_test]`：泄露测试的可信 DNS 解析器、检测源和 STUN 服务器，界面里在 **泄露测试** 页设置。
 
 ## 注意事项与已知限制
 
@@ -221,11 +251,13 @@ src/
   pfrules.rs        pf 规则文本生成（与平台无关，可测试）
   config.rs         TOML 配置解析/保存、白名单（IP/CIDR）匹配
   egress.rs         公网出口 IP 查询（ureq + 系统 TLS）
+  leaktest/         泄露测试：判定逻辑（mod.rs）、DNS（dns.rs）、WebRTC（webrtc.rs）、STUN 客户端（stun.rs）、网卡地址（ifaces.rs）
   controller.rs     阻断/放行决策逻辑，Firewall 抽象，dry-run 后端
   blockall.rs       全局断网的例外规则（局域网网段、DNS、DHCP 端口）
   discovery.rs      子进程 / 同目录关联程序识别
   logbuf.rs         日志（stderr / 文件 / 界面）
   gui/mod.rs        界面页面（eframe/egui）
+  gui/leak.rs       「泄露测试」页
   gui/backend.rs    界面背后的引擎：本进程（Windows）或后台服务（macOS）
   gui/theme.rs      苹果风格配色、样式和自绘控件（开关、分段控件、卡片、图标）
   gui/tray.rs       系统托盘（独立消息循环线程）

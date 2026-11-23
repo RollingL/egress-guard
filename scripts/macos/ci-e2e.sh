@@ -44,7 +44,9 @@ can_reach() { curl -sS -m 8 -o /dev/null "$1"; }
 # 截图：启动界面打开指定页面，截全屏
 shot() {
   local name="$1" page="$2"
-  "$GUI" --page "$page" >/dev/null 2>&1 &
+  # 第 4 个参数是额外的界面参数（如 --leak-test）
+  # shellcheck disable=SC2086
+  "$GUI" --page "$page" ${4:-} >/dev/null 2>&1 &
   local pid=$!
   sleep "${3:-6}"
   screencapture -x "$SHOTS/$name.png" || echo "截图失败：$name"
@@ -198,6 +200,24 @@ can_reach https://example.com && echo "OK：已放行" || fail "放行后仍不�
 shot 3-allowed-dark overview
 shot 4-settings-dark settings 4
 shot 5-whitelist-dark whitelist 4
+
+step "泄露测试（DNS、WebRTC）：以普通用户运行，结果与白名单对比"
+"$CLI" -c /tmp/eg.toml leak-test || fail "泄露测试命令失败"
+"$CLI" -c /tmp/eg.toml leak-test --json > /tmp/leak.json 2>/tmp/leak.err || fail "泄露测试（JSON）失败：$(cat /tmp/leak.err)"
+# 依赖外部服务：结果只打印、不作为失败条件；但输出必须是完整的 JSON，并且至少测了默认路由
+python3 - /tmp/leak.json <<'PY' || fail "泄露测试输出不完整"
+import json, sys
+r = json.load(open(sys.argv[1]))
+d, w = r["dns"], r["webrtc"]
+print("DNS：", d.get("summary", {}).get("text") or d.get("error"))
+print("WebRTC：", w["summary"]["text"])
+assert w["report"]["paths"], "WebRTC 没有测试任何路径"
+assert "summary" in d or "error" in d
+PY
+shot 11-leaktest-dark leaktest 35 --leak-test
+write_cfg "\"$IP\"" light
+"$CLI" apply /tmp/eg.toml || fail "apply 失败"
+shot 12-leaktest-light leaktest 35 --leak-test
 
 step "菜单栏应用：窗口隐藏后再次打开应用会显示窗口"
 pkill -f "$GUI" 2>/dev/null

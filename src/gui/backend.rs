@@ -74,7 +74,7 @@ impl Backend for Local {
 
     fn apply(&self, cfg: &Config) -> Result<()> {
         cfg.save(&self.config_path)?;
-        self.engine.send(Event::Reconfigure(cfg.clone()));
+        self.engine.send(Event::Reconfigure(Box::new(cfg.clone())));
         Ok(())
     }
 
