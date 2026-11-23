@@ -242,6 +242,8 @@ fn run(
     let mut checking = false;
     let mut next_check: Option<Instant> = Some(Instant::now());
     let mut debounce_until: Option<Instant> = None;
+    // 这一轮网络变化开始的时刻：变化一直不停时，防抖最多推迟到这之后 MAX_SETTLE
+    let mut change_started: Option<Instant> = None;
     let mut after_change = false;
     // 规则同步失败或有程序暂未加上规则时，定时重试
     let mut next_retry: Option<Instant> = None;
@@ -324,7 +326,9 @@ fn run(
                 }
                 // 正在进行的检测结果作废；等网络安静下来再检测
                 generation += 1;
-                debounce_until = Some(later(Duration::from_millis(ctrl.config().behavior.debounce_ms)));
+                let now = Instant::now();
+                let started = *change_started.get_or_insert(now);
+                debounce_until = Some(settle_deadline(now, started, Duration::from_millis(ctrl.config().behavior.debounce_ms)));
                 next_check = None;
             }
             Ok(Event::CheckNow) => {
@@ -386,6 +390,7 @@ fn run(
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
+                    change_started.get_or_insert_with(Instant::now);
                     debounce_until.get_or_insert_with(|| later(Duration::from_millis(ctrl.config().behavior.debounce_ms)));
                 }
             }
@@ -432,6 +437,7 @@ fn run(
             let now = Instant::now();
             if debounce_until.is_some_and(|d| d <= now) {
                 debounce_until = None;
+                change_started = None;
                 after_change = true;
                 log::info!("网络发生变化，重新检测出口 IP");
                 start_check(&mut checking, &detector, generation);
@@ -523,6 +529,18 @@ fn run(
 fn later(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
+}
+
+/// 防抖的截止时刻：每次变化都从现在起再等 `debounce`，但从这一轮变化开始算最多等 [`max_settle`]。
+/// 网络一直抖动（例如每 1.5 秒一次通知、防抖 2 秒）时，检测不会被无限期推迟，阻断也不会一直不解除。
+fn settle_deadline(now: Instant, started: Instant, debounce: Duration) -> Instant {
+    let cap = started.checked_add(max_settle(debounce)).unwrap_or(now);
+    now.checked_add(debounce).map_or(cap, |d| d.min(cap)).max(now)
+}
+
+/// 一轮网络变化最多等多久就检测一次：防抖的 5 倍，至少 10 秒。
+fn max_settle(debounce: Duration) -> Duration {
+    debounce.saturating_mul(5).max(Duration::from_secs(10))
 }
 
 /// 有上限的指数退避：5 秒起，每次失败加倍，最多 5 分钟。
@@ -628,4 +646,29 @@ fn open_backend(cfg: &Config, tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn open_backend(_cfg: &Config, _tx: Sender<Event>) -> Result<Box<dyn Firewall>> {
     anyhow::bail!("只支持 Windows（WFP）和 macOS（pf）；在其他平台请使用 --dry-run")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settle_deadline_slides_but_is_capped() {
+        let t0 = Instant::now();
+        let d = Duration::from_secs(2);
+        // 第一个通知：等满防抖
+        assert_eq!(settle_deadline(t0, t0, d), t0 + d);
+        // 之后的通知继续往后推
+        let t = t0 + Duration::from_millis(1500);
+        assert_eq!(settle_deadline(t, t0, d), t + d);
+        // 推到上限（10 秒）为止
+        let t = t0 + Duration::from_secs(9);
+        assert_eq!(settle_deadline(t, t0, d), t0 + Duration::from_secs(10));
+        // 已经过了上限：立刻检测
+        let t = t0 + Duration::from_secs(12);
+        assert_eq!(settle_deadline(t, t0, d), t);
+        // 防抖很长时上限是它的 5 倍
+        assert_eq!(max_settle(Duration::from_secs(5)), Duration::from_secs(25));
+        assert_eq!(max_settle(Duration::ZERO), Duration::from_secs(10));
+    }
 }
