@@ -303,8 +303,49 @@ pub struct Config {
     pub update: UpdateConfig,
 }
 
-/// 把一节配置改回默认值。
-type Repair = fn(&mut RawConfig, &RawConfig);
+/// 把一节配置从第二个参数复制到第一个参数。
+type CopySection = fn(&mut RawConfig, &RawConfig);
+
+/// 读取配置文件的结果（见 [`Config::load_recovering`]）。
+#[derive(Debug)]
+pub enum Loaded {
+    /// 配置文件正常。
+    Ok(Config),
+    /// 配置文件有误，已改用最近一次有效的配置；原文件另存在 `broken`（另存失败或读不了时为 None）。
+    LastGood { cfg: Config, error: String, broken: Option<PathBuf> },
+    /// 配置文件有误，也没有可用的最近有效配置。
+    Failed { error: String, broken: Option<PathBuf> },
+}
+
+/// 最近一次有效配置的副本：每次保存、每次成功读取后更新，配置文件损坏时用它恢复保护。
+pub fn last_good_path(path: &Path) -> PathBuf {
+    sibling(path, "last-good")
+}
+
+/// 无法解析的配置文件另存的位置（之后保存设置会覆盖原文件，这里留一份供用户找回）。
+pub fn broken_path(path: &Path) -> PathBuf {
+    sibling(path, "broken")
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.toml".into());
+    path.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// 时间类设置的上限。
+pub const MAX_INTERVAL_SECS: u64 = 7 * 86400;
+pub const MAX_TIMEOUT_SECS: u64 = 600;
+pub const MAX_DEBOUNCE_MS: u64 = 600_000;
+pub const MAX_LEAK_INTERVAL_MINS: u64 = 30 * 24 * 60;
+
+fn clamp_field(name: &str, v: u64, max: u64) -> u64 {
+    if v > max {
+        log::warn!("{name} = {v} 超出范围，按上限 {max} 处理");
+        max
+    } else {
+        v
+    }
+}
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -313,8 +354,66 @@ impl Config {
         Self::parse_lenient(&text).with_context(|| format!("配置文件 {} 有误", path.display()))
     }
 
+    /// 读取配置文件；读取失败或内容有误时改用最近一次有效的配置（[`last_good_path`]），
+    /// 无法解析的原文件另存为 [`broken_path`]。没有可用的最近有效配置时返回 `Err`（调用方决定怎么退回）。
+    ///
+    /// 成功读取后顺便更新最近有效配置。
+    pub fn load_recovering(path: &Path) -> Loaded {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                // 读不了（权限、I/O 错误）：内容未必有问题，不另存，只尝试最近有效的配置
+                let error = format!("无法读取配置文件 {}：{e}", path.display());
+                return Self::from_last_good(path, error, None);
+            }
+        };
+        match Self::parse_lenient(&text) {
+            Ok(cfg) => {
+                let private = cfg.has_secrets();
+                if let Err(e) = write_atomic(&last_good_path(path), text.as_bytes(), Some(private).filter(|p| *p)) {
+                    log::warn!("无法更新最近有效配置的副本: {e:#}");
+                }
+                Loaded::Ok(cfg)
+            }
+            Err(e) => {
+                let error = format!("配置文件 {} 有误：{e:#}", path.display());
+                // 原文件可能含令牌等凭据：另存的副本一律只让所有者读写
+                let broken = broken_path(path);
+                let broken = match write_atomic(&broken, text.as_bytes(), Some(true)) {
+                    Ok(()) => Some(broken),
+                    Err(e) => {
+                        log::warn!("无法另存损坏的配置文件: {e:#}");
+                        None
+                    }
+                };
+                Self::from_last_good(path, error, broken)
+            }
+        }
+    }
+
+    fn from_last_good(path: &Path, error: String, broken: Option<PathBuf>) -> Loaded {
+        let good = last_good_path(path);
+        match std::fs::read_to_string(&good).map_err(anyhow::Error::from).and_then(|t| Self::parse_lenient(&t)) {
+            Ok(cfg) => {
+                log::warn!("{error}；已改用最近一次有效的配置 {}", good.display());
+                Loaded::LastGood { cfg, error, broken }
+            }
+            Err(e) => {
+                log::debug!("没有可用的最近有效配置（{}）: {e:#}", good.display());
+                Loaded::Failed { error, broken }
+            }
+        }
+    }
+
+    /// 配置里有凭据（GitHub 令牌、代理地址里的用户名密码）：文件只让所有者读写。
+    pub fn has_secrets(&self) -> bool {
+        !self.update.token.is_empty() || self.detect.proxy.contains('@')
+    }
+
     /// 读取配置文件用：泄露测试、IPv6 查询服务、检查更新这几项与断网保护无关，写错时改用默认值并记日志，
     /// 不让整份配置失效（失效时后台服务会退回默认配置，可能把整个网络断掉）。
+    ///
+    /// 各节分别校验：只把写错的那一节改回默认值，其余各节（包括同样可容错的节）保留用户的设置。
     pub fn parse_lenient(text: &str) -> Result<Self> {
         let mut raw: RawConfig = toml::from_str(text)?;
         let err = match Self::from_raw(raw.clone()) {
@@ -322,21 +421,40 @@ impl Config {
             Err(e) => e,
         };
         let d = RawConfig::default();
-        let repairs: [(&str, Repair); 3] = [
-            ("[leak_test]", |r, d| r.leak_test = d.leak_test.clone()),
-            ("[ipv6] services", |r, d| r.ipv6.services = d.ipv6.services.clone()),
-            ("[update]", |r, d| r.update = d.update.clone()),
+        let sections: [(&str, CopySection); 3] = [
+            ("[leak_test]", |to, from| to.leak_test = from.leak_test.clone()),
+            // 查询服务能不能为空取决于 IPv6 处理方式，一起放进去校验；改回默认值时只改服务
+            ("[ipv6] services", |to, from| {
+                to.ipv6.mode = from.ipv6.mode;
+                to.ipv6.services = from.ipv6.services.clone();
+            }),
+            ("[update]", |to, from| to.update = from.update.clone()),
         ];
         let mut fixed = Vec::new();
-        for (name, repair) in repairs {
-            repair(&mut raw, &d);
-            fixed.push(name);
-            if let Ok(c) = Self::from_raw(raw.clone()) {
-                log::warn!("配置有误（{err:#}）：{} 改用默认值", fixed.join("、"));
-                return Ok(c);
+        for (name, copy) in sections {
+            // 只带这一节的默认配置：校验不过就是这一节写错了
+            let mut probe = d.clone();
+            copy(&mut probe, &raw);
+            if let Err(e) = Self::from_raw(probe) {
+                if name == "[ipv6] services" {
+                    raw.ipv6.services = d.ipv6.services.clone();
+                } else {
+                    copy(&mut raw, &d);
+                }
+                fixed.push(format!("{name}（{e:#}）"));
             }
         }
-        Err(err)
+        if fixed.is_empty() {
+            return Err(err);
+        }
+        match Self::from_raw(raw) {
+            Ok(c) => {
+                log::warn!("配置有误，以下各项改用默认值，其余设置保留：{}", fixed.join("；"));
+                Ok(c)
+            }
+            // 其他节（与保护有关的）也有错：报告最初的错误
+            Err(_) => Err(err),
+        }
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -378,12 +496,19 @@ impl Config {
             bail!("超时时间必须大于 0");
         }
         let mut detect = raw.detect;
+        // 时间类设置的上限：过大的值换算或与时钟相加时会溢出。超出时取上限（不让保护相关的配置因此失效），
+        // 0 表示关闭的项保持可用
+        detect.interval_secs = clamp_field("[detect] interval_secs", detect.interval_secs, MAX_INTERVAL_SECS);
+        detect.timeout_secs = clamp_field("[detect] timeout_secs", detect.timeout_secs, MAX_TIMEOUT_SECS);
+        let mut behavior = raw.behavior;
+        behavior.debounce_ms = clamp_field("[behavior] debounce_ms", behavior.debounce_ms, MAX_DEBOUNCE_MS);
         detect.services.retain(|s| !s.trim().is_empty());
         detect.proxy = detect.proxy.trim().to_owned();
         if !detect.proxy.is_empty() {
             ureq::Proxy::new(&detect.proxy).with_context(|| format!("检测代理地址有误: {:?}", detect.proxy))?;
         }
         let mut leak_test = raw.leak_test;
+        leak_test.interval_mins = clamp_field("[leak_test] interval_mins", leak_test.interval_mins, MAX_LEAK_INTERVAL_MINS);
         leak_test.trusted_dns = leak_test
             .trusted_dns
             .iter()
@@ -421,6 +546,7 @@ impl Config {
             }
         }
         vpn.interfaces = names;
+        vpn.check_interval_secs = clamp_field("[vpn] check_interval_secs", vpn.check_interval_secs, MAX_INTERVAL_SECS);
         let mut ipv6 = raw.ipv6;
         ipv6.services.retain(|s| !s.trim().is_empty());
         if ipv6.mode == Ipv6Mode::Check && ipv6.services.is_empty() {
@@ -436,7 +562,7 @@ impl Config {
             whitelist,
             apps: raw.apps,
             detect,
-            behavior: raw.behavior,
+            behavior,
             ui: raw.ui,
             children: raw.children,
             block_all,
@@ -484,8 +610,13 @@ impl Config {
             "# egress-guard 配置（由程序保存，说明见 config.example.toml）\n\n{}",
             toml::to_string_pretty(&self.to_raw())?
         );
-        let private = !self.update.token.is_empty();
-        write_atomic(path, text.as_bytes(), Some(private).filter(|p| *p))
+        let private = self.has_secrets();
+        write_atomic(path, text.as_bytes(), Some(private).filter(|p| *p))?;
+        // 刚保存的是校验过的配置：同时更新最近有效配置的副本（失败不影响保存本身）
+        if let Err(e) = write_atomic(&last_good_path(path), text.as_bytes(), Some(private).filter(|p| *p)) {
+            log::warn!("无法更新最近有效配置的副本: {e:#}");
+        }
+        Ok(())
     }
 
     /// 出口 IP 是否命中白名单。
@@ -499,12 +630,18 @@ impl Config {
 /// 任何一步失败时删除临时文件，原文件保持不变。
 ///
 /// `private = Some(true)`：只让所有者读写（Unix 上临时文件创建时就是 0600；Windows 上设置受保护的 ACL）。
-/// 否则 Unix 上沿用原文件的权限（没有原文件时为 0644）。
+/// 否则 Unix 上沿用原文件的权限（显式设置，不受进程 umask 影响）；没有原文件时按 0644 创建，受 umask 约束。
 pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<()> {
     use std::io::Write;
     let private = private.unwrap_or(false);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    // 原文件（普通文件）的权限：替换后保持不变
+    #[cfg(unix)]
+    let keep_mode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).ok().filter(|m| m.is_file()).map(|m| m.mode() & 0o777)
+    };
     let mut tmp = None;
     for i in 0..100u32 {
         let candidate = dir.join(format!(".{name}.tmp-{}-{i}", std::process::id()));
@@ -512,12 +649,9 @@ pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<(
         opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            let mode = if private {
-                0o600
-            } else {
-                std::fs::metadata(path).map(|m| m.mode() & 0o777).unwrap_or(0o644)
-            };
+            use std::os::unix::fs::OpenOptionsExt;
+            // 创建时最多给到原文件的权限（umask 只会再去掉一些），写入前再显式恢复成原文件的权限
+            let mode = if private { 0o600 } else { keep_mode.unwrap_or(0o644) };
             opts.mode(mode);
         }
         match opts.open(&candidate) {
@@ -532,10 +666,15 @@ pub fn write_atomic(path: &Path, data: &[u8], private: Option<bool>) -> Result<(
     let Some((tmp_path, mut f)) = tmp else { bail!("无法在 {} 创建临时文件", dir.display()) };
     let result = (|| -> Result<()> {
         #[cfg(unix)]
-        if private {
-            // umask 只会去掉权限，不会加；再确认一次
+        {
             use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            if private {
+                // umask 只会去掉权限，不会加；再确认一次
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            } else if let Some(mode) = keep_mode {
+                // 通过已打开的文件设置，不受 umask 影响：替换后与原文件相同
+                f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
         }
         #[cfg(windows)]
         if private {
@@ -722,6 +861,125 @@ apps = ['C:\Program Files\App\app.exe']
     }
 
     #[test]
+    fn lenient_repairs_only_the_broken_section() {
+        // 只写错更新仓库：泄露测试和 IPv6 查询服务的自定义设置都保留
+        let text = "whitelist=[\"203.0.113.0/24\"]\n[leak_test]\ntrusted_dns=[\"1.1.1.1\"]\nauto=true\n\
+                    [ipv6]\nmode=\"check\"\nservices=[\"https://v6.example.org/\"]\n[update]\nrepo=\"bad repo\"";
+        let c = Config::parse_lenient(text).unwrap();
+        assert_eq!(c.leak_test.trusted_dns, vec!["1.1.1.1"]);
+        assert!(c.leak_test.auto);
+        assert_eq!(c.ipv6.mode, Ipv6Mode::Check);
+        assert_eq!(c.ipv6.services, vec!["https://v6.example.org/"]);
+        assert_eq!(c.update.repo, UpdateConfig::default().repo);
+
+        // 两节分别写错：各自改回默认值，第三节保留
+        let text = "whitelist=[\"203.0.113.0/24\"]\n[leak_test]\nstun_servers=[\"stun.example.org\"]\nauto=true\n\
+                    [ipv6]\nmode=\"check\"\nservices=[\"https://v6.example.org/\"]\n[update]\nrepo=\"bad repo\"";
+        let c = Config::parse_lenient(text).unwrap();
+        assert_eq!(c.leak_test, LeakTestConfig::default());
+        assert_eq!(c.ipv6.services, vec!["https://v6.example.org/"]);
+        assert_eq!(c.update.repo, UpdateConfig::default().repo);
+
+        // 检测 IPv6 出口却没有查询服务：只补上默认服务，处理方式保持「检测」
+        let text = "whitelist=[\"203.0.113.0/24\"]\n[leak_test]\nauto=true\n[ipv6]\nmode=\"check\"\nservices=[]";
+        let c = Config::parse_lenient(text).unwrap();
+        assert_eq!(c.ipv6.mode, Ipv6Mode::Check);
+        assert_eq!(c.ipv6.services, Ipv6Config::default().services);
+        assert!(c.leak_test.auto);
+
+        // 可容错的节之外也有错：整份配置报错（保护相关的设置不能悄悄改掉）
+        let text = "whitelist=[\"not-an-ip\"]\n[update]\nrepo=\"bad repo\"";
+        assert!(Config::parse_lenient(text).is_err());
+        let text = "whitelist=[\"203.0.113.0/24\"]\napps=['relative.exe']\n[update]\nrepo=\"bad repo\"";
+        assert!(Config::parse_lenient(text).is_err());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn broken_config_falls_back_to_last_good() {
+        let dir = temp_dir("lastgood");
+        let path = dir.join("config.toml");
+        // 首次启动：没有任何文件
+        assert!(matches!(Config::load_recovering(&path), Loaded::Failed { broken: None, .. }));
+
+        // 保存过一次有效配置后，配置文件被写坏
+        let mut cfg = Config::parse(SAMPLE).unwrap();
+        cfg.block_all.enabled = true;
+        cfg.save(&path).unwrap();
+        assert!(last_good_path(&path).exists());
+        let bad = "whitelist=[\"not-an-ip\"]\n# 用户写坏的文件\n";
+        std::fs::write(&path, bad).unwrap();
+        match Config::load_recovering(&path) {
+            Loaded::LastGood { cfg: c, error, broken } => {
+                assert_eq!(c.apps, cfg.apps);
+                assert!(c.block_all.enabled);
+                assert!(error.contains("有误"), "{error}");
+                // 原文件另存一份，保存设置之后也能找回
+                assert_eq!(std::fs::read_to_string(broken.unwrap()).unwrap(), bad);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 读不了配置文件（这里用目录代替）：不另存，照样用最近有效的配置
+        let odd = dir.join("dir.toml");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::copy(last_good_path(&path), last_good_path(&odd)).unwrap();
+        assert!(matches!(Config::load_recovering(&odd), Loaded::LastGood { broken: None, .. }));
+
+        // 没有最近有效配置时报告失败（调用方按平台的安全方式退回）
+        std::fs::remove_file(last_good_path(&path)).unwrap();
+        assert!(matches!(Config::load_recovering(&path), Loaded::Failed { broken: Some(_), .. }));
+
+        // 正常读取会刷新最近有效配置（包括手工编辑的有效配置）
+        std::fs::write(&path, SAMPLE).unwrap();
+        assert!(matches!(Config::load_recovering(&path), Loaded::Ok(_)));
+        assert_eq!(std::fs::read_to_string(last_good_path(&path)).unwrap(), SAMPLE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgraded_090_config_loads_and_records_last_good() {
+        // 0.9.0 保存的配置：有 auto_after_change、interval_mins，没有 auto、ipv6、proxy
+        let dir = temp_dir("upgrade");
+        let path = dir.join("my config 配置.toml");
+        let text = format!("{SAMPLE}\n[leak_test]\nauto_after_change=true\ninterval_mins=60\n[vpn]\nguard=true\n");
+        std::fs::write(&path, &text).unwrap();
+        let Loaded::Ok(c) = Config::load_recovering(&path) else { panic!() };
+        assert_eq!(c.apps.len(), 1);
+        assert!(!c.leak_test.auto);
+        assert_eq!(std::fs::read_to_string(last_good_path(&path)).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_time_settings_are_clamped() {
+        let text = format!(
+            "{SAMPLE}\n[detect]\ninterval_secs={max}\ntimeout_secs={max}\n[behavior]\ndebounce_ms={max}\n\
+             [vpn]\ncheck_interval_secs={max}\n[leak_test]\ninterval_mins={max}",
+            max = u64::MAX
+        );
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.detect.interval_secs, MAX_INTERVAL_SECS);
+        assert_eq!(c.detect.timeout_secs, MAX_TIMEOUT_SECS);
+        assert_eq!(c.behavior.debounce_ms, MAX_DEBOUNCE_MS);
+        assert_eq!(c.vpn.check_interval_secs, MAX_INTERVAL_SECS);
+        assert_eq!(c.leak_test.interval_mins, MAX_LEAK_INTERVAL_MINS);
+        // 上限换算成时刻也不会溢出
+        let now = std::time::Instant::now();
+        assert!(now.checked_add(std::time::Duration::from_secs(MAX_INTERVAL_SECS)).is_some());
+        assert!(now.checked_add(std::time::Duration::from_secs(MAX_LEAK_INTERVAL_MINS * 60)).is_some());
+        // 0 表示关闭的项保持可用
+        let c = Config::parse(&format!("{SAMPLE}\n[vpn]\ncheck_interval_secs=0\n[leak_test]\ninterval_mins=0")).unwrap();
+        assert_eq!((c.vpn.check_interval_secs, c.leak_test.interval_mins), (0, 0));
+    }
+
+    #[test]
     fn new_sections() {
         let cfg = Config::parse(SAMPLE).unwrap();
         assert!(cfg.vpn.guard && cfg.vpn.interfaces.is_empty());
@@ -772,6 +1030,15 @@ apps = ['C:\Program Files\App\app.exe']
             cfg.save(&path).unwrap();
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
             assert!(std::fs::read_to_string(&path).unwrap().contains("ghp_secret"));
+            // 最近有效配置的副本同样只有所有者能读写
+            assert_eq!(std::fs::metadata(last_good_path(&path)).unwrap().permissions().mode() & 0o777, 0o600);
+            // 代理地址里带用户名密码时也一样
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mut with_proxy = cfg.clone();
+            with_proxy.update.token.clear();
+            with_proxy.detect.proxy = "http://user:pass@127.0.0.1:8080".into();
+            with_proxy.save(&path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
             // 没有令牌时沿用原来的权限
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
             cfg.update.token.clear();

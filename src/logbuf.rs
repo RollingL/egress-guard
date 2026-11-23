@@ -103,9 +103,32 @@ fn local_now() -> (u32, u32, u32, u32, u32, u32) {
     )
 }
 
-#[cfg(not(windows))]
+/// macOS 等 Unix：按系统时区（/etc/localtime，launchd 启动的后台服务也一样）换算。
+#[cfg(unix)]
 fn local_now() -> (u32, u32, u32, u32, u32, u32) {
-    // 非 Windows 仅用于开发测试，显示 UTC
+    let t: libc::time_t = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return utc_now();
+    }
+    (
+        (tm.tm_year + 1900) as u32,
+        (tm.tm_mon + 1) as u32,
+        tm.tm_mday as u32,
+        tm.tm_hour as u32,
+        tm.tm_min as u32,
+        tm.tm_sec as u32,
+    )
+}
+
+#[cfg(not(any(windows, unix)))]
+fn local_now() -> (u32, u32, u32, u32, u32, u32) {
+    utc_now()
+}
+
+/// UTC 时间（取不到本地时区时退回）。
+#[cfg(not(windows))]
+fn utc_now() -> (u32, u32, u32, u32, u32, u32) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -130,4 +153,25 @@ fn local_now() -> (u32, u32, u32, u32, u32, u32) {
         (rem % 3600 / 60) as u32,
         (rem % 60) as u32,
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// 本地时间 = UTC + 系统时区的偏移（以前非 Windows 直接显示 UTC，却称本地时间）。
+    #[test]
+    fn local_time_follows_system_timezone() {
+        let t: libc::time_t = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        assert!(!unsafe { libc::localtime_r(&t, &mut tm) }.is_null());
+        let off = tm.tm_gmtoff as i64;
+        let (_, _, _, lh, lm, _) = local_now();
+        let (_, _, _, uh, um, _) = utc_now();
+        let local = (lh * 60 + lm) as i64;
+        let utc = (uh * 60 + um) as i64;
+        let diff = (local - utc - off / 60).rem_euclid(24 * 60);
+        // 两次取时间之间可能跨过一分钟
+        assert!(diff == 0 || diff == 1 || diff == 24 * 60 - 1, "local {lh}:{lm} utc {uh}:{um} off {off}");
+    }
 }

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText};
 
-use crate::config::{parse_net, Appearance, ChildMode, Config, FailMode, Ipv6Mode, RawConfig};
+use crate::config::{self, parse_net, Appearance, ChildMode, Config, FailMode, Ipv6Mode, RawConfig};
 use crate::discovery::Source;
 use crate::engine::{self, Status};
 use crate::eventlog::Kind;
@@ -211,11 +211,26 @@ struct App {
 
 pub fn run(opts: Options) -> Result<()> {
     let (cfg, load_error) = if opts.config_path.exists() {
-        match Config::load(&opts.config_path) {
-            Ok(c) => (c, None),
-            Err(e) => {
-                log::error!("{e:#}");
-                (Config::from_raw(RawConfig::default())?, Some(format!("{e:#}")))
+        let saved_as = |broken: &Option<std::path::PathBuf>| match broken {
+            Some(b) => format!("原文件已另存为 {}。", b.display()),
+            None => String::new(),
+        };
+        match Config::load_recovering(&opts.config_path) {
+            config::Loaded::Ok(c) => (c, None),
+            config::Loaded::LastGood { cfg: c, error, broken } => {
+                let msg = format!(
+                    "已改用最近一次有效的配置（受控应用、白名单等与上次成功保存时相同）。{}检查各项设置后点「保存并应用」，会覆盖有误的文件。{error}",
+                    saved_as(&broken)
+                );
+                (c, Some(msg))
+            }
+            config::Loaded::Failed { error: e, broken } => {
+                log::error!("{e}");
+                let msg = format!(
+                    "没有可用的最近有效配置，当前按默认设置运行：没有受控应用，也没有开启全局断网，出口不在白名单时不会拦截任何连接。{}请检查各项设置后点「保存并应用」。{e}",
+                    saved_as(&broken)
+                );
+                (Config::from_raw(RawConfig::default())?, Some(msg))
             }
         }
     } else {
@@ -1238,15 +1253,16 @@ impl App {
         theme::page_title(ui, p, "概览", text::OVERVIEW_SUB);
 
         if let Some(e) = self.backend.config_error() {
-            warning_card(
-                ui,
-                p,
-                "后台服务的配置文件有误",
-                &format!("为安全起见，后台服务正按默认设置运行并开启了全局断网。检查各项设置后点「保存并应用」，会覆盖损坏的文件。{e}"),
-            );
+            // 0.9.3 起后台服务给出完整说明；更早的服务只给错误本身
+            let body = if e.starts_with("后台服务") || e.starts_with("为安全起见") {
+                e
+            } else {
+                format!("为安全起见，后台服务正按默认设置运行并开启了全局断网。检查各项设置后点「保存并应用」，会覆盖损坏的文件。{e}")
+            };
+            warning_card(ui, p, "后台服务的配置文件有误", &body);
             ui.add_space(4.0);
         } else if let Some(e) = &self.load_error {
-            warning_card(ui, p, "配置文件读取失败", &format!("当前使用默认设置，保存会覆盖原文件。{e}"));
+            warning_card(ui, p, "配置文件有误", e);
             ui.add_space(4.0);
         }
         self.service_card(ui, p);
