@@ -27,7 +27,8 @@ pub enum Event {
     /// 立即检测一次出口 IP。
     CheckNow,
     /// 应用新配置。
-    Reconfigure(Box<Config>),
+    /// 应用新配置；第二项是保存时分配的配置版本（单调递增），应用后写入 [`Status::config_version`]。
+    Reconfigure(Box<Config>, u64),
     /// 退出（移除全部阻断规则）。
     Shutdown,
     /// 内部：检测线程返回结果。
@@ -90,6 +91,10 @@ pub struct Status {
     pub running: bool,
     /// 自动识别到、一并阻断的关联程序。
     pub extra_apps: Vec<ExtraApp>,
+    /// 引擎已经处理到的配置版本（界面保存后据此判断规则是否已应用）。
+    pub config_version: u64,
+    /// 应用这个版本的配置时出错（配置已保存，但规则没有按它更新）。
+    pub config_apply_error: Option<String>,
 }
 
 pub type Reporter = Arc<dyn Fn(&Status) + Send + Sync>;
@@ -102,6 +107,11 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub fn send(&self, e: Event) {
         let _ = self.tx.send(e);
+    }
+
+    /// 发送事件；引擎已经停止时返回错误。
+    pub fn try_send(&self, e: Event) -> Result<()> {
+        self.tx.send(e).map_err(|_| anyhow!("引擎已经停止"))
     }
 
     pub fn sender(&self) -> Sender<Event> {
@@ -155,13 +165,15 @@ fn run(
 ) -> Result<()> {
     let mut status = Status { running: true, per_app: true, ..Default::default() };
 
-    // 网卡变化监听，需在整个循环期间保持存活
-    let _watcher = start_netwatch(tx.clone());
+    // 网卡变化监听，需在整个循环期间保持存活；注册失败时稍后重试（见下面的 recover）
+    let mut watcher = start_netwatch(tx.clone());
     // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
     // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
     let mut adapters: Vec<Adapter> = vpn::scan().unwrap_or_default();
-    let mut guarded: Vec<String> = Vec::new();
+    // 守护中的 VPN 网卡（名称 + 稳定标识）与上一次看到的 VPN 网卡（含地址，用来发现同名换址）
+    let mut guarded: Vec<vpn::Link> = Vec::new();
+    let mut vpn_links: Vec<vpn::Link> = vpn::links(&adapters, &cfg.vpn);
 
     let fw: Box<dyn Firewall> = if dry_run {
         status.simulated = true;
@@ -175,9 +187,10 @@ fn run(
                 return Err(e);
             }
             Err(e) => {
-                log::error!("拦截引擎不可用，进入模拟模式: {e:#}");
+                log::error!("拦截引擎不可用，暂时进入模拟模式，稍后重试: {e:#}");
                 status.simulated = true;
                 status.backend_error = Some(format!("{e:#}"));
+                // 启动时先阻断的设置照样记下，后端恢复时按它提交
                 Box::new(DryRunFirewall::default())
             }
         }
@@ -226,6 +239,9 @@ fn run(
     let mut after_change = false;
     // 规则同步失败或有程序暂未加上规则时，定时重试
     let mut next_retry: Option<Instant> = None;
+    // 拦截后端打开失败（不是用户要求的模拟）、网卡变化监听注册失败时，按退避间隔重新尝试
+    let mut backend_retry = Backoff::new(!dry_run && status.simulated && cfg!(any(windows, target_os = "macos")));
+    let mut watch_retry = Backoff::new(watcher.is_none() && cfg!(any(windows, target_os = "macos")));
 
     let start_check = |checking: &mut bool, detector: &Arc<Detectors>, generation: u64| {
         if *checking {
@@ -246,13 +262,13 @@ fn run(
     macro_rules! check_vpn {
         () => {{
             let cfg_vpn = &ctrl.config().vpn;
-            let connected = vpn::connected(&adapters, cfg_vpn);
-            status.vpn_connected = connected.clone();
+            vpn_links = vpn::links(&adapters, cfg_vpn);
+            status.vpn_connected = vpn::names(&vpn_links);
             let mut blocked_now = false;
             if ctrl.wants_block() || !cfg_vpn.guard {
                 guarded.clear();
             } else {
-                let lost = vpn::lost(&guarded, &connected);
+                let lost = vpn::lost(&guarded, &vpn_links);
                 if !lost.is_empty() {
                     let reason = format!("VPN 断开（{}）", lost.join("、"));
                     // 阻断失败时控制器记着目标和原因，每 5 秒重试，直到生效或被新的检测结果取代
@@ -268,7 +284,7 @@ fn run(
     }
 
     update_status(&mut status, &ctrl, checking);
-    status.vpn_connected = vpn::connected(&adapters, &ctrl.config().vpn);
+    status.vpn_connected = vpn::names(&vpn_links);
     reporter(&status);
 
     loop {
@@ -277,7 +293,8 @@ fn run(
         } else {
             next_retry = None;
         }
-        let deadline = [next_check, debounce_until, next_retry].into_iter().flatten().min();
+        let deadline =
+            [next_check, debounce_until, next_retry, backend_retry.at, watch_retry.at].into_iter().flatten().min();
         let event = match deadline {
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -309,7 +326,7 @@ fn run(
                 next_check = None;
                 start_check(&mut checking, &detector, generation);
             }
-            Ok(Event::Reconfigure(new_cfg)) => {
+            Ok(Event::Reconfigure(new_cfg, version)) => {
                 log::info!(
                     "应用新配置：受控应用 {} 个，白名单 {} 条",
                     new_cfg.apps.len(),
@@ -323,15 +340,21 @@ fn run(
                     *w = WatchSettings::from_config(&new_cfg, watch_version);
                     w.clear_learned = clear;
                 }
-                if let Err(e) = ctrl.reconfigure(*new_cfg) {
-                    log::error!("应用新配置失败: {e:#}");
-                }
+                status.config_version = version;
+                status.config_apply_error = match ctrl.reconfigure(*new_cfg) {
+                    Ok(()) => None,
+                    Err(e) => {
+                        log::error!("应用新配置失败: {e:#}");
+                        Some(format!("{e:#}"))
+                    }
+                };
                 // 守护的网卡设置可能变了：不再算 VPN 的网卡不再守护（而不是当作断开）
-                status.vpn_connected = vpn::connected(&adapters, &ctrl.config().vpn);
+                vpn_links = vpn::links(&adapters, &ctrl.config().vpn);
+                status.vpn_connected = vpn::names(&vpn_links);
                 if !ctrl.config().vpn.guard {
                     guarded.clear();
                 }
-                guarded.retain(|g| status.vpn_connected.contains(g));
+                guarded.retain(|g| vpn_links.iter().any(|l| l.same(g)));
                 generation += 1;
                 next_check = None;
                 start_check(&mut checking, &detector, generation);
@@ -348,9 +371,9 @@ fn run(
             }
             Ok(Event::Adapters(a)) => {
                 adapters = a;
-                let before = status.vpn_connected.clone();
-                // VPN 网卡有增减时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废
-                if check_vpn!() || status.vpn_connected != before {
+                let before = vpn_links.clone();
+                // VPN 网卡有增减、被重建或换了地址时（包括阻断期间），正在进行的检测可能是在旧网络上测的，一律作废
+                if check_vpn!() || vpn_links != before {
                     // 等网络安静下来再重新检测（VPN 可能正在重连）
                     generation += 1;
                     next_check = None;
@@ -367,9 +390,9 @@ fn run(
                     status.last_check = Some(logbuf::now_hms());
                     // 放行时记下正在使用的 VPN 网卡，之后它一断开就立即阻断
                     let vcfg = &ctrl.config().vpn;
-                    guarded = if !ctrl.is_blocked() && vcfg.guard { vpn::connected(&adapters, vcfg) } else { Vec::new() };
-                    if !guarded.is_empty() && status.vpn_guarded != guarded {
-                        log::info!("VPN 守护：{}", guarded.join("、"));
+                    guarded = if !ctrl.is_blocked() && vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
+                    if !guarded.is_empty() && status.vpn_guarded != vpn::names(&guarded) {
+                        log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                     }
                     let mut interval = Duration::from_secs(ctrl.config().detect.interval_secs);
                     // 通过 VPN 放行期间检测得更勤：VPN 服务器那一侧换了出口、本机网卡又没有变化时也能尽快发现
@@ -400,6 +423,39 @@ fn run(
                     next_check = None;
                     start_check(&mut checking, &detector, generation);
                 }
+                if backend_retry.due(now) {
+                    match open_backend(ctrl.config(), tx.clone()) {
+                        Ok(fw) => {
+                            backend_retry.done();
+                            log::info!("拦截引擎已恢复，退出模拟模式");
+                            status.simulated = false;
+                            status.backend_error = None;
+                            if let Err(e) = ctrl.replace_firewall(fw) {
+                                log::error!("{e:#}");
+                            }
+                            // 模拟期间的检测不算数：重新检测
+                            generation += 1;
+                            next_check = None;
+                            start_check(&mut checking, &detector, generation);
+                        }
+                        Err(e) => {
+                            let wait = backend_retry.failed();
+                            log::warn!("拦截引擎仍不可用，{} 秒后再试: {e:#}", wait.as_secs());
+                            status.backend_error = Some(format!("{e:#}"));
+                        }
+                    }
+                }
+                if watch_retry.due(now) {
+                    watcher = start_netwatch(tx.clone());
+                    if watcher.is_some() {
+                        watch_retry.done();
+                        log::info!("网卡变化监听已恢复");
+                        // 监听中断期间可能错过了变化：按网络变化处理
+                        let _ = tx.send(Event::NetworkChanged);
+                    } else {
+                        watch_retry.failed();
+                    }
+                }
                 if next_retry.is_some_and(|d| d <= now) {
                     next_retry = None;
                     let was_blocked = ctrl.is_blocked();
@@ -409,9 +465,9 @@ fn run(
                     // 重试让放行生效了：与检测后直接放行一样，开始守护正在使用的 VPN 网卡、按守护间隔检测
                     if was_blocked && !ctrl.is_blocked() {
                         let vcfg = &ctrl.config().vpn;
-                        guarded = if vcfg.guard { vpn::connected(&adapters, vcfg) } else { Vec::new() };
+                        guarded = if vcfg.guard { vpn::links(&adapters, vcfg) } else { Vec::new() };
                         if !guarded.is_empty() {
-                            log::info!("VPN 守护：{}", guarded.join("、"));
+                            log::info!("VPN 守护：{}", vpn::names(&guarded).join("、"));
                             if vcfg.check_interval_secs > 0 && debounce_until.is_none() {
                                 let soon = later(Duration::from_secs(vcfg.check_interval_secs));
                                 next_check = Some(next_check.map_or(soon, |n| n.min(soon)));
@@ -425,7 +481,7 @@ fn run(
         if ctrl.wants_block() {
             guarded.clear();
         }
-        status.vpn_guarded = guarded.clone();
+        status.vpn_guarded = vpn::names(&guarded);
         status.generation = generation;
         vpn_watch.set_active(!guarded.is_empty());
         update_status(&mut status, &ctrl, checking);
@@ -446,6 +502,37 @@ fn run(
 fn later(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
+}
+
+/// 有上限的指数退避：5 秒起，每次失败加倍，最多 5 分钟。
+struct Backoff {
+    at: Option<Instant>,
+    delay: Duration,
+}
+
+impl Backoff {
+    const FIRST: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(300);
+
+    fn new(active: bool) -> Self {
+        Self { at: active.then(|| later(Self::FIRST)), delay: Self::FIRST }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.at.is_some_and(|t| t <= now)
+    }
+
+    /// 又失败了一次：返回下次重试前等待的时间。
+    fn failed(&mut self) -> Duration {
+        self.delay = (self.delay * 2).min(Self::MAX);
+        self.at = Some(later(self.delay));
+        self.delay
+    }
+
+    fn done(&mut self) {
+        self.at = None;
+        self.delay = Self::FIRST;
+    }
 }
 
 fn update_status(s: &mut Status, ctrl: &Controller, checking: bool) {

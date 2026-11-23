@@ -176,8 +176,8 @@ pub fn install(src_bin: &Path) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     last?;
-    // 立即启动一次（RunAtLoad 关闭时也让保护马上生效）
-    let _ = launchctl(&["kickstart", &target]);
+    // 立即启动一次（RunAtLoad 关闭时也让保护马上生效）；没能启动要告诉调用者
+    launchctl(&["kickstart", &target]).context("后台服务已安装，但没能启动")?;
     println!("后台服务已安装：{}", bin.display());
     Ok(())
 }
@@ -185,14 +185,43 @@ pub fn install(src_bin: &Path) -> Result<()> {
 /// 卸载后台服务（保留配置文件）。需要 root。
 pub fn uninstall() -> Result<()> {
     require_root()?;
-    let _ = launchctl(&["bootout", &format!("system/{DAEMON_LABEL}")]);
-    let _ = std::fs::remove_file(DAEMON_PLIST);
-    if let Err(e) = super::pf::flush_anchor() {
-        log::warn!("{e:#}");
+    let target = format!("system/{DAEMON_LABEL}");
+    let mut problems = Vec::new();
+    // 没有加载时 bootout 也会失败：以之后服务是否还在为准（bootout 是异步的，稍等）
+    let bootout = launchctl(&["bootout", &target]);
+    let mut still_loaded = true;
+    for _ in 0..20 {
+        if launchctl(&["print", &target]).is_err() {
+            still_loaded = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    let _ = std::fs::remove_dir_all(paths::daemon_bin().parent().unwrap_or(Path::new("/nonexistent")));
-    let _ = std::fs::remove_file(SOCKET);
-    let _ = std::fs::remove_file(crate::filterfeed::run_marker(Path::new(SOCKET)));
+    if still_loaded {
+        problems.push(match bootout {
+            Err(e) => format!("后台服务没有停止：{e:#}"),
+            Ok(()) => "后台服务没有停止".into(),
+        });
+    }
+    let remove = |p: &Path, dir: bool| {
+        let r = if dir { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+        match r {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(format!("无法删除 {}：{e}", p.display())),
+            _ => None,
+        }
+    };
+    problems.extend(remove(Path::new(DAEMON_PLIST), false));
+    if let Err(e) = super::pf::flush_anchor() {
+        problems.push(format!("没能移除 pf 规则：{e:#}"));
+    }
+    if let Some(dir) = paths::daemon_bin().parent() {
+        problems.extend(remove(dir, true));
+    }
+    problems.extend(remove(Path::new(SOCKET), false));
+    problems.extend(remove(&crate::filterfeed::run_marker(Path::new(SOCKET)), false));
+    if !problems.is_empty() {
+        bail!("卸载没有全部完成：{}", problems.join("；"));
+    }
     println!("后台服务已卸载；配置保留在 {SUPPORT_DIR}，日志在 {LOG_FILE}");
     Ok(())
 }

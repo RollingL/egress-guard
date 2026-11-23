@@ -16,6 +16,8 @@ pub struct IfAddr {
 pub struct Adapter {
     /// 与 [`IfAddr::name`] 相同。
     pub name: String,
+    /// 稳定标识：Windows 上是网卡 GUID，Unix 上是接口索引。同名网卡被删掉重建时会变。
+    pub id: String,
     /// Windows 上的网卡描述（如「WireGuard Tunnel」「TAP-Windows Adapter V9」）；其他平台为空。
     pub description: String,
     /// Windows 上的接口类型（IF_TYPE_*）；其他平台为 0。
@@ -74,7 +76,10 @@ pub fn try_adapters() -> Option<Vec<Adapter>> {
             let name = CStr::from_ptr(i.ifa_name).to_string_lossy().into_owned();
             match out.iter_mut().find(|a| a.name == name) {
                 Some(a) => a.addrs.push(ip),
-                None => out.push(Adapter { name, description: String::new(), if_type: 0, addrs: vec![ip] }),
+                None => {
+                    let id = libc::if_nametoindex(i.ifa_name).to_string();
+                    out.push(Adapter { name, id, description: String::new(), if_type: 0, addrs: vec![ip] })
+                }
             }
         }
         libc::freeifaddrs(ifap);
@@ -128,6 +133,7 @@ pub fn try_adapters() -> Option<Vec<Adapter>> {
             }
             let mut adapter = Adapter {
                 name: a.FriendlyName.to_string().unwrap_or_default(),
+                id: a.AdapterName.to_string().unwrap_or_default(),
                 description: a.Description.to_string().unwrap_or_default(),
                 if_type: a.IfType,
                 addrs: Vec::new(),

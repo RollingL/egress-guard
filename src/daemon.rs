@@ -25,6 +25,9 @@ struct Daemon {
     raw: Mutex<RawConfig>,
     /// 配置文件读取失败的原因；成功保存一次新配置后清除。
     config_error: Mutex<Option<String>>,
+    /// 配置提交锁和最近分配的配置版本：校验、写盘、更新共享配置、通知引擎在锁内依次完成，
+    /// 两个界面同时保存时，磁盘、共享配置和引擎收到的顺序一致。
+    commit: Mutex<u64>,
 }
 
 impl Handler for Daemon {
@@ -42,14 +45,20 @@ impl Handler for Daemon {
         self.raw.lock().unwrap().clone()
     }
 
-    fn set_config(&self, raw: RawConfig) -> Result<()> {
+    fn set_config(&self, raw: RawConfig) -> Result<u64> {
+        let mut version = self.commit.lock().unwrap();
         let cfg = Config::from_raw(raw)?;
         cfg.save(&self.config_path)?;
+        *version += 1;
         *self.raw.lock().unwrap() = cfg.to_raw();
         *self.config_error.lock().unwrap() = None;
-        log::info!("界面保存了新配置");
-        self.send(Event::Reconfigure(Box::new(cfg)));
-        Ok(())
+        log::info!("界面保存了新配置（版本 {}）", *version);
+        self.tx
+            .lock()
+            .unwrap()
+            .send(Event::Reconfigure(Box::new(cfg), *version))
+            .map_err(|_| anyhow::anyhow!("配置已保存，但引擎已经停止，规则没有更新"))?;
+        Ok(*version)
     }
 
     fn check_now(&self) {
@@ -166,6 +175,7 @@ pub fn run(opts: Options) -> Result<()> {
         log_path: opts.log_path.clone(),
         raw: Mutex::new(cfg.to_raw()),
         config_error: Mutex::new(load_error),
+        commit: Mutex::new(0),
     });
     ipc::serve(listener, daemon, hub);
     // 告诉网络扩展服务在运行。扩展只在这个文件存在时才连接套接字，
@@ -186,4 +196,58 @@ pub fn run(opts: Options) -> Result<()> {
     let _ = std::fs::remove_file(&marker);
     log::info!("后台服务退出");
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 两个界面同时保存：磁盘、共享配置和引擎最后收到的是同一份，版本单调递增；引擎停止时报错。
+    #[test]
+    fn concurrent_saves_stay_in_order() {
+        let dir = std::env::temp_dir().join(format!("egress-guard-daemon-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = Arc::new(Daemon {
+            tx: Mutex::new(tx),
+            config_path: path.clone(),
+            log_path: dir.join("log"),
+            raw: Mutex::new(RawConfig::default()),
+            config_error: Mutex::new(None),
+            commit: Mutex::new(0),
+        });
+        let threads: Vec<_> = (0..2)
+            .map(|t| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        let raw = RawConfig { whitelist: vec![format!("10.{t}.{i}.0/24")], ..Default::default() };
+                        d.set_config(raw).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got: Vec<(Config, u64)> = rx
+            .try_iter()
+            .map(|e| match e {
+                Event::Reconfigure(c, v) => (*c, v),
+                _ => panic!("意外的事件"),
+            })
+            .collect();
+        assert_eq!(got.iter().map(|(_, v)| *v).collect::<Vec<_>>(), (1..=40).collect::<Vec<_>>());
+        let (last, _) = got.last().unwrap();
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(disk.to_raw(), last.to_raw());
+        assert_eq!(*d.raw.lock().unwrap(), last.to_raw());
+        // 引擎停了：配置照样保存，但要报告规则没有更新
+        drop(rx);
+        let raw = RawConfig { whitelist: vec!["192.0.2.0/24".into()], ..Default::default() };
+        let err = d.set_config(raw).unwrap_err();
+        assert!(format!("{err:#}").contains("引擎已经停止"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -170,6 +170,8 @@ struct App {
     remote_error: Option<String>,
     /// (是否成功, 文本, 时间)
     message: Option<(bool, String, Instant)>,
+    /// 刚保存、还没确认规则已按它更新的配置版本。
+    applying: Option<u64>,
     load_error: Option<String>,
     picker: Option<ProcPicker>,
     autostart: bool,
@@ -323,6 +325,7 @@ pub fn run(opts: Options) -> Result<()> {
                 new_remote: String::new(),
                 remote_error: None,
                 message: None,
+                applying: None,
                 load_error,
                 picker: None,
                 hide_on_first_frame: opts.start_minimized,
@@ -426,7 +429,7 @@ fn start_backend(cfg: Config, config_path: &std::path::Path, reporter: engine::R
     let learned = crate::learned_file(config_path);
     crate::eventlog::init(&crate::events_file(config_path));
     let engine = Arc::new(engine::spawn(cfg.clone(), false, false, Some(learned), reporter));
-    (Arc::new(backend::Local { engine, config_path: config_path.to_path_buf() }), cfg)
+    (Arc::new(backend::Local { engine, config_path: config_path.to_path_buf(), commit: Default::default() }), cfg)
 }
 
 #[cfg(target_os = "macos")]
@@ -557,15 +560,41 @@ impl App {
     fn save_and_apply(&mut self) {
         self.sync_services();
         match Config::from_raw(self.draft.clone()).and_then(|cfg| {
-            self.backend.apply(&cfg)?;
-            Ok(cfg)
+            let version = self.backend.apply(&cfg)?;
+            Ok((cfg, version))
         }) {
-            Ok(cfg) => {
+            Ok((cfg, version)) => {
                 self.set_applied(cfg.to_raw());
                 self.load_error = None;
-                self.notify(true, "已保存并生效");
+                if version == 0 {
+                    self.notify(true, "已保存并生效");
+                } else {
+                    // 等引擎处理到这个版本再说结果（poll_applying）
+                    self.applying = Some(version);
+                    self.notify(true, "已保存，正在应用规则…");
+                }
             }
             Err(e) => self.notify(false, format!("保存失败：{e:#}")),
+        }
+    }
+
+    /// 保存后，引擎处理到这个版本时报告规则是否已按新配置更新。
+    fn poll_applying(&mut self) {
+        let Some(version) = self.applying else { return };
+        let s = self.status.lock().unwrap().clone();
+        if s.config_version < version {
+            return;
+        }
+        self.applying = None;
+        if s.config_version > version {
+            // 之后又有一次保存（可能来自另一个界面）：以最新状态为准
+            self.notify(true, "已保存；之后又有新的配置，按最新配置生效");
+        } else if let Some(e) = s.config_apply_error {
+            self.notify(false, format!("已保存，但规则没能按新配置更新：{e}"));
+        } else if let Some(e) = s.apply_error {
+            self.notify(false, format!("已保存，规则还没生效，正在每 5 秒重试：{e}"));
+        } else {
+            self.notify(true, "已保存并生效");
         }
     }
 
@@ -1275,20 +1304,26 @@ impl App {
             warning_card(ui, p, "切换没有生效，正在重试", &format!("{e}。每 5 秒自动重试一次，生效后这条提示会消失。"));
             ui.add_space(4.0);
         }
-        if let (true, Some(e)) = (s.running, &s.degraded) {
-            let title = if cfg!(windows) { "部分拦截规则没能加上" } else { "网络扩展需要更新" };
+        // macOS：网络扩展没连上时只有 pf 全局断网有效（这时由下面的卡片说明，不再重复提示）
+        let no_ext = !s.per_app && s.running && !s.simulated && !self.applied.block_all.enabled;
+        if let (true, Some(e)) = (s.running && (cfg!(windows) || !no_ext), &s.degraded) {
+            let title = if cfg!(windows) { "部分拦截规则没能加上" } else { "网络扩展的规则没有完全生效" };
             warning_card(ui, p, title, e);
             ui.add_space(4.0);
         }
-        // macOS：网络扩展没连上时只有 pf 全局断网有效
-        if !s.per_app && s.running && !s.simulated && !self.applied.block_all.enabled {
+        if no_ext {
             let mut go = None;
             let body = if self.applied.apps.is_empty() {
-                "还没有添加受控应用，全局断网也没有开启：出口 IP 不在白名单时不会拦截任何连接。"
+                "还没有添加受控应用，全局断网也没有开启：出口 IP 不在白名单时不会拦截任何连接。".to_owned()
             } else {
-                "网络扩展没有启用，出口 IP 不在白名单时受控应用不会被断网。可以启用网络扩展，或者开启全局断网。"
+                let v6 = if self.applied.ipv6.mode == Ipv6Mode::Block {
+                    "「始终阻断 IPv6」对受控应用也不会生效。"
+                } else {
+                    ""
+                };
+                format!("网络扩展没有启用，出口 IP 不在白名单时受控应用不会被断网。{v6}可以启用网络扩展，或者开启全局断网。")
             };
-            warning_card_with(ui, p, "按应用断网未生效", body, |ui| {
+            warning_card_with(ui, p, "按应用断网未生效", &body, |ui| {
                 if theme::text_button(ui, p.accent, "全局断网  ›").clicked() {
                     go = Some(Page::Network);
                 }
@@ -2261,6 +2296,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_service_job();
         self.poll_netext(ctx);
+        self.poll_applying();
         // macOS：连上后台服务后以服务里的配置为准（没有未保存的修改时）
         if let Some(raw) = self.backend.take_new_config() {
             if !self.dirty() && raw != self.applied {

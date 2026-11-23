@@ -7,7 +7,7 @@
 //! 系统目录（Windows 的 %WINDIR%，macOS 的 /System、/usr/bin 等）下的程序永远不会被自动加入，
 //! 以免误伤系统组件（例如应用调用 cmd.exe、powershell.exe、conhost.exe 或 /bin/sh）。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -107,19 +107,31 @@ pub struct ProcEntry {
     pub path: String,
 }
 
+/// 一个程序所属的受控应用（规范路径）。同一个辅助程序可以被多个受控应用启动。
+pub type Roots = BTreeSet<String>;
+
 /// 程序（规范路径）属于哪个目标：完全相同，或者位于作为目标的 `.app` 应用包里
 /// （macOS 上受控应用通常是应用包本身，例如 `/Applications/Foo.app`，进程路径是包内的可执行文件）。
-pub fn lookup_target<'a>(norm: &str, targets: &'a HashMap<String, String>) -> Option<&'a String> {
-    if let Some(t) = targets.get(norm) {
-        return Some(t);
+/// 返回目标的键和值。
+pub fn lookup_target<'a, V>(norm: &str, targets: &'a HashMap<String, V>) -> Option<(&'a String, &'a V)> {
+    if let Some(kv) = targets.get_key_value(norm) {
+        return Some(kv);
     }
-    norm.match_indices(".app\\").find_map(|(i, _)| targets.get(&norm[..i + 4]))
+    norm.match_indices(".app\\").find_map(|(i, _)| targets.get_key_value(&norm[..i + 4]))
 }
 
-/// 找出所有“祖先链上有目标进程”且自身不是目标的进程。
+/// 目标本身就是受控应用（而不是识别出来的关联程序）。
+fn is_direct(key: &str, roots: &Roots) -> bool {
+    roots.contains(key)
+}
+
+/// 找出所有“祖先链上有目标进程”的进程，以及最近那个目标祖先所属的受控应用。
 /// `targets`：目标程序的规范路径 → 它所属的受控应用（规范路径）。
+///
+/// 受控应用本身（及其 .app 包里的程序）不算；已经识别过的辅助程序照样返回：
+/// 它可能这次是被另一个受控应用启动的，需要补记这个来源。
 /// 返回 (进程下标, 所属受控应用)。
-pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, String>) -> Vec<(usize, String)> {
+pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> Vec<(usize, Roots)> {
     let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
     let target_of = |p: &ProcEntry| {
         if p.path.is_empty() {
@@ -130,7 +142,7 @@ pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Str
     };
     let mut out = Vec::new();
     for (i, p) in procs.iter().enumerate() {
-        if p.pid <= 4 || target_of(p).is_some() {
+        if p.pid <= 4 || target_of(p).is_some_and(|(k, r)| is_direct(k, r)) {
             continue;
         }
         let mut cur = p;
@@ -146,8 +158,8 @@ pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Str
             {
                 break;
             }
-            if let Some(root) = target_of(parent) {
-                out.push((i, root.clone()));
+            if let Some((_, roots)) = target_of(parent) {
+                out.push((i, roots.clone()));
                 break;
             }
             cur = parent;
@@ -233,12 +245,13 @@ pub struct ExtraApp {
     pub source: Source,
 }
 
-/// 已识别的子进程程序及其所属的受控应用，持久化为文本文件（每行"子程序路径<TAB>受控应用路径"）。
-/// 受控应用被移出配置后，它名下的记录不再生效。
+/// 已识别的子进程程序及其所属的受控应用，持久化为文本文件（每行"子程序路径<TAB>受控应用路径"，
+/// 同一个子程序属于多个受控应用时有多行；与只有一个来源的旧文件兼容）。
+/// 子程序只要还有一个所属应用在配置里就继续生效；全部移出配置后不再生效。
 pub struct Learned {
     file: Option<PathBuf>,
     /// 规范路径 → (原始路径, 所属受控应用的规范路径)
-    map: BTreeMap<String, (PathBuf, String)>,
+    map: BTreeMap<String, (PathBuf, Roots)>,
 }
 
 impl Learned {
@@ -248,20 +261,23 @@ impl Learned {
             for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
                 // 没有所属应用的旧格式记录直接丢弃
                 if let Some((child, root)) = line.split_once('\t') {
-                    map.insert(normalize(child.trim()), (PathBuf::from(child.trim()), normalize(root.trim())));
+                    map.entry(normalize(child.trim()))
+                        .or_insert_with(|| (PathBuf::from(child.trim()), Roots::new()))
+                        .1
+                        .insert(normalize(root.trim()));
                 }
             }
         }
         Self { file, map }
     }
 
-    /// 新增一项，返回是否为新项。
+    /// 记下"这个子程序属于这个受控应用"，返回是否是新的关系。
     pub fn add(&mut self, path: &Path, root_norm: &str) -> bool {
         let key = normalize_path(path);
-        if self.map.contains_key(&key) {
+        let entry = self.map.entry(key).or_insert_with(|| (path.to_path_buf(), Roots::new()));
+        if !entry.1.insert(root_norm.to_owned()) {
             return false;
         }
-        self.map.insert(key, (path.to_path_buf(), root_norm.to_owned()));
         self.save();
         true
     }
@@ -272,17 +288,20 @@ impl Learned {
     }
 
     /// (规范路径, 原始路径, 所属受控应用的规范路径)
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &PathBuf, &String)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &PathBuf, &Roots)> {
         self.map.iter().map(|(k, (p, r))| (k, p, r))
     }
 
     fn save(&self) {
         let Some(f) = &self.file else { return };
         let mut text = String::from("# egress-guard 自动识别的子进程程序：子程序路径<TAB>所属受控应用（可删除此文件以清空）\n");
-        for (p, root) in self.map.values() {
-            text.push_str(&format!("{}\t{}\n", p.to_string_lossy(), root));
+        for (p, roots) in self.map.values() {
+            for root in roots {
+                text.push_str(&format!("{}\t{}\n", p.to_string_lossy(), root));
+            }
         }
-        if let Err(e) = std::fs::write(f, text) {
+        // 原子替换：写到一半崩溃不会留下截断的记录
+        if let Err(e) = crate::config::write_atomic(f, text.as_bytes(), None) {
             log::warn!("无法保存子进程记录 {}: {e}", f.display());
         }
     }
@@ -334,15 +353,15 @@ pub fn spawn(
         .expect("无法创建子进程识别线程");
 }
 
-/// 扫描受控应用所在目录（include_app_dir 开启时）。返回 (exe, 所属受控应用规范路径)。
-fn scan_app_dirs(s: &WatchSettings, system_dirs: &[String]) -> Vec<(PathBuf, String)> {
+/// 扫描受控应用所在目录（include_app_dir 开启时）。返回 (exe, 所属受控应用规范路径)；
+/// 几个受控应用在同一个目录里时，目录下的程序同时属于它们。
+fn scan_app_dirs(s: &WatchSettings, system_dirs: &[String]) -> Vec<(PathBuf, Roots)> {
     let mut out = Vec::new();
     if !s.include_app_dir {
         return out;
     }
-    let mut seen = HashSet::new();
+    let mut dirs: BTreeMap<String, (PathBuf, Roots)> = BTreeMap::new();
     for app in &s.apps {
-        let norm = normalize_path(app);
         let Some(root) = app_scan_root(app, system_dirs) else {
             log::warn!(
                 "目录太宽泛，不整体阻断: {}",
@@ -350,40 +369,43 @@ fn scan_app_dirs(s: &WatchSettings, system_dirs: &[String]) -> Vec<(PathBuf, Str
             );
             continue;
         };
-        if seen.insert(normalize_path(&root)) {
-            // macOS 应用包的辅助程序可能嵌套较深（Frameworks/…/Helpers/…app/Contents/MacOS）
-            out.extend(scan_dir_exes(&root, 12, 1000).into_iter().map(|p| (p, norm.clone())));
-        }
+        dirs.entry(normalize_path(&root)).or_insert_with(|| (root, Roots::new())).1.insert(normalize_path(app));
+    }
+    for (root, owners) in dirs.into_values() {
+        // macOS 应用包的辅助程序可能嵌套较深（Frameworks/…/Helpers/…app/Contents/MacOS）
+        out.extend(scan_dir_exes(&root, 12, 1000).into_iter().map(|p| (p, owners.clone())));
     }
     out
 }
 
-/// 当前生效的目标程序：规范路径 → 所属受控应用。被忽略的、所属应用已不在配置中的记录不计入。
-fn targets(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, String)]) -> HashMap<String, String> {
+/// 当前生效的目标程序：规范路径 → 所属受控应用（只算还在配置里的）。
+/// 被忽略的、所属应用都已不在配置中的记录不计入。
+fn targets(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) -> HashMap<String, Roots> {
     let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
-    let mut t: HashMap<String, String> = HashMap::new();
-    for app in &s.apps {
-        let k = normalize_path(app);
-        t.insert(k.clone(), k);
+    let apps: HashSet<String> = s.apps.iter().map(|p| normalize_path(p)).collect();
+    let mut t: HashMap<String, Roots> = HashMap::new();
+    for k in &apps {
+        t.entry(k.clone()).or_default().insert(k.clone());
     }
+    let mut add = |k: &String, roots: &Roots| {
+        let active: Roots = roots.iter().filter(|r| apps.contains(*r)).cloned().collect();
+        if !active.is_empty() && !excluded.contains(k) {
+            t.entry(k.clone()).or_default().extend(active);
+        }
+    };
     if s.mode == ChildMode::Tree {
-        for (k, _, root) in learned.iter() {
-            if t.get(root).is_some_and(|r| r == root) && !excluded.contains(k) {
-                t.entry(k.clone()).or_insert_with(|| root.clone());
-            }
+        for (k, _, roots) in learned.iter() {
+            add(k, roots);
         }
     }
-    for (p, root) in dir_exes {
-        let k = normalize_path(p);
-        if !excluded.contains(&k) {
-            t.entry(k).or_insert_with(|| root.clone());
-        }
+    for (p, roots) in dir_exes {
+        add(&normalize_path(p), roots);
     }
     t
 }
 
 /// 汇总需要额外阻断的程序（去掉已配置的和被忽略的）。
-fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, String)]) -> Vec<ExtraApp> {
+fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) -> Vec<ExtraApp> {
     let t = targets(s, learned, dir_exes);
     let mut seen: HashSet<String> = s.apps.iter().map(|p| normalize_path(p)).collect();
     let mut extra = Vec::new();
@@ -407,6 +429,43 @@ pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, system_di
     collect(s, &learned, &scan_app_dirs(s, system_dirs))
 }
 
+/// 根据一次进程快照记下受控应用（及已识别程序）启动的子程序和它们的来源。
+fn learn_children(
+    s: &WatchSettings,
+    learned: &mut Learned,
+    dir_exes: &[(PathBuf, Roots)],
+    procs: &[ProcEntry],
+    system_dirs: &[String],
+) {
+    let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
+    let t = targets(s, learned, dir_exes);
+    for (i, roots) in descendants_of_targets(procs, &t) {
+        let p = &procs[i];
+        if p.path.is_empty() {
+            continue;
+        }
+        let norm = normalize(&p.path);
+        if is_system_path(&norm, system_dirs) || excluded.contains(&norm) {
+            continue;
+        }
+        // 已经是目标、而且已经属于这个受控应用（例如同目录扫描到的程序）：不用再记
+        let have = lookup_target(&norm, &t).map(|(_, r)| r);
+        let known = have.is_some();
+        for root in &roots {
+            if have.is_some_and(|r| r.contains(root)) {
+                continue;
+            }
+            if learned.add(Path::new(&p.path), root) {
+                if known {
+                    log::info!("{} 也由 {root} 启动，记下这个来源 (PID {})", p.path, p.pid);
+                } else {
+                    log::warn!("识别到受控应用的子进程，加入阻断: {} (PID {})", p.path, p.pid);
+                }
+            }
+        }
+    }
+}
+
 fn run(
     settings: Arc<Mutex<WatchSettings>>,
     learned_file: Option<PathBuf>,
@@ -415,7 +474,7 @@ fn run(
     tx: Sender<Event>,
 ) {
     let mut learned = Learned::load(learned_file);
-    let mut dir_exes: Vec<(PathBuf, String)> = Vec::new();
+    let mut dir_exes: Vec<(PathBuf, Roots)> = Vec::new();
     let mut last_scan: Option<(Instant, u64)> = None;
     let mut last_sent: Option<Vec<ExtraApp>> = None;
 
@@ -444,22 +503,7 @@ fn run(
 
         // 子进程识别
         if s.mode == ChildMode::Tree && !s.apps.is_empty() {
-            let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
-            let t = targets(&s, &learned, &dir_exes);
-            let procs = snapshot();
-            for (i, root) in descendants_of_targets(&procs, &t) {
-                let p = &procs[i];
-                if p.path.is_empty() {
-                    continue;
-                }
-                let norm = normalize(&p.path);
-                if is_system_path(&norm, &system_dirs) || excluded.contains(&norm) || lookup_target(&norm, &t).is_some() {
-                    continue;
-                }
-                if learned.add(Path::new(&p.path), &root) {
-                    log::warn!("识别到受控应用的子进程，加入阻断: {} (PID {})", p.path, p.pid);
-                }
-            }
+            learn_children(&s, &mut learned, &dir_exes, &snapshot(), &system_dirs);
         }
 
         let extra = collect(&s, &learned, &dir_exes);
@@ -493,13 +537,13 @@ mod tests {
             p(600, 500, 60, r"D:\x\deep.exe"),
         ];
         let root = normalize(r"C:\Apps\Foo\foo.exe");
-        let targets: HashMap<String, String> = [(root.clone(), root.clone())].into();
+        let targets: HashMap<String, Roots> = [(root.clone(), [root.clone()].into())].into();
         let found = descendants_of_targets(&procs, &targets);
         let mut pids: Vec<u32> = found.iter().map(|(i, _)| procs[*i].pid).collect();
         pids.sort();
         // 500 路径未知，但创建时间已知，可作为中间节点
         assert_eq!(pids, vec![200, 300, 500, 600]);
-        assert!(found.iter().all(|(_, r)| r == &root));
+        assert!(found.iter().all(|(_, r)| r.len() == 1 && r.contains(&root)));
     }
 
     #[test]
@@ -512,8 +556,8 @@ mod tests {
             p(400, 1, 40, "/Applications/Foo.appx/Contents/MacOS/x"),
         ];
         let root = normalize("/Applications/Foo.app");
-        let targets: HashMap<String, String> = [(root.clone(), root.clone())].into();
-        assert_eq!(lookup_target(&normalize(&procs[1].path), &targets), Some(&root));
+        let targets: HashMap<String, Roots> = [(root.clone(), [root.clone()].into())].into();
+        assert_eq!(lookup_target(&normalize(&procs[1].path), &targets).map(|(k, _)| k), Some(&root));
         assert_eq!(lookup_target(&normalize(&procs[3].path), &targets), None);
         let found = descendants_of_targets(&procs, &targets);
         let pids: Vec<u32> = found.iter().map(|(i, _)| procs[*i].pid).collect();
@@ -525,7 +569,7 @@ mod tests {
         // 父 PID 100 已退出并被一个更晚创建的目标进程复用
         let procs = vec![p(100, 1, 99, r"C:\Apps\Foo\foo.exe"), p(200, 100, 20, r"C:\Other\x.exe")];
         let root = normalize(r"C:\Apps\Foo\foo.exe");
-        let targets: HashMap<String, String> = [(root.clone(), root)].into();
+        let targets: HashMap<String, Roots> = [(root.clone(), [root].into())].into();
         assert!(descendants_of_targets(&procs, &targets).is_empty());
         // 父进程创建时间未知时，也不认定父子关系
         let procs = vec![p(100, 1, 0, r"C:\Apps\Foo\foo.exe"), p(200, 100, 20, r"C:\Other\x.exe")];
@@ -580,7 +624,55 @@ mod tests {
         assert!(!l.add(Path::new(r"c:/a/B.EXE"), "c:\\a\\root.exe"));
         let l2 = Learned::load(Some(f.clone()));
         assert_eq!(l2.iter().count(), 1);
-        assert_eq!(l2.iter().next().unwrap().2, "c:\\a\\root.exe");
+        assert!(l2.iter().next().unwrap().2.contains("c:\\a\\root.exe"));
+        // 同一个子程序还属于另一个受控应用：多一行，重新载入后两个来源都在
+        assert!(l.add(Path::new(r"C:\A\b.exe"), "c:\\other\\two.exe"));
+        let l3 = Learned::load(Some(f.clone()));
+        assert_eq!(l3.iter().next().unwrap().2.len(), 2);
+        assert_eq!(std::fs::read_to_string(&f).unwrap().lines().filter(|l| !l.starts_with('#')).count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 两个独立的受控应用先后启动同一个（在两者目录之外的）辅助程序：两个来源都记下，
+    /// 重启后仍在；移除任一个仍受控，移除最后一个才解除；显式忽略始终有效。
+    #[test]
+    fn shared_helper_keeps_all_roots() {
+        let dir = std::env::temp_dir().join(format!("eg-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("learned-apps.txt");
+        let sys = vec![normalize(r"C:\Windows")];
+        let (a, b, h) = (r"C:\Apps\A\a.exe", r"C:\Apps\B\b.exe", r"D:\Shared\helper.exe");
+        let settings = |apps: &[&str]| WatchSettings {
+            apps: apps.iter().map(PathBuf::from).collect(),
+            mode: ChildMode::Tree,
+            ..Default::default()
+        };
+        let both = settings(&[a, b]);
+        let mut learned = Learned::load(Some(f.clone()));
+        // A 启动 helper
+        learn_children(&both, &mut learned, &[], &[p(10, 1, 1, a), p(11, 10, 2, h)], &sys);
+        // B 启动同一个 helper（这时 helper 已经是目标，也要补记 B）
+        learn_children(&both, &mut learned, &[], &[p(20, 1, 3, b), p(21, 20, 4, h)], &sys);
+        let roots: Vec<&String> = learned.iter().next().unwrap().2.iter().collect();
+        assert_eq!(roots, vec![&normalize(a), &normalize(b)]);
+
+        // 重启后仍在
+        let learned = Learned::load(Some(f.clone()));
+        let paths = |s: &WatchSettings| -> Vec<String> {
+            collect(s, &learned, &[]).iter().map(|e| e.path.to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(paths(&both), vec![h.to_string()]);
+        assert_eq!(paths(&settings(&[b])), vec![h.to_string()], "移除 A 后 B 仍在使用");
+        assert_eq!(paths(&settings(&[a])), vec![h.to_string()], "移除 B 后 A 仍在使用");
+        assert!(paths(&settings(&[])).is_empty(), "两个都移除才解除");
+        let mut excl = settings(&[a, b]);
+        excl.exclude = vec![PathBuf::from(h)];
+        assert!(paths(&excl).is_empty(), "显式忽略仍生效");
+
+        // PID 复用：父进程比子进程晚创建，不继承来源
+        let mut learned = Learned::load(None);
+        learn_children(&both, &mut learned, &[], &[p(30, 1, 9, a), p(31, 30, 5, r"D:\X\other.exe")], &sys);
+        assert_eq!(learned.iter().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

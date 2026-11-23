@@ -45,7 +45,25 @@ fn path_and_time(pid: u32, buf: &mut [u16]) -> (Option<String>, u64) {
     }
 }
 
-/// 快照缓存的一项：同一 PID、同一父进程、同一 exe 名时直接复用，不再打开进程。
+/// 进程的创建时间；打不开时为 0。
+fn created_time(pid: u32) -> u64 {
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return 0;
+        };
+        let (mut c, mut e, mut k, mut u) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let created = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u).is_ok() {
+            ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64
+        } else {
+            0
+        };
+        let _ = CloseHandle(h);
+        created
+    }
+}
+
+/// 快照缓存的一项：同一 PID、同一父进程、同一 exe 名、同一创建时间时直接复用路径，不再查询路径。
 struct Cached {
     ppid: u32,
     name: [u16; 260],
@@ -82,9 +100,12 @@ fn snapshot_cached(cache: &mut HashMap<u32, Cached>) -> Vec<ProcEntry> {
             let pid = e.th32ProcessID;
             if pid > 4 {
                 let ppid = e.th32ParentProcessID;
+                // PID 可能在两次快照之间被同名的新进程复用（路径可能不同）：创建时间也要一致。
+                // 创建时间未知（0）的项不复用，每次重新查询
                 let hit = cache
                     .remove(&pid)
-                    .filter(|c| c.ppid == ppid && c.name == e.szExeFile);
+                    .filter(|c| c.ppid == ppid && c.name == e.szExeFile && c.created != 0)
+                    .filter(|c| created_time(pid) == c.created);
                 let entry = hit.unwrap_or_else(|| {
                     // 无法打开的进程（受保护）创建时间未知，记为 0，识别时会断开祖先链
                     let (path, created) = path_and_time(pid, &mut buf);

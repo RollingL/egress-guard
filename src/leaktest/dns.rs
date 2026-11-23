@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -104,6 +105,7 @@ impl DnsReport {
         r
     }
 
+    /// 直接观察到的泄露数（未知解析器、证据不足的网段不算）。
     pub fn leaks(&self) -> usize {
         self.resolvers.iter().filter(|x| x.verdict.is_leak()).count()
             + self.client_subnets.iter().filter(|x| x.verdict.is_leak()).count()
@@ -130,7 +132,7 @@ pub fn aggregate(msgs: &[WatchMsg], id: &str) -> (Vec<Resolver>, Vec<IpNet>, u32
             sources: vec![DNSCHECK.to_owned()],
             protos: Vec::new(),
             info: None,
-            verdict: Verdict::Leak,
+            verdict: Verdict::Unknown,
         });
         r.queries += 1;
         let proto = m.proto.to_ascii_uppercase();
@@ -167,12 +169,14 @@ pub const DNSCHECK: &str = "dnscheck";
 
 /// 运行测试。`sources` 为要使用的检测源（[`DNSCHECK`] 与 [`HttpSource`] 的名称），
 /// `progress` 在 dnscheck 每收到一个查询时调用（参数为已收到的数量）。
+/// `cancel` 为真时不再发出新的查询（DNS、HTTP、归属查询），已经发出的照常收尾，结果为「已取消」。
 pub fn run(
     zone: &str,
     sources: &[String],
     egress: Option<IpAddr>,
     judge: &Judge,
     progress: &(dyn Fn(u32) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<DnsReport> {
     let use_dnscheck = sources.iter().any(|s| s == DNSCHECK);
     let http: Vec<HttpSource> = sources.iter().filter_map(|s| HttpSource::from_name(s)).collect();
@@ -181,13 +185,13 @@ pub fn run(
     }
 
     let (dnscheck, http_results) = std::thread::scope(|s| {
-        let d = use_dnscheck.then(|| s.spawn(|| run_dnscheck(zone, progress)));
+        let d = use_dnscheck.then(|| s.spawn(|| run_dnscheck(zone, progress, cancel)));
         let agent = http_agent();
         let h: Vec<_> = http
             .iter()
             .map(|src| {
                 let agent = agent.clone();
-                (*src, s.spawn(move || src.run(&agent)))
+                (*src, s.spawn(move || if cancel() { Err(anyhow!("测试已取消")) } else { src.run(&agent) }))
             })
             .collect();
         let d = d.map(|j| j.join().unwrap_or_else(|_| Err(anyhow!("检测线程异常退出"))));
@@ -231,13 +235,16 @@ pub fn run(
                             sources: vec![src.name().into()],
                             protos: Vec::new(),
                             info: None,
-                            verdict: Verdict::Leak,
+                            verdict: Verdict::Unknown,
                         }),
                     }
                 }
             }
             Err(e) => statuses.push(SourceStatus { name: src.name().into(), ok: false, detail: format!("{e:#}") }),
         }
+    }
+    if cancel() {
+        bail!("测试已取消（网络或设置变了）");
     }
     if resolvers.is_empty() {
         let why = statuses.iter().map(|s| format!("{}：{}", s.name, s.detail)).collect::<Vec<_>>().join("；");
@@ -251,7 +258,10 @@ pub fn run(
     let mut ips: Vec<IpAddr> = resolvers.iter().map(|r| r.ip).collect();
     ips.extend(subnets.iter().map(|n| n.network()));
     ips.extend(egress);
-    let mut infos = lookup_info(&ips).into_iter();
+    let mut infos = lookup_info(&ips, cancel).into_iter();
+    if cancel() {
+        bail!("测试已取消（网络或设置变了）");
+    }
     for r in &mut resolvers {
         r.info = infos.next().flatten();
     }
@@ -268,10 +278,17 @@ pub fn all_source_names() -> Vec<String> {
     std::iter::once(DNSCHECK).chain(HttpSource::ALL.iter().map(|s| s.name())).map(Into::into).collect()
 }
 
-fn run_dnscheck(zone: &str, progress: &(dyn Fn(u32) + Sync)) -> Result<(Vec<WatchMsg>, String)> {
+fn run_dnscheck(
+    zone: &str,
+    progress: &(dyn Fn(u32) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(Vec<WatchMsg>, String)> {
     for _ in 0..3 {
+        if cancel() {
+            bail!("测试已取消");
+        }
         let id = format!("{:08x}", super::random_u64() as u32);
-        if let Some(m) = collect(zone, &id, progress)? {
+        if let Some(m) = collect(zone, &id, progress, cancel)? {
             return Ok((m, id));
         }
         // ID 冲突，换一个
@@ -407,7 +424,12 @@ fn random_label(n: usize) -> String {
 }
 
 /// 连接推送、发出查询、收集结果。ID 已被占用时返回 None。
-fn collect(zone: &str, id: &str, progress: &(dyn Fn(u32) + Sync)) -> Result<Option<Vec<WatchMsg>>> {
+fn collect(
+    zone: &str,
+    id: &str,
+    progress: &(dyn Fn(u32) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Vec<WatchMsg>>> {
     let host = format!("ws.{zone}");
     let url = format!("wss://{host}/watch/{id}");
     let addrs: Vec<_> = (host.as_str(), 443).to_socket_addrs().with_context(|| format!("无法解析 {host}"))?.collect();
@@ -439,9 +461,15 @@ fn collect(zone: &str, id: &str, progress: &(dyn Fn(u32) + Sync)) -> Result<Opti
         std::thread::sleep(Duration::from_millis(300));
         let names = query_names(zone, id);
         let lookup_tx = tx.clone();
+        // 取消后查询线程不再发出新的查询
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_lookups = stop.clone();
         // getaddrinfo 没有超时，放在独立线程里，不等它结束
         std::thread::spawn(move || {
             for n in names {
+                if stop_lookups.load(Ordering::SeqCst) {
+                    break;
+                }
                 let _ = (n.as_str(), 443).to_socket_addrs();
             }
             let _ = lookup_tx.send(Note::LookupsDone);
@@ -458,7 +486,12 @@ fn collect(zone: &str, id: &str, progress: &(dyn Fn(u32) + Sync)) -> Result<Opti
             if now >= deadline {
                 break;
             }
-            match rx.recv_timeout(deadline - now) {
+            if cancel() {
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
+            // 分段等待，及时发现取消
+            match rx.recv_timeout((deadline - now).min(Duration::from_millis(250))) {
                 Ok(Note::Msg(m)) => {
                     if m.qname.to_ascii_lowercase().contains(&id_lc) {
                         msgs.push(m);
@@ -470,9 +503,11 @@ fn collect(zone: &str, id: &str, progress: &(dyn Fn(u32) + Sync)) -> Result<Opti
                     taken = code == Some(4000);
                     break;
                 }
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        stop.store(true, Ordering::SeqCst);
         let _ = control.shutdown(Shutdown::Both);
         if taken && msgs.is_empty() {
             return Ok(None);
@@ -510,6 +545,15 @@ fn read_loop<S: Read + Write>(ws: &mut tungstenite::WebSocket<S>, tx: mpsc::Send
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_run_stops_before_requests() {
+        let started = Instant::now();
+        let err = run("dnscheck.tools", &all_source_names(), None, &Judge::default(), &|_| {}, &|| true).unwrap_err();
+        assert!(format!("{err:#}").contains("已取消"), "{err:#}");
+        // 没有发出任何网络请求，立即返回
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     fn msg(ip: &str, proto: &str, qname: &str, ecs: Option<&str>) -> WatchMsg {
         WatchMsg { remote_ip: ip.into(), proto: proto.into(), qname: qname.into(), client_subnet: ecs.map(Into::into) }
@@ -580,12 +624,14 @@ mod tests {
         let j = Judge::from_strings(&["203.0.113.0/24".to_owned()], &[]);
         let a = r.judged(&j);
         assert_eq!(a.resolvers[0].verdict, Verdict::Whitelisted);
-        assert_eq!(a.resolvers[1].verdict, Verdict::Leak);
+        assert_eq!(a.resolvers[1].verdict, Verdict::Unknown, "未知解析器不算直接证据");
         assert_eq!(a.client_subnets[0].verdict, Verdict::Leak);
-        assert_eq!(a.leaks(), 2);
-        // 把 AS4134 加入可信后只剩 ECS 网段
+        assert_eq!(a.leaks(), 1);
+        // 把 AS4134 加入可信
         let j = Judge::from_strings(&["203.0.113.0/24".to_owned()], &["AS4134".to_owned()]);
-        assert_eq!(r.judged(&j).leaks(), 1);
+        let b = r.judged(&j);
+        assert_eq!(b.resolvers[1].verdict, Verdict::Trusted);
+        assert_eq!(b.leaks(), 1);
     }
 
     #[test]

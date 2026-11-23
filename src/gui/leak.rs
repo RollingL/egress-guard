@@ -33,8 +33,10 @@ pub(super) struct JobMeta {
     pub egress: Option<IpAddr>,
     /// 这次测试是自动运行的。
     pub auto: bool,
-    /// 上次测试完成的时刻。
+    /// 上次（有效的）测试完成的时刻。作废的自动测试不算。
     pub finished: Option<Instant>,
+    /// 测试编号：每开始一次加一。工作线程只在编号没变时更新界面上的结果。
+    pub id: u64,
 }
 
 /// 测试完成后的结论（按开始测试时的白名单判定）。
@@ -62,11 +64,11 @@ impl Outcome {
     pub fn warn_text(&self) -> Option<String> {
         let mut parts = Vec::new();
         match &self.dns {
-            Ok((Level::Warn, t)) => parts.push(format!("DNS：{t}")),
+            Ok((Level::Warn | Level::Inconclusive, t)) => parts.push(format!("DNS：{t}")),
             Err(e) => parts.push(format!("DNS 测试失败：{e}")),
             _ => {}
         }
-        if self.webrtc.0 == Level::Warn {
+        if matches!(self.webrtc.0, Level::Warn | Level::Inconclusive) {
             parts.push(format!("WebRTC：{}", self.webrtc.1));
         }
         (!parts.is_empty()).then(|| parts.join("；"))
@@ -74,6 +76,13 @@ impl Outcome {
 }
 
 type Done = Box<dyn FnOnce(Outcome) + Send>;
+
+/// 一次测试自己的结果（不与界面共享）。
+#[derive(Default)]
+struct Private {
+    dns: Option<Result<DnsReport, String>>,
+    webrtc: Option<WebRtcReport>,
+}
 
 /// 自动测试是否仍然有效。
 pub(super) type Validity = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -123,37 +132,48 @@ impl LeakJob {
             *d = Task::Running { since: Instant::now(), progress: 0 };
             *w = Task::Running { since: Instant::now(), progress: 0 };
         }
-        {
+        let id = {
             let mut m = self.meta.lock().unwrap();
             m.egress = egress;
             m.auto = auto;
-        }
+            m.id += 1;
+            m.id
+        };
         log::info!(
             "开始{}泄露测试（出口 IP {}）",
             if auto { "自动" } else { "" },
             egress.map(|i| i.to_string()).unwrap_or_else(|| "未知".into())
         );
 
+        // 本次测试私有的结果：汇总只看它，不读共享的显示状态（那里可能已经是下一次测试）
+        let results: Arc<Mutex<Private>> = Arc::default();
         // 后完成的那个线程汇总结论
         let remaining = Arc::new(AtomicUsize::new(2));
         let done: Arc<Mutex<Option<Done>>> = Arc::new(Mutex::new(Some(Box::new(done))));
         let finish = {
             let job = self.clone();
             let ctx = ctx.clone();
+            let valid = valid.clone();
+            let results = results.clone();
             move |remaining: &AtomicUsize, done: &Mutex<Option<Done>>| {
                 if remaining.fetch_sub(1, Ordering::SeqCst) != 1 {
                     return;
                 }
-                job.meta.lock().unwrap().finished = Some(Instant::now());
-                let dns = match &*job.dns.lock().unwrap() {
-                    Task::Done { result: Ok(r), .. } => Ok(leaktest::dns_summary(r)),
-                    Task::Done { result: Err(e), .. } => Err(e.clone()),
-                    _ => Err("未完成".into()),
+                // 作废的自动测试不算「最近一次测试」，不推迟下一次定时测试
+                if valid() {
+                    let mut m = job.meta.lock().unwrap();
+                    if m.id == id {
+                        m.finished = Some(Instant::now());
+                    }
+                }
+                let r = results.lock().unwrap();
+                let dns = match &r.dns {
+                    Some(Ok(r)) => Ok(leaktest::dns_summary(r)),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Err("未完成".into()),
                 };
-                let webrtc = match &*job.webrtc.lock().unwrap() {
-                    Task::Done { result, .. } => leaktest::webrtc_summary(result),
-                    _ => (Level::Ok, String::new()),
-                };
+                let webrtc = r.webrtc.as_ref().map(leaktest::webrtc_summary).unwrap_or((Level::Ok, String::new()));
+                drop(r);
                 if let Some(f) = done.lock().unwrap().take() {
                     f(Outcome { dns, webrtc, egress });
                 }
@@ -164,6 +184,7 @@ impl LeakJob {
         {
             let (task, ctx, judge, lt) = (self.dns.clone(), ctx.clone(), judge.clone(), lt.clone());
             let (remaining, done, finish, valid) = (remaining.clone(), done.clone(), finish.clone(), valid.clone());
+            let (results, meta) = (results.clone(), self.meta.clone());
             std::thread::Builder::new()
                 .name("dns-leak-test".into())
                 .spawn(move || {
@@ -177,7 +198,7 @@ impl LeakJob {
                     let r = if !valid() {
                         Err(anyhow::anyhow!("测试已取消（网络或设置变了）"))
                     } else if leaktest::valid_zone(&zone) {
-                        dns::run(&zone, &lt.dns_sources, egress, &judge, &progress)
+                        dns::run(&zone, &lt.dns_sources, egress, &judge, &progress, &|| !valid())
                     } else {
                         Err(anyhow::anyhow!("DNS 测试服务的域名有误：{:?}", lt.dnscheck_zone))
                     };
@@ -185,8 +206,11 @@ impl LeakJob {
                         Ok(r) => log::info!("DNS 泄露测试：{}", leaktest::dns_summary(r).1),
                         Err(e) => log::warn!("DNS 泄露测试失败：{e:#}"),
                     }
-                    *task.lock().unwrap() =
-                        Task::Done { at: crate::logbuf::now_hms(), result: r.map_err(|e| format!("{e:#}")) };
+                    let r = r.map_err(|e| format!("{e:#}"));
+                    results.lock().unwrap().dns = Some(r.clone());
+                    if meta.lock().unwrap().id == id {
+                        *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
+                    }
                     ctx.request_repaint();
                     finish(&remaining, &done);
                 })
@@ -194,12 +218,16 @@ impl LeakJob {
         }
         {
             let (task, ctx) = (self.webrtc.clone(), ctx.clone());
+            let meta = self.meta.clone();
             std::thread::Builder::new()
                 .name("webrtc-leak-test".into())
                 .spawn(move || {
                     let r = webrtc::run(&lt.stun_servers, egress, &judge, &|| !valid());
                     log::info!("WebRTC 泄露测试：{}", leaktest::webrtc_summary(&r).1);
-                    *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
+                    results.lock().unwrap().webrtc = Some(r.clone());
+                    if meta.lock().unwrap().id == id {
+                        *task.lock().unwrap() = Task::Done { at: crate::logbuf::now_hms(), result: r };
+                    }
                     ctx.request_repaint();
                     finish(&remaining, &done);
                 })
@@ -231,7 +259,7 @@ impl LeakUi {
 fn level_color(p: &Palette, l: Level) -> Color32 {
     match l {
         Level::Ok => p.green,
-        Level::Warn => p.orange,
+        Level::Inconclusive | Level::Warn => p.orange,
         Level::Leak => p.red,
     }
 }
@@ -240,7 +268,7 @@ fn verdict_color(p: &Palette, v: Verdict) -> Color32 {
     match v {
         Verdict::Whitelisted | Verdict::Trusted | Verdict::SameNetwork => p.green,
         Verdict::Local | Verdict::NoResponse => p.gray,
-        Verdict::Exposed => p.orange,
+        Verdict::Exposed | Verdict::Unknown | Verdict::Inconclusive => p.orange,
         Verdict::Leak => p.red,
     }
 }
@@ -252,7 +280,9 @@ fn verdict_hint(v: Verdict) -> &'static str {
         Verdict::SameNetwork => "与当前出口 IP 属于同一个网络（同一自治系统），多半是 VPN 服务商自己的解析器",
         Verdict::Local => "局域网地址，只在本地网络可见",
         Verdict::Exposed => "网卡上的公网地址：网页获得摄像头/麦克风权限后可以通过 WebRTC 读到",
-        Verdict::Leak => "不在白名单内，也不是可信解析器（解析器本身不一定说明泄露：VPN 也可能使用公共解析器）",
+        Verdict::Unknown => "不在白名单内，也不是可信解析器（解析器本身不一定说明泄露：VPN 也可能使用公共解析器）",
+        Verdict::Inconclusive => "客户端网段比白名单条目宽，只有一部分重叠：不能确定查询来自白名单出口",
+        Verdict::Leak => "直接观察到的白名单以外的地址",
         Verdict::NoResponse => "STUN 服务器没有响应：这条路径没有验证到（只说明到这些服务器的 UDP 不通，不能证明不会暴露）",
     }
 }
@@ -370,6 +400,7 @@ impl App {
                 match worst {
                     Some(Level::Leak) => ("发现泄露".to_owned(), p.red),
                     Some(Level::Warn) => ("需要留意".to_owned(), p.orange),
+                    Some(Level::Inconclusive) => ("证据不足".to_owned(), p.orange),
                     Some(Level::Ok) if d.level().is_none() => ("DNS 测试失败".to_owned(), p.orange),
                     Some(Level::Ok) => ("未发现泄露".to_owned(), p.green),
                     None => ("测试失败".to_owned(), p.orange),

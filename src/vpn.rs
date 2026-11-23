@@ -8,10 +8,9 @@
 //! macOS 自带的几个 utun（iCloud 专用代理、接力等）只有 fe80:: 地址，不会被当成 VPN。
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::VpnConfig;
 use crate::leaktest::ifaces::{self, Adapter};
@@ -72,17 +71,52 @@ fn named(a: &Adapter, names: &[String]) -> bool {
     names.iter().any(|n| n.eq_ignore_ascii_case(&a.name) || (!a.description.is_empty() && n.eq_ignore_ascii_case(&a.description)))
 }
 
-/// 现在连着的 VPN 网卡名称（有可用地址），按名称排序。
-pub fn connected(adapters: &[Adapter], cfg: &VpnConfig) -> Vec<String> {
-    let mut v: Vec<String> = adapters
-        .iter()
-        .filter(|a| a.addrs.iter().any(usable))
-        .filter(|a| if cfg.interfaces.is_empty() { looks_like_vpn(a) } else { named(a, &cfg.interfaces) })
-        .map(|a| a.name.clone())
-        .collect();
+/// 一块连着的 VPN 网卡：名称、稳定标识和可用地址（排序去重）。
+/// 同名网卡被删掉重建（标识变了）不算同一块；同一块网卡换了地址时，引擎重新检测出口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub name: String,
+    pub id: String,
+    pub addrs: Vec<IpAddr>,
+}
+
+impl Link {
+    /// 是不是同一块网卡（名称和标识都相同，不看地址）。
+    pub fn same(&self, other: &Link) -> bool {
+        self.name == other.name && self.id == other.id
+    }
+}
+
+fn usable_addrs(a: &Adapter) -> Vec<IpAddr> {
+    let mut v: Vec<IpAddr> = a.addrs.iter().copied().filter(usable).collect();
     v.sort();
     v.dedup();
     v
+}
+
+/// 现在连着的 VPN 网卡（有可用地址），按名称排序。
+pub fn links(adapters: &[Adapter], cfg: &VpnConfig) -> Vec<Link> {
+    let mut v: Vec<Link> = adapters
+        .iter()
+        .filter(|a| if cfg.interfaces.is_empty() { looks_like_vpn(a) } else { named(a, &cfg.interfaces) })
+        .map(|a| Link { name: a.name.clone(), id: a.id.clone(), addrs: usable_addrs(a) })
+        .filter(|l| !l.addrs.is_empty())
+        .collect();
+    v.sort_by(|x, y| (&x.name, &x.id).cmp(&(&y.name, &y.id)));
+    v.dedup();
+    v
+}
+
+/// 网卡名称（去重，保持顺序）。
+pub fn names(links: &[Link]) -> Vec<String> {
+    let mut v: Vec<String> = links.iter().map(|l| l.name.clone()).collect();
+    v.dedup();
+    v
+}
+
+/// 现在连着的 VPN 网卡名称（有可用地址），按名称排序。
+pub fn connected(adapters: &[Adapter], cfg: &VpnConfig) -> Vec<String> {
+    names(&links(adapters, cfg))
 }
 
 /// 当前已启用的网卡；枚举失败时为 None（不知道现在的情况，不能当作「全部断开」或「全部还在」）。
@@ -102,43 +136,83 @@ pub fn candidates(adapters: &[Adapter]) -> Vec<(String, String, bool)> {
     v
 }
 
-/// 网卡快照的指纹：名称 + 是否有可用地址。只在它变化时通知引擎。
-fn fingerprint(adapters: &[Adapter]) -> Vec<(String, bool)> {
-    let mut v: Vec<(String, bool)> = adapters.iter().map(|a| (a.name.clone(), a.addrs.iter().any(usable))).collect();
+/// 网卡快照的指纹：标识、名称、描述、类型和可用地址。只在它变化时通知引擎，
+/// 所以同名网卡换了地址、被删掉重建也会通知。
+fn fingerprint(adapters: &[Adapter]) -> Vec<(String, String, String, u32, Vec<IpAddr>)> {
+    let mut v: Vec<_> =
+        adapters.iter().map(|a| (a.id.clone(), a.name.clone(), a.description.clone(), a.if_type, usable_addrs(a))).collect();
     v.sort();
     v
 }
 
-/// 网卡检查线程的控制：轮询间隔与停止信号。引擎退出时丢弃，线程随即结束。
+#[derive(Default)]
+struct WatchState {
+    active: bool,
+    stop: bool,
+}
+
+type Shared = Arc<(Mutex<WatchState>, Condvar)>;
+
+/// 网卡检查线程的控制：轮询间隔与停止信号。引擎退出时丢弃，线程随即被唤醒并结束。
 pub struct Watch {
-    interval_ms: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
+    shared: Shared,
 }
 
 impl Watch {
-    /// 有守护中的网卡时勤一些，否则放慢。
+    /// 有守护中的网卡时勤一些，否则放慢。从放慢切换为勤查时立即唤醒检查线程。
     pub fn set_active(&self, active: bool) {
-        let d = if active { POLL_INTERVAL } else { IDLE_POLL_INTERVAL };
-        self.interval_ms.store(d.as_millis() as u64, Ordering::Relaxed);
+        let (m, cv) = &*self.shared;
+        let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+        if st.active != active {
+            st.active = active;
+            cv.notify_all();
+        }
     }
 }
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let (m, cv) = &*self.shared;
+        m.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        cv.notify_all();
+    }
+}
+
+/// 等到下一次检查的时间（从 `since` 起按当前间隔算）；要求停止时返回 false。
+/// 间隔在等待期间缩短（进入守护）时按新的间隔算，已经超过就立即返回。
+fn wait_next(shared: &Shared, since: Instant) -> bool {
+    let (m, cv) = &**shared;
+    let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if st.stop {
+            return false;
+        }
+        let iv = if st.active { POLL_INTERVAL } else { IDLE_POLL_INTERVAL };
+        let elapsed = since.elapsed();
+        if elapsed >= iv {
+            return true;
+        }
+        st = cv.wait_timeout(st, iv - elapsed).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
 /// 在后台线程中按 [`Watch::set_active`] 设定的间隔检查网卡；有变化时调用 `send`（返回 false 时结束线程）。
 /// 枚举失败的那一次跳过（不当作网卡全部消失）。
 pub fn spawn_watch(send: impl Fn(Vec<Adapter>) -> bool + Send + 'static) -> Watch {
-    let interval_ms = Arc::new(AtomicU64::new(IDLE_POLL_INTERVAL.as_millis() as u64));
-    let stop = Arc::new(AtomicBool::new(false));
-    let (iv, st) = (interval_ms.clone(), stop.clone());
+    spawn_watch_with(scan, send)
+}
+
+fn spawn_watch_with(
+    mut scan: impl FnMut() -> Option<Vec<Adapter>> + Send + 'static,
+    send: impl Fn(Vec<Adapter>) -> bool + Send + 'static,
+) -> Watch {
+    let shared: Shared = Arc::default();
+    let sh = shared.clone();
     let r = std::thread::Builder::new().name("vpn-watch".into()).spawn(move || {
         let mut last = None;
         let mut warned = false;
-        while !st.load(Ordering::Relaxed) {
+        loop {
+            let started = Instant::now();
             match scan() {
                 Some(now) => {
                     warned = false;
@@ -156,18 +230,15 @@ pub fn spawn_watch(send: impl Fn(Vec<Adapter>) -> bool + Send + 'static) -> Watc
                 }
                 None => {}
             }
-            // 分段睡眠：放慢期间切换为勤查、或者要求停止时能尽快生效
-            let mut slept = 0;
-            while slept < iv.load(Ordering::Relaxed) && !st.load(Ordering::Relaxed) {
-                std::thread::sleep(POLL_INTERVAL);
-                slept += POLL_INTERVAL.as_millis() as u64;
+            if !wait_next(&sh, started) {
+                break;
             }
         }
     });
     if let Err(e) = r {
         log::warn!("无法启动 VPN 网卡检查线程: {e}");
     }
-    Watch { interval_ms, stop }
+    Watch { shared }
 }
 
 /// 便捷封装：把网卡变化发给引擎。
@@ -175,9 +246,9 @@ pub fn spawn_engine_watch(tx: Sender<crate::engine::Event>) -> Watch {
     spawn_watch(move |a| tx.send(crate::engine::Event::Adapters(a)).is_ok())
 }
 
-/// 守护中的网卡里，现在已经断开的那些。
-pub fn lost<'a>(guarded: &'a [String], connected: &[String]) -> Vec<&'a str> {
-    guarded.iter().filter(|g| !connected.contains(g)).map(String::as_str).collect()
+/// 守护中的网卡里，现在已经断开的那些（包括同名但被删掉重建的网卡）。
+pub fn lost<'a>(guarded: &'a [Link], now: &[Link]) -> Vec<&'a str> {
+    guarded.iter().filter(|g| !now.iter().any(|l| l.same(g))).map(|g| g.name.as_str()).collect()
 }
 
 #[cfg(test)]
@@ -185,11 +256,11 @@ mod tests {
     use super::*;
 
     fn unix(name: &str, addrs: &[&str]) -> Adapter {
-        Adapter { name: name.into(), description: String::new(), if_type: 0, addrs: addrs.iter().map(|a| a.parse().unwrap()).collect() }
+        Adapter { name: name.into(), id: name.into(), description: String::new(), if_type: 0, addrs: addrs.iter().map(|a| a.parse().unwrap()).collect() }
     }
 
     fn win(name: &str, desc: &str, if_type: u32, addrs: &[&str]) -> Adapter {
-        Adapter { name: name.into(), description: desc.into(), if_type, addrs: addrs.iter().map(|a| a.parse().unwrap()).collect() }
+        Adapter { name: name.into(), id: name.into(), description: desc.into(), if_type, addrs: addrs.iter().map(|a| a.parse().unwrap()).collect() }
     }
 
     #[test]
@@ -226,9 +297,78 @@ mod tests {
 
     #[test]
     fn lost_ones() {
-        let g = vec!["utun4".to_owned(), "wg0".to_owned()];
-        assert_eq!(lost(&g, &["wg0".to_owned()]), vec!["utun4"]);
-        assert!(lost(&g, &g).is_empty());
+        let cfg = VpnConfig::default();
+        let before = links(&[unix("utun4", &["10.8.0.2"]), unix("wg0", &["10.9.0.2"])], &cfg);
+        assert_eq!(names(&before), vec!["utun4", "wg0"]);
+        // 多个 VPN：只报告断开的那块
+        let now = links(&[unix("wg0", &["10.9.0.2"])], &cfg);
+        assert_eq!(lost(&before, &now), vec!["utun4"]);
+        assert!(lost(&before, &before).is_empty());
         assert!(lost(&[], &[]).is_empty());
+        // 同名网卡被删掉重建：算断开过
+        let mut rebuilt = unix("utun4", &["10.8.0.2"]);
+        rebuilt.id = "99".into();
+        let now = links(&[rebuilt, unix("wg0", &["10.9.0.2"])], &cfg);
+        assert_eq!(lost(&before, &now), vec!["utun4"]);
     }
+
+    #[test]
+    fn same_name_new_address() {
+        let cfg = VpnConfig::default();
+        let a = links(&[unix("utun4", &["10.8.0.2", "fe80::1"])], &cfg);
+        let b = links(&[unix("utun4", &["10.8.0.7", "fe80::1"])], &cfg);
+        assert!(lost(&a, &b).is_empty(), "换地址不算断开");
+        assert_ne!(a, b, "但引擎能看出变化并重新检测");
+        // 只是链路本地地址变化、地址顺序不同：不算变化
+        let c = links(&[unix("utun4", &["fe80::2", "10.8.0.2", "10.8.0.2"])], &cfg);
+        assert_eq!(a, c);
+        // 指纹同样能看出同名换址
+        assert_ne!(
+            fingerprint(&[unix("utun4", &["10.8.0.2"])]),
+            fingerprint(&[unix("utun4", &["10.8.0.7"])])
+        );
+    }
+
+    /// 枚举偶发失败时跳过（不发空列表）；从空闲进入守护、退出时都能立即唤醒检查线程。
+    #[test]
+    fn watch_thread() {
+        use std::sync::mpsc;
+        let (scan_tx, scan_rx) = mpsc::channel::<()>();
+        let mut n = 0;
+        let scan = move || {
+            n += 1;
+            let _ = scan_tx.send(());
+            match n {
+                2 => None,
+                _ => Some(vec![unix("utun4", if n < 3 { &["10.8.0.2"] } else { &["10.8.0.3"] })]),
+            }
+        };
+        let (tx, rx) = mpsc::channel::<Vec<Adapter>>();
+        let w = spawn_watch_with(scan, move |a| tx.send(a).is_ok());
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first[0].addrs, vec!["10.8.0.2".parse::<IpAddr>().unwrap()]);
+        scan_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // 空闲时 2 秒一次；切换为守护后马上按 0.25 秒检查
+        let t = Instant::now();
+        w.set_active(true);
+        scan_rx.recv_timeout(Duration::from_secs(1)).unwrap(); // 第 2 次：枚举失败
+        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap(); // 第 3 次：换了地址
+        assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+        assert_eq!(second[0].addrs, vec!["10.8.0.3".parse::<IpAddr>().unwrap()], "失败的那次没有发出空列表");
+        // 退出时唤醒线程：不用等到下一次间隔
+        w.set_active(false);
+        while scan_rx.try_recv().is_ok() {}
+        let t = Instant::now();
+        drop(w);
+        // 线程结束时 send 闭包被丢弃，rx 断开
+        loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("检查线程没有及时退出"),
+                Ok(_) => {}
+            }
+        }
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+    }
+
 }

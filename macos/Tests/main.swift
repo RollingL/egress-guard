@@ -61,6 +61,25 @@ func unitTests() {
     check(FilterRules.parse(line: Data(#"{"kind":"status","data":{}}"#.utf8)) == nil, "忽略其他回复")
     check(FilterRules.parseError(line: Data(#"{"kind":"err","data":"只接受 root"}"#.utf8)) == "只接受 root", "解析错误回复")
     check(FilterRules.parse(line: Data("garbage".utf8)) == nil, "无法解析的行")
+
+    // 严格解析：缺字段、类型不对都不能当成「放行、没有受控应用」
+    func decode(_ s: String) -> FilterRules.Message { FilterRules.decode(line: Data(s.utf8)) }
+    func invalid(_ m: FilterRules.Message) -> Bool { if case .invalid = m { return true } else { return false } }
+    check(invalid(decode(#"{"kind":"filter","data":{"inspect_existing":false,"apps":[]}}"#)), "缺 blocked")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false}}"#)), "缺 apps")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":1,"inspect_existing":false,"apps":[]}}"#)), "blocked 是数字")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":"true","inspect_existing":false,"apps":[]}}"#)), "blocked 是字符串")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":["/a",1]}}"#)), "apps 里有非字符串")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":[],"block_ipv6":"yes"}}"#)), "block_ipv6 类型不对")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":[],"rev":-1}}"#)), "rev 为负数")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":[],"rev":1.5}}"#)), "rev 不是整数")
+    check(invalid(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":false,"apps":[],"rev":true}}"#)), "rev 是布尔")
+    check(invalid(decode(#"{"kind":"filter"}"#)), "缺 data")
+    check(invalid(decode("garbage")), "无法解析的行")
+    check(FilterRules.parseRev(line: Data(#"{"kind":"filter","data":{"blocked":true,"apps":[],"rev":3}}"#.utf8)) == nil, "坏消息不确认")
+    check(decode(#"{"kind":"filter","data":{"blocked":true,"inspect_existing":true,"apps":["/A"]}}"#)
+        == .rules(FilterRules(blocked: true, inspectExisting: true, apps: ["/a"]), rev: nil), "旧服务：没有 block_ipv6 和 rev")
+    check(decode(#"{"kind":"status","data":{}}"#) == .other, "其他回复")
 }
 
 func feedTest(_ args: [String]) -> Bool {

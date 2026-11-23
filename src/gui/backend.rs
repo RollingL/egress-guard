@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::config::{Config, RawConfig};
 use crate::engine::{EngineHandle, Event};
@@ -28,7 +28,9 @@ pub trait Backend: Send + Sync {
     fn check_now(&self);
     fn clear_learned(&self);
     /// 校验、保存并应用配置。
-    fn apply(&self, cfg: &Config) -> Result<()>;
+    /// 保存并应用配置，返回配置版本（0 表示不知道，例如旧版本的后台服务）。
+    /// 引擎应用后 [`crate::engine::Status::config_version`] 会追上这个版本。
+    fn apply(&self, cfg: &Config) -> Result<u64>;
     fn logs(&self) -> Vec<String>;
     fn clear_logs(&self);
     /// 连接记录（阻断、恢复、泄露），从旧到新。
@@ -67,6 +69,8 @@ pub trait Backend: Send + Sync {
 pub struct Local {
     pub engine: Arc<EngineHandle>,
     pub config_path: PathBuf,
+    /// 配置提交锁和最近分配的版本：写盘和通知引擎按同一顺序进行。
+    pub commit: std::sync::Mutex<u64>,
 }
 
 impl Backend for Local {
@@ -78,10 +82,14 @@ impl Backend for Local {
         self.engine.send(Event::ClearLearned);
     }
 
-    fn apply(&self, cfg: &Config) -> Result<()> {
+    fn apply(&self, cfg: &Config) -> Result<u64> {
+        let mut version = self.commit.lock().unwrap();
         cfg.save(&self.config_path)?;
-        self.engine.send(Event::Reconfigure(Box::new(cfg.clone())));
-        Ok(())
+        *version += 1;
+        self.engine
+            .try_send(Event::Reconfigure(Box::new(cfg.clone()), *version))
+            .context("配置已保存，但规则没有更新")?;
+        Ok(*version)
     }
 
     fn logs(&self) -> Vec<String> {
@@ -232,13 +240,13 @@ mod remote {
             }
         }
 
-        fn apply(&self, cfg: &Config) -> Result<()> {
-            self.client.command(&Request::SetConfig(Box::new(cfg.to_raw())), T)?;
+        fn apply(&self, cfg: &Config) -> Result<u64> {
+            let version = self.client.set_config(cfg.to_raw(), T)?;
             // 服务保存成功后损坏的配置已被覆盖
             if let Some(h) = self.hello.lock().unwrap().as_mut() {
                 h.config_error = None;
             }
-            Ok(())
+            Ok(version)
         }
 
         fn logs(&self) -> Vec<String> {
