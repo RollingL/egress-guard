@@ -74,10 +74,8 @@ pub fn uninstall<O: Ops>(ops: &mut O) -> Result<()> {
     };
     // 阶段三：持锁清理
     let mut problems = Vec::new();
-    for item in [Item::Plist] {
-        if let Err(e) = ops.remove(item) {
-            problems.push(format!("{e:#}"));
-        }
+    if let Err(e) = ops.remove(Item::Plist) {
+        problems.push(format!("{e:#}"));
     }
     if let Err(e) = ops.flush_anchor() {
         problems.push(format!("没能移除 pf 规则：{e:#}"));
