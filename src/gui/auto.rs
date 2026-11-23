@@ -124,18 +124,27 @@ impl LeakScheduler {
         let mut allowed_since = Instant::now();
         // 已经通知过的泄露（同一出口、同样的结论只提醒一次）
         let notified: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let mut idle = false;
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            let s = self.status.lock().unwrap().clone();
-            let cfg = self.config.lock().unwrap().clone();
-            let lt = &cfg.leak_test;
-            // 总开关关闭时不发出任何后台探测
-            let Some(key) = allowed_key(&s).filter(|_| lt.auto) else {
-                last_key = None;
-                change_at = None;
-                self.state.lock().unwrap().next = None;
+            // 总开关关闭时不发出任何后台探测，也不必复制状态和配置（默认就是关闭的）
+            let auto = self.config.lock().unwrap().leak_test.auto;
+            let key = if auto { allowed_key(&self.status.lock().unwrap()) } else { None };
+            let Some(key) = key else {
+                if !idle {
+                    idle = true;
+                    last_key = None;
+                    change_at = None;
+                    self.state.lock().unwrap().next = None;
+                }
                 continue;
             };
+            idle = false;
+            let cfg = self.config.lock().unwrap().clone();
+            let lt = &cfg.leak_test;
+            if !lt.auto {
+                continue; // 刚刚被关掉
+            }
             let now = Instant::now();
             // 刚放行、或者出口变了：等网络稳定后测一次
             if last_key != Some((key.0, key.1)) {
