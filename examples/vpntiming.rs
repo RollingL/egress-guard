@@ -343,6 +343,9 @@ struct Trial {
     react: Option<f64>,
     from_cut: Option<f64>,
     leak: [Option<f64>; 3],
+    held: Option<f64>,
+    after_block: [usize; 3],
+    after_block_max: [Option<f64>; 3],
     first_fail: [Option<f64>; 3],
     ok_before: [bool; 3],
     reason: String,
@@ -428,7 +431,9 @@ fn real(args: &[String]) {
         };
         let blocked = r.wait("断开后阻断", Duration::from_secs(if down.is_some() { 15 } else { 300 }), |s| s.blocked);
         let reason = r.last.lock().unwrap().block_reason.clone().unwrap_or_default();
-        std::thread::sleep(Duration::from_millis(2500));
+        // 阻断之后到重新放行（没有 VPN，重新检测通过）之间，受控进程的连接都不应成功
+        let reallow = blocked.and_then(|_| r.wait("恢复放行（没有 VPN）", Duration::from_secs(60), |s| !s.blocked));
+        std::thread::sleep(Duration::from_millis(300));
         if let Some(mut d) = dn {
             let _ = d.wait();
         }
@@ -449,26 +454,38 @@ fn real(args: &[String]) {
             (Some(a), Some(b)) => Some(ms(a, b)),
             _ => None,
         };
-        if let Some(g) = gone {
+        tr.held = match (blocked, reallow) {
+            (Some(b), Some(e)) => Some(ms(b, e)),
+            _ => None,
+        };
+        if let (Some(g), Some(b), Some(e)) = (gone, blocked, reallow) {
+            let start = g.min(b);
             for (k, p) in ["probe n4", "probe n6", "probe l4"].iter().enumerate() {
-                let before = g - Duration::from_millis(500);
-                tr.ok_before[k] = !probe.times(before, &format!("{p} ok")).into_iter().filter(|t| *t < g).collect::<Vec<_>>().is_empty();
-                tr.leak[k] = probe.times(g, &format!("{p} ok")).into_iter().max().map(|t| ms(g, t));
-                tr.first_fail[k] = probe.times(g, &format!("{p} fail")).into_iter().min().map(|t| ms(g, t));
+                let before = start - Duration::from_millis(500);
+                tr.ok_before[k] = probe.times(before, &format!("{p} ok")).into_iter().any(|t| t < start);
+                let oks: Vec<Instant> = probe.times(start, &format!("{p} ok")).into_iter().filter(|t| *t < e).collect();
+                tr.leak[k] = oks.iter().max().map(|t| ms(g, *t));
+                tr.after_block[k] = oks.iter().filter(|t| **t > b + Duration::from_millis(5)).count();
+                tr.after_block_max[k] = oks.iter().max().map(|t| ms(b, *t));
+                tr.first_fail[k] = probe.times(start, &format!("{p} fail")).into_iter().filter(|t| *t < e).min().map(|t| ms(g, t));
             }
         }
         println!(
-            "第 {:>2} 次：{}网卡消失→阻断 {}；受控进程在网卡消失后的最后一次连通 IPv4 {} / IPv6 {} / 长连接 {}；原因「{}」",
+            "第 {:>2} 次：{}网卡消失→阻断 {}，保持 {}；网卡消失后最后一次连通 IPv4 {} / IPv6 {} / 长连接 {}；规则生效 5ms 后仍成功 {}/{}/{} 次；原因「{}」",
             i + 1,
             tr.teardown.map(|v| format!("断开脚本→网卡消失 {v:.0}ms，")).unwrap_or_default(),
             tr.react.map(|v| format!("{v:.1}ms")).unwrap_or("—".into()),
+            tr.held.map(|v| format!("{v:.0}ms")).unwrap_or("—".into()),
             fmt_leak(tr.ok_before[0], tr.leak[0]),
             fmt_leak(tr.ok_before[1], tr.leak[1]),
             fmt_leak(tr.ok_before[2], tr.leak[2]),
+            tr.after_block[0],
+            tr.after_block[1],
+            tr.after_block[2],
             tr.reason
         );
         trials.push(tr);
-        let _ = r.wait("恢复放行（没有 VPN）", Duration::from_secs(60), |s| !s.blocked && !s.checking);
+        let _ = r.wait("检测结束", Duration::from_secs(60), |s| !s.blocked && !s.checking);
     }
 
     println!("\n== 汇总（{} 次）==", trials.len());
@@ -477,10 +494,13 @@ fn real(args: &[String]) {
         report("断开脚本 → 网卡消失", col(&|t| t.teardown), 0);
         report("断开脚本 → 规则生效", col(&|t| t.from_cut), 0);
     }
+    report("规则生效 → 重新放行（阻断保持时间）", col(&|t| t.held), 0);
     report("网卡消失 → 规则生效（引擎反应 + 提交）", col(&|t| t.react), trials.iter().filter(|t| t.react.is_none()).count());
     for (k, name) in ["IPv4 新连接", "IPv6 新连接", "IPv4 长连接"].iter().enumerate() {
         if trials.iter().any(|t| t.ok_before[k]) {
-            report(&format!("网卡消失 → {name}最后一次连通（≤0 表示消失后没有再连通）"), col(&|t| t.ok_before[k].then(|| t.leak[k].unwrap_or(0.0))), 0);
+            report(&format!("网卡消失 → {name}最后一次连通（0 表示消失后没有再连通）"), col(&|t| t.ok_before[k].then(|| t.leak[k].unwrap_or(0.0).max(0.0))), 0);
+            report(&format!("规则生效 → {name}最后一次连通（负数表示生效前就断了）"), col(&|t| t.ok_before[k].then_some(t.after_block_max[k]).flatten()), 0);
+            println!("  规则生效 5ms 之后仍然成功的{name}：共 {} 次", trials.iter().map(|t| t.after_block[k]).sum::<usize>());
             report(&format!("网卡消失 → {name}第一次失败"), col(&|t| t.ok_before[k].then_some(t.first_fail[k]).flatten()), 0);
         } else {
             println!("{name}：放行时就不通，跳过");
@@ -508,6 +528,19 @@ fn real(args: &[String]) {
             let oks = probe.times(t0, &format!("{tag} n4 ok"));
             let fails = probe.times(t0, &format!("{tag} n4 fail"));
             let first = probe.log.lock().unwrap().iter().find(|(t, l)| *t >= t0 && l.starts_with(&tag)).map(|(t, _)| *t);
+            // 结果序列（连续相同的合并）：时间相对子程序第一行输出
+            if let Some(f) = first {
+                let mut seq: Vec<(String, f64, usize)> = Vec::new();
+                for (t, l) in probe.log.lock().unwrap().iter().filter(|(t, l)| *t >= t0 && l.starts_with(&tag)) {
+                    let what = l[tag.len() + 1..].to_owned();
+                    match seq.last_mut() {
+                        Some(last) if last.0 == what => last.2 += 1,
+                        _ => seq.push((what, ms(f, *t), 1)),
+                    }
+                }
+                let s: Vec<String> = seq.iter().take(14).map(|(w, t, n)| format!("{t:.0}ms {w}×{n}")).collect();
+                println!("    {}", s.join(" → "));
+            }
             match (first, oks.iter().max(), fails.iter().min()) {
                 (Some(f), Some(last_ok), _) => {
                     println!("  {tag}：启动后 {:.0}ms 内能连网（共 {} 次成功），{}", ms(f, *last_ok), oks.len(), fails.first().map(|x| format!("{:.0}ms 起失败", ms(f, *x))).unwrap_or("一直没有失败".into()));

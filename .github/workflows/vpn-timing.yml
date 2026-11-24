@@ -39,11 +39,16 @@ jobs:
           Get-NetIPAddress -InterfaceAlias wg9 -ErrorAction SilentlyContinue | Format-Table IPAddress
           & "$dir\down.cmd"; Start-Sleep 3
           Get-NetAdapter | Format-Table Name, InterfaceDescription, Status
-      - name: 1. 默认设置（网络变化时先阻断：开），按应用，含新子程序
+      - name: 1. 默认设置（网络变化时先阻断：开），按应用
         shell: pwsh
         run: |
           $d = "$env:RUNNER_TEMP\wgconf"
-          ./target/release/examples/vpntiming.exe real --n 20 --kids 8 --up "$d\up.cmd" --down "$d\down.cmd"
+          ./target/release/examples/vpntiming.exe real --n 20 --up "$d\up.cmd" --down "$d\down.cmd"
+      - name: 1b. 阻断期间受控应用启动新的子程序（详细日志）
+        shell: pwsh
+        run: |
+          $d = "$env:RUNNER_TEMP\wgconf"
+          ./target/release/examples/vpntiming.exe real --n 1 --kids 10 -v --up "$d\up.cmd" --down "$d\down.cmd" 2>&1 | Select-String -NotMatch "出口 IP:|检测出口|重新检测"
       - name: 2. 只靠 VPN 守护（网络变化时先阻断：关），按应用
         shell: pwsh
         run: |
