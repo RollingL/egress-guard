@@ -64,6 +64,7 @@ mod text {
     pub const APPS_SUB: &str = "出口 IP 不在白名单内时，以下程序的全部网络连接会被阻断。";
     pub const KILL_EXISTING_SUB: &str = "切换为阻断时，主动断开受控应用的 TCP 连接";
     pub const SYSTEM_DIRS_HINT: &str = "Windows 系统目录下的程序（cmd、PowerShell、conhost 等）不会被自动加入。识别到的子进程会被记住，下次启动立即生效。";
+    pub const BROWSER_HINT: &str = "受控应用里打开网页链接时，浏览器可能由它启动。阻断按程序生效，一并阻断后无论从哪里打开这个浏览器都会断网。";
     pub const AUTOSTART_TITLE: &str = "登录时自动启动";
     pub const AUTOSTART_SUB: &str = "以管理员权限在托盘中运行，不弹出 UAC";
     pub const SELF_SUB: &str = "用于在断网期间继续检测出口 IP，以便自动恢复";
@@ -86,6 +87,7 @@ mod text {
     pub const APPS_SUB: &str = "出口 IP 不在白名单内时，以下应用的全部网络连接会被阻断（由网络扩展执行）。";
     pub const KILL_EXISTING_SUB: &str = "切换为阻断时，立即切断受控应用正在进行的连接（网络扩展会持续检查这些连接）";
     pub const SYSTEM_DIRS_HINT: &str = "系统目录（/System、/usr、/bin 等）下的程序不会被自动加入。识别到的子进程会被记住。";
+    pub const BROWSER_HINT: &str = "受控应用直接启动浏览器时会出现在这里。阻断按应用生效，一并阻断后无论从哪里打开这个浏览器都会断网。";
     pub const AUTOSTART_TITLE: &str = "开机自动启动";
     pub const AUTOSTART_SUB: &str = "开机即由后台服务保护，登录后在菜单栏显示图标";
     pub const SELF_SUB: &str = "检测出口 IP 的请求（以 nobody 身份发出），以便断网期间自动恢复";
@@ -344,6 +346,7 @@ pub fn run(opts: Options) -> Result<()> {
                 let last_tray: Mutex<Option<tray::TrayState>> = Mutex::new(None);
                 Arc::new(move |s: &Status| {
                     *status.lock().unwrap() = s.clone();
+                    notify_new_pending(s);
                     let t = tray_state(s);
                     let mut last = last_tray.lock().unwrap();
                     if last.as_ref() != Some(&t) {
@@ -1544,7 +1547,13 @@ impl App {
             });
             theme::hairline(ui, p);
             let extra_n = s.extra_apps.len();
-            let sub = (extra_n > 0).then(|| format!("另有 {extra_n} 个自动识别的关联程序"));
+            let pending_n = s.pending_children.len();
+            let sub = match (extra_n, pending_n) {
+                (0, 0) => None,
+                (e, 0) => Some(format!("另有 {e} 个自动识别的关联程序")),
+                (0, b) => Some(format!("{b} 个浏览器待确认是否阻断")),
+                (e, b) => Some(format!("另有 {e} 个自动识别的关联程序，{b} 个浏览器待确认")),
+            };
             theme::row(ui, p, "受控应用", sub.as_deref(), |ui| {
                 if theme::text_button(ui, p.accent, &format!("{} 个  ›", self.applied.apps.len())).clicked() {
                     goto = Some(Page::Apps);
@@ -1751,7 +1760,7 @@ impl App {
                 p,
                 "阻断所在目录的全部程序",
                 Some(if cfg!(target_os = "macos") {
-                    "受控应用所在 .app 包里的所有程序，未运行的也提前阻断"
+                    "受控应用是包里的单个程序时，同一个 .app 包里的其他程序也提前阻断（选的是整个 .app 时包里的程序本来就全部阻断）"
                 } else {
                     "受控应用 exe 所在目录（含子目录）下的所有 exe，未运行的也提前阻断"
                 }),
@@ -1765,6 +1774,70 @@ impl App {
         // 刚点了"忽略"、尚未保存的项先隐藏
         let pending: Vec<String> =
             self.draft.children.exclude.iter().map(|p| crate::discovery::normalize_path(p)).collect();
+
+        // 受控应用启动的浏览器：确认前不阻断
+        let browsers: Vec<_> = self
+            .status
+            .lock()
+            .unwrap()
+            .pending_children
+            .iter()
+            .filter(|x| !pending.contains(&crate::discovery::normalize_path(&x.path)))
+            .cloned()
+            .collect();
+        if !browsers.is_empty() {
+            theme::section(ui, p, &format!("{} 个浏览器待确认", browsers.len()));
+            let mut confirm = None;
+            let mut skip = None;
+            theme::card(ui, p, |ui| {
+                let n = browsers.len();
+                for (i, x) in browsers.iter().enumerate() {
+                    let path = x.path.display().to_string();
+                    let name = exe_name(&path);
+                    let by: Vec<String> = x.apps.iter().map(|a| exe_name(&a.display().to_string())).collect();
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(40.0);
+                        letter_icon(ui, p, &name);
+                        ui.vertical(|ui| {
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(&name).color(p.label));
+                            ui.add_space(-6.0);
+                            ui.label(
+                                RichText::new(format!("由 {} 启动，还没有阻断", by.join("、")))
+                                    .size(12.0)
+                                    .color(p.secondary),
+                            )
+                            .on_hover_text(&path);
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::gray_button(ui, p, "不阻断")
+                                .on_hover_text("以后不再自动阻断这个浏览器（加入已忽略，保存后生效）")
+                                .clicked()
+                            {
+                                skip = Some(x.path.clone());
+                            }
+                            if theme::accent_button(ui, p, "一并阻断", true)
+                                .on_hover_text("阻断受控应用时，这个浏览器也一起断网")
+                                .clicked()
+                            {
+                                confirm = Some(x.path.clone());
+                            }
+                        });
+                    });
+                    if i + 1 < n {
+                        theme::hairline_inset(ui, p, theme::ICON_INSET);
+                    }
+                }
+            });
+            theme::footnote(ui, p, text::BROWSER_HINT);
+            if let Some(path) = confirm {
+                self.backend.confirm_child(&path);
+                self.notify(true, format!("{} 将一并阻断", exe_name(&path.display().to_string())));
+            }
+            if let Some(path) = skip {
+                self.draft.children.exclude.push(path);
+            }
+        }
         let extra: Vec<_> = self
             .status
             .lock()
@@ -2551,6 +2624,56 @@ fn open_url(url: &str) {
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     log::info!("打开 {url}");
+}
+
+/// 已经通知过、还在待确认的浏览器（规范路径）；None 表示还没从状态文件载入。
+static NOTIFIED_PENDING: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// 出现新的待确认浏览器时发一条系统通知（窗口通常隐藏着）。每个浏览器只通知一次，记在界面的状态文件里；
+/// 它离开待确认（确认阻断、不阻断、清空识别记录）后忘掉，之后再被识别到时重新通知。
+fn notify_new_pending(s: &Status) {
+    // 还没连上引擎（默认状态）时不能据此忘掉记录
+    if !s.running {
+        return;
+    }
+    let mut g = NOTIFIED_PENDING.lock().unwrap();
+    let known = g.get_or_insert_with(|| auto::GuiState::load().notified_children.into_iter().collect());
+    let now: std::collections::HashSet<String> =
+        s.pending_children.iter().map(|x| crate::discovery::normalize_path(&x.path)).collect();
+    let new: Vec<_> = s
+        .pending_children
+        .iter()
+        .filter(|x| !known.contains(&crate::discovery::normalize_path(&x.path)))
+        .cloned()
+        .collect();
+    if new.is_empty() && known.is_subset(&now) {
+        return;
+    }
+    *known = now;
+    let mut keys: Vec<String> = known.iter().cloned().collect();
+    keys.sort();
+    drop(g);
+    std::thread::spawn(move || {
+        let mut gs = auto::GuiState::load();
+        gs.notified_children = keys;
+        gs.save();
+        if new.is_empty() {
+            return;
+        }
+        let name = |p: &std::path::Path| exe_name(&p.display().to_string());
+        let browsers: Vec<String> = new.iter().map(|x| name(&x.path)).collect();
+        let mut apps: Vec<String> = new.iter().flat_map(|x| x.apps.iter().map(|a| name(a))).collect();
+        apps.sort();
+        apps.dedup();
+        notify::show(
+            "受控应用打开了浏览器",
+            &format!(
+                "{} 由 {} 启动，还没有阻断。打开 Egress Guard 的「受控应用」页确认是否一并阻断。",
+                browsers.join("、"),
+                apps.join("、")
+            ),
+        );
+    });
 }
 
 fn exe_name(path: &str) -> String {

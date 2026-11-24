@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 
 use crate::config::Config;
 use crate::controller::{Controller, DryRunFirewall, Egress, Firewall};
-use crate::discovery::{self, ExtraApp, WatchSettings};
+use crate::discovery::{self, ExtraApp, Found, PendingChild, WatchSettings};
 use crate::egress::Detectors;
 use crate::leaktest::ifaces::Adapter;
 use crate::{logbuf, vpn};
@@ -36,10 +36,12 @@ pub enum Event {
     Detected { generation: u64, result: Result<Egress> },
     /// 内部：网卡发生变化（VPN 守护用）。
     Adapters(Vec<Adapter>),
-    /// 内部：自动识别到的关联程序发生变化。
-    ExtraApps(Vec<ExtraApp>),
+    /// 内部：自动识别到的关联程序（以及等待确认的浏览器）发生变化。
+    ExtraApps(Found),
     /// 清空子进程识别记录。
     ClearLearned,
+    /// 用户确认一并阻断这个识别到的浏览器。
+    ConfirmChild(PathBuf),
     /// 只刷新状态（例如 macOS 网络扩展连上或断开）。
     Refresh,
 }
@@ -98,6 +100,8 @@ pub struct Status {
     pub running: bool,
     /// 自动识别到、一并阻断的关联程序。
     pub extra_apps: Vec<ExtraApp>,
+    /// 受控应用启动的、等待用户确认是否一并阻断的浏览器（确认前不阻断）。旧版本的服务没有这一项。
+    pub pending_children: Vec<PendingChild>,
     /// 引擎已经处理到的配置版本（界面保存后据此判断规则是否已应用）。
     pub config_version: u64,
     /// 应用这个版本的配置时出错（配置已保存，但规则没有按它更新）。
@@ -205,8 +209,10 @@ fn run(
     let net = NetNotifier::new(tx.clone());
     let mut watcher = start_netwatch(net.clone());
     // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
-    // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
+    // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒，没有要保护的对象时暂停；
+    // 引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
+    vpn_watch.set_paused(nothing_to_protect(&cfg));
     let mut adapters: Vec<Adapter> = vpn::scan().unwrap_or_default();
     // 守护中的 VPN 网卡（名称 + 稳定标识）与上一次看到的 VPN 网卡（含地址，用来发现同名换址）
     let mut guarded: Vec<vpn::Link> = Vec::new();
@@ -259,13 +265,14 @@ fn run(
     let mut watch_version = 0u64;
     let watch = Arc::new(Mutex::new(WatchSettings::from_config(&cfg, watch_version)));
     let initial = discovery::initial_extra(&watch.lock().unwrap(), learned_file.clone(), &system_dirs);
-    if !initial.is_empty() {
-        log::info!("载入 {} 个已识别的关联程序", initial.len());
+    if !initial.extra.is_empty() {
+        log::info!("载入 {} 个已识别的关联程序", initial.extra.len());
     }
-    if let Err(e) = ctrl.set_extra(initial.iter().map(|x| x.path.clone()).collect()) {
+    if let Err(e) = ctrl.set_extra(initial.extra.iter().map(|x| x.path.clone()).collect()) {
         log::error!("{e:#}");
     }
-    status.extra_apps = initial;
+    status.extra_apps = initial.extra;
+    status.pending_children = initial.pending;
     discovery::spawn(watch.clone(), learned_file, snapshot_fn(), system_dirs, tx.clone());
 
     let mut detector = Arc::new(Detectors::new(&cfg));
@@ -381,8 +388,10 @@ fn run(
                 {
                     let mut w = watch.lock().unwrap();
                     let clear = w.clear_learned;
+                    let confirm = std::mem::take(&mut w.confirm);
                     *w = WatchSettings::from_config(&new_cfg, watch_version);
                     w.clear_learned = clear;
+                    w.confirm = confirm;
                 }
                 status.config_version = version;
                 status.config_apply_error = match ctrl.reconfigure(*new_cfg) {
@@ -403,15 +412,21 @@ fn run(
                 next_check = None;
                 start_check(&mut checking, &detector, generation);
             }
-            Ok(Event::ExtraApps(extra)) => {
-                log::info!("关联程序更新：共 {} 个", extra.len());
-                if let Err(e) = ctrl.set_extra(extra.iter().map(|x| x.path.clone()).collect()) {
-                    log::error!("更新关联程序的阻断规则失败: {e:#}");
+            Ok(Event::ExtraApps(Found { extra, pending })) => {
+                if extra != status.extra_apps {
+                    log::info!("关联程序更新：共 {} 个", extra.len());
+                    if let Err(e) = ctrl.set_extra(extra.iter().map(|x| x.path.clone()).collect()) {
+                        log::error!("更新关联程序的阻断规则失败: {e:#}");
+                    }
                 }
                 status.extra_apps = extra;
+                status.pending_children = pending;
             }
             Ok(Event::ClearLearned) => {
                 watch.lock().unwrap().clear_learned = true;
+            }
+            Ok(Event::ConfirmChild(path)) => {
+                watch.lock().unwrap().confirm.push(path);
             }
             Ok(Event::Adapters(a)) => {
                 adapters = a;
@@ -539,12 +554,15 @@ fn run(
             }
         }
 
-        if ctrl.wants_block() {
+        // 没有要保护的对象时不守护，也不定时检查网卡（网络变化通知照样更新界面上的 VPN 状态）
+        let idle = nothing_to_protect(ctrl.config());
+        if ctrl.wants_block() || idle {
             guarded.clear();
         }
         status.vpn_guarded = vpn::names(&guarded);
         status.generation = generation;
         vpn_watch.set_active(!guarded.is_empty());
+        vpn_watch.set_paused(idle);
         update_status(&mut status, &ctrl, checking);
         if status != reported {
             reporter(&status);
@@ -568,10 +586,15 @@ fn later(d: Duration) -> Instant {
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
 }
 
-/// 放行时要守护的 VPN 网卡：已经放行、开了 VPN 守护时，现在连着的 VPN 网卡；否则为空。
+/// 既没有受控应用、也没开全局断网：阻断不拦任何连接，VPN 守护没有意义。
+fn nothing_to_protect(cfg: &Config) -> bool {
+    cfg.apps.is_empty() && !cfg.block_all.enabled
+}
+
+/// 放行时要守护的 VPN 网卡：已经放行、开了 VPN 守护、有要保护的对象时，现在连着的 VPN 网卡；否则为空。
 fn guard_links(ctrl: &Controller, adapters: &[Adapter]) -> Vec<vpn::Link> {
     let vcfg = &ctrl.config().vpn;
-    if !ctrl.is_blocked() && vcfg.guard {
+    if !ctrl.is_blocked() && vcfg.guard && !nothing_to_protect(ctrl.config()) {
         vpn::links(adapters, vcfg)
     } else {
         Vec::new()
@@ -712,6 +735,20 @@ mod tests {
         drop(rx);
         n.taken();
         assert!(!n.notify(), "引擎已退出");
+    }
+
+    #[test]
+    fn nothing_to_protect_only_without_apps_and_block_all() {
+        let cfg = |apps: &[&str], block_all: bool| {
+            let mut raw = crate::config::RawConfig { apps: apps.iter().map(PathBuf::from).collect(), ..Default::default() };
+            raw.block_all.enabled = block_all;
+            Config::from_raw(raw).unwrap()
+        };
+        let app = if cfg!(windows) { r"C:\a\curl.exe" } else { "/usr/bin/curl" };
+        assert!(nothing_to_protect(&cfg(&[], false)));
+        assert!(!nothing_to_protect(&cfg(&[app], false)));
+        assert!(!nothing_to_protect(&cfg(&[], true)));
+        assert!(!nothing_to_protect(&cfg(&[app], true)));
     }
 
     #[test]

@@ -71,6 +71,10 @@ impl Handler for Daemon {
         self.send(Event::ClearLearned);
     }
 
+    fn confirm_child(&self, path: std::path::PathBuf) {
+        self.send(Event::ConfirmChild(path));
+    }
+
     fn set_autostart(&self, on: bool) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
