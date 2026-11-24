@@ -117,6 +117,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("probe-child") => probe_child(&args[2..]),
         Some("real") => real(&args[2..]),
+        Some("watch") => watch(&args[2..]),
         #[cfg(target_os = "linux")]
         Some("sim") | None => sim::run(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(30)),
         _ => eprintln!("用法见文件开头的说明"),
@@ -564,6 +565,78 @@ fn real(args: &[String]) {
     drop(probe);
     let _ = r.h.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只做测量、不运行引擎：配合已经安装运行的 egress-guard（真机，按应用阻断时也覆盖 macOS 网络扩展）。
+/// 受控测试进程固定复制到 `<目录>/egress-guard-probe(.exe)`；先在 egress-guard 里把它加为受控应用，
+/// 然后按提示断开 VPN。每次断开后报告：网卡消失时刻、受控测试进程最后一次连通、之后还有没有成功的连接。
+fn watch(args: &[String]) {
+    let n: usize = opt(args, "--n").and_then(|v| v.parse().ok()).unwrap_or(5);
+    let dir = opt(args, "--dir").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("egress-guard-probe"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(exe_name("egress-guard-probe"));
+    let me = std::env::current_exe().unwrap();
+    if std::fs::copy(&me, &exe).is_err() && !exe.exists() {
+        eprintln!("无法复制到 {}", exe.display());
+        return;
+    }
+    let exe = PathBuf::from(std::fs::canonicalize(&exe).unwrap().to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+    println!("受控测试进程：{}", exe.display());
+    println!("请在 egress-guard 里把上面这个程序加为受控应用（或开启全局断网），连上 VPN，确认状态为「放行」后按回车。");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let adapters = adapter_log(Default::default());
+    let probe = Probe::start(&exe);
+    std::thread::sleep(Duration::from_secs(2));
+    let t = Instant::now() - Duration::from_secs(1);
+    let have = ["probe n4 ok", "probe n6 ok", "probe l4 ok"].map(|p| !probe.times(t, p).is_empty());
+    println!("放行时的连通性：IPv4 新连接 {}，IPv6 新连接 {}，IPv4 长连接 {}", have[0], have[1], have[2]);
+    let names = ["IPv4 新连接", "IPv6 新连接", "IPv4 长连接"];
+    let mut results: Vec<[Option<f64>; 3]> = Vec::new();
+    for i in 0..n {
+        let vpns = adapters.lock().unwrap().last().map(|(_, v)| v.clone()).unwrap_or_default();
+        if vpns.is_empty() {
+            println!("没有看到 VPN 网卡，请连上 VPN，等 egress-guard 显示放行后按回车");
+            let _ = std::io::stdin().read_line(&mut line);
+            continue;
+        }
+        println!("第 {} 次：现在请断开 VPN（{}）", i + 1, vpns.join("、"));
+        let t0 = Instant::now();
+        let gone = loop {
+            if let Some((t, _)) = adapters.lock().unwrap().iter().find(|(t, v)| *t >= t0 && vpns.iter().any(|g| !v.contains(g))) {
+                break *t;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        std::thread::sleep(Duration::from_secs(5));
+        let mut r = [None; 3];
+        let mut parts = Vec::new();
+        for (k, p) in ["probe n4", "probe n6", "probe l4"].iter().enumerate() {
+            if !have[k] {
+                continue;
+            }
+            let oks: Vec<Instant> = probe.times(gone, &format!("{p} ok")).into_iter().filter(|t| *t < gone + Duration::from_secs(5)).collect();
+            let fail = probe.times(gone, &format!("{p} fail")).into_iter().min();
+            r[k] = Some(oks.iter().max().map_or(0.0, |t| ms(gone, *t)));
+            parts.push(format!(
+                "{} 最后一次连通 +{:.0}ms（之后成功 {} 次），第一次失败 {}",
+                names[k],
+                r[k].unwrap(),
+                oks.len(),
+                fail.map(|f| format!("+{:.0}ms", ms(gone, f))).unwrap_or("没有".into())
+            ));
+        }
+        println!("  网卡消失之后 5 秒内：{}", parts.join("；"));
+        results.push(r);
+        println!("请重新连上 VPN，等 egress-guard 显示放行后按回车");
+        let _ = std::io::stdin().read_line(&mut line);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    println!("\n== 汇总（{} 次）==", results.len());
+    for (k, name) in names.iter().enumerate() {
+        report(&format!("网卡消失 → {name}最后一次连通"), results.iter().filter_map(|r| r[k]).collect(), 0);
+    }
+    println!("断开后仍能连通很久（几百毫秒以上）就是泄露；把整段输出发回来即可。");
 }
 
 fn fmt_leak(ok_before: bool, leak: Option<f64>) -> String {
