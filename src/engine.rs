@@ -731,10 +731,11 @@ mod tests {
             raw.block_all.enabled = block_all;
             Config::from_raw(raw).unwrap()
         };
+        let app = if cfg!(windows) { r"C:\a\curl.exe" } else { "/usr/bin/curl" };
         assert!(nothing_to_protect(&cfg(&[], false)));
-        assert!(!nothing_to_protect(&cfg(&["/usr/bin/curl"], false)));
+        assert!(!nothing_to_protect(&cfg(&[app], false)));
         assert!(!nothing_to_protect(&cfg(&[], true)));
-        assert!(!nothing_to_protect(&cfg(&["/usr/bin/curl"], true)));
+        assert!(!nothing_to_protect(&cfg(&[app], true)));
     }
 
     #[test]
