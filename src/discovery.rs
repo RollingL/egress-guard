@@ -6,6 +6,8 @@
 //!
 //! 系统目录（Windows 的 %WINDIR%，macOS 的 /System、/usr/bin 等）下的程序永远不会被自动加入，
 //! 以免误伤系统组件（例如应用调用 cmd.exe、powershell.exe、conhost.exe 或 /bin/sh）。
+//!
+//! 识别到的子进程是常见浏览器时不自动加入，先列为「待确认」（见 [`is_browser`]）。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -120,6 +122,82 @@ pub fn lookup_target<'a, V>(norm: &str, targets: &'a HashMap<String, V>) -> Opti
     norm.match_indices(".app\\").find_map(|(i, _)| targets.get_key_value(&norm[..i + 4]))
 }
 
+/// 常见浏览器的程序名（Windows，规范形式）。
+const BROWSER_EXES: &[&str] = &[
+    "chrome.exe",
+    "chromium.exe",
+    "msedge.exe",
+    "iexplore.exe",
+    "firefox.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "floorp.exe",
+    "zen.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "thorium.exe",
+    "arc.exe",
+    "browser.exe", // Yandex
+    "360se.exe",
+    "360chrome.exe",
+    "360chromex.exe",
+    "qqbrowser.exe",
+    "sogouexplorer.exe",
+    "ucbrowser.exe",
+    "maxthon.exe",
+    "liebao.exe",
+    "2345explorer.exe",
+    "quark.exe",
+];
+
+/// 常见浏览器的应用包名（macOS，规范形式，不含 `.app`）。包名相同或以「名字 + 空格」开头都算，
+/// 例如 `google chrome canary`、`firefox developer edition`。
+const BROWSER_BUNDLES: &[&str] = &[
+    "safari",
+    "google chrome",
+    "chromium",
+    "microsoft edge",
+    "firefox",
+    "librewolf",
+    "waterfox",
+    "floorp",
+    "zen",
+    "brave browser",
+    "opera",
+    "vivaldi",
+    "arc",
+    "orion",
+    "tor browser",
+    "yandex",
+    "duckduckgo",
+    "qqbrowser",
+    "quark",
+];
+
+/// 程序（规范路径）是不是常见浏览器：Windows 按程序名，macOS 按最外层 `.app` 包名（包里的辅助程序也算）。
+///
+/// 受控应用里点开网页链接、而浏览器还没开时，浏览器会作为它的子进程启动。阻断按程序路径生效，
+/// 自动加入会让浏览器从此断网，所以识别到浏览器时先列为待确认，由用户决定。
+/// 嵌入式网页组件（例如 Windows 的 msedgewebview2.exe）属于受控应用自己的联网，不在其列。
+pub fn is_browser(norm: &str) -> bool {
+    let name = norm.rsplit('\\').next().unwrap_or(norm);
+    if BROWSER_EXES.contains(&name) {
+        return true;
+    }
+    norm.split('\\').find_map(|c| c.strip_suffix(".app")).is_some_and(|bundle| {
+        BROWSER_BUNDLES
+            .iter()
+            .any(|b| bundle.strip_prefix(b).is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')))
+    })
+}
+
+/// 识别到、等待用户确认的浏览器：确认前不阻断，它启动的程序也不识别。
+/// 所属受控应用本身就是浏览器时（用户明确要阻断浏览器）不需要确认。
+fn needs_confirm(key: &str, roots: &Roots, learned: &Learned) -> bool {
+    is_browser(key) && !learned.confirmed.contains(key) && !roots.iter().any(|r| is_browser(r))
+}
+
 /// 目标本身就是受控应用（而不是识别出来的关联程序）。
 fn is_direct(key: &str, roots: &Roots) -> bool {
     roots.contains(key)
@@ -130,6 +208,8 @@ fn is_direct(key: &str, roots: &Roots) -> bool {
 ///
 /// 受控应用本身（及其 .app 包里的程序）不算；已经识别过的辅助程序照样返回：
 /// 它可能这次是被另一个受控应用启动的，需要补记这个来源。
+/// 祖先链经过一个不是目标的浏览器（待确认或已忽略）时断开：浏览器自己的辅助进程、
+/// 从浏览器里打开的程序都不属于受控应用。
 /// 返回 (进程下标, 所属受控应用)。
 pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Roots>) -> Vec<(usize, Roots)> {
     let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
@@ -139,6 +219,7 @@ pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Roo
         .map(|p| if p.path.is_empty() { None } else { lookup_target(&normalize(&p.path), targets) })
         .collect();
     let target_of = |p: &ProcEntry| by_pid.get(&p.pid).and_then(|&i| hits[i]);
+    let browser_at = |i: usize| !procs[i].path.is_empty() && is_browser(&normalize(&procs[i].path));
     let mut out = Vec::new();
     for (i, p) in procs.iter().enumerate() {
         if p.pid <= 4 || hits[i].is_some_and(|(k, r)| is_direct(k, r)) {
@@ -159,6 +240,9 @@ pub fn descendants_of_targets(procs: &[ProcEntry], targets: &HashMap<String, Roo
             }
             if let Some((_, roots)) = target_of(parent) {
                 out.push((i, roots.clone()));
+                break;
+            }
+            if browser_at(pi) {
                 break;
             }
             cur = parent;
@@ -314,19 +398,46 @@ pub struct ExtraApp {
     pub source: Source,
 }
 
+/// 识别到、等待用户确认是否一并阻断的浏览器（见 [`is_browser`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChild {
+    pub path: PathBuf,
+    /// 启动它的受控应用（配置里的写法）。
+    pub apps: Vec<PathBuf>,
+}
+
+/// 识别结果：一并阻断的程序，和等待确认的浏览器。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    pub extra: Vec<ExtraApp>,
+    pub pending: Vec<PendingChild>,
+}
+
 /// 已识别的子进程程序及其所属的受控应用，持久化为文本文件（每行"子程序路径<TAB>受控应用路径"，
 /// 同一个子程序属于多个受控应用时有多行；与只有一个来源的旧文件兼容）。
 /// 子程序只要还有一个所属应用在配置里就继续生效；全部移出配置后不再生效。
+///
+/// 用户确认要阻断的浏览器记为 `#confirmed<TAB>规范路径`：旧版本把它当注释跳过（照旧直接阻断浏览器）。
 pub struct Learned {
     file: Option<PathBuf>,
     /// 规范路径 → (原始路径, 所属受控应用的规范路径)
     map: BTreeMap<String, (PathBuf, Roots)>,
+    /// 用户确认要阻断的浏览器（规范路径）。
+    confirmed: BTreeSet<String>,
 }
+
+const CONFIRMED_PREFIX: &str = "#confirmed\t";
 
 impl Learned {
     pub fn load(file: Option<PathBuf>) -> Self {
         let mut map = BTreeMap::new();
+        let mut confirmed = BTreeSet::new();
         if let Some(text) = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) {
+            for line in text.lines() {
+                if let Some(p) = line.strip_prefix(CONFIRMED_PREFIX) {
+                    confirmed.insert(normalize(p.trim()));
+                }
+            }
             for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
                 // 没有所属应用的旧格式记录直接丢弃
                 if let Some((child, root)) = line.split_once('\t') {
@@ -337,7 +448,16 @@ impl Learned {
                 }
             }
         }
-        Self { file, map }
+        Self { file, map, confirmed }
+    }
+
+    /// 用户确认阻断这个浏览器，返回是否是新的确认。
+    pub fn confirm(&mut self, path: &Path) -> bool {
+        if !self.confirmed.insert(normalize_path(path)) {
+            return false;
+        }
+        self.save();
+        true
     }
 
     /// 记下"这个子程序属于这个受控应用"，返回是否是新的关系。
@@ -353,6 +473,7 @@ impl Learned {
 
     pub fn clear(&mut self) {
         self.map.clear();
+        self.confirmed.clear();
         self.save();
     }
 
@@ -368,6 +489,9 @@ impl Learned {
             for root in roots {
                 text.push_str(&format!("{}\t{}\n", p.to_string_lossy(), root));
             }
+        }
+        for c in &self.confirmed {
+            text.push_str(&format!("{CONFIRMED_PREFIX}{c}\n"));
         }
         // 原子替换：写到一半崩溃不会留下截断的记录
         if let Err(e) = crate::config::write_atomic(f, text.as_bytes(), None) {
@@ -387,6 +511,8 @@ pub struct WatchSettings {
     pub version: u64,
     /// 请求清空子进程记录。
     pub clear_learned: bool,
+    /// 用户确认要阻断、还没记下的浏览器。
+    pub confirm: Vec<PathBuf>,
 }
 
 impl WatchSettings {
@@ -398,6 +524,7 @@ impl WatchSettings {
             exclude: cfg.children.exclude.clone(),
             version,
             clear_learned: false,
+            confirm: Vec::new(),
         }
     }
 }
@@ -436,6 +563,11 @@ fn app_dir_roots(s: &WatchSettings, system_dirs: &[String], warn: bool) -> Vec<(
     }
     let mut dirs: BTreeMap<String, (PathBuf, Roots)> = BTreeMap::new();
     for app in &s.apps {
+        // 受控应用就是整个 .app 包：网络扩展按路径前缀匹配，包里的程序（包括更新后新增的）本来就都受控，
+        // 不用扫描。受控应用是包里的单个程序时，才需要扫描找出同一个包里的其他程序。
+        if is_whole_bundle(app) {
+            continue;
+        }
         let Some(root) = app_scan_root(app, system_dirs) else {
             if warn {
                 log::warn!(
@@ -448,6 +580,12 @@ fn app_dir_roots(s: &WatchSettings, system_dirs: &[String], warn: bool) -> Vec<(
         dirs.entry(normalize_path(&root)).or_insert_with(|| (root, Roots::new())).1.insert(normalize_path(app));
     }
     dirs.into_values().collect()
+}
+
+/// 受控应用是不是整个 macOS 应用包（Unix 路径，以 `.app` 结尾）。
+fn is_whole_bundle(app: &Path) -> bool {
+    !crate::config::is_windows_absolute(&app.to_string_lossy())
+        && app.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"))
 }
 
 /// 一次扫描完受控应用所在的目录。返回 (exe, 所属受控应用规范路径)；
@@ -475,7 +613,9 @@ fn targets(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) 
     };
     if s.mode == ChildMode::Tree {
         for (k, _, roots) in learned.iter() {
-            add(k, roots);
+            if !needs_confirm(k, roots, learned) {
+                add(k, roots);
+            }
         }
     }
     for (p, roots) in dir_exes {
@@ -484,8 +624,8 @@ fn targets(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) 
     t
 }
 
-/// 汇总需要额外阻断的程序（去掉已配置的和被忽略的）。
-fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) -> Vec<ExtraApp> {
+/// 汇总需要额外阻断的程序（去掉已配置的和被忽略的）和等待确认的浏览器。
+fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) -> Found {
     let t = targets(s, learned, dir_exes);
     let mut seen: HashSet<String> = s.apps.iter().map(|p| normalize_path(p)).collect();
     let mut extra = Vec::new();
@@ -500,11 +640,24 @@ fn collect(s: &WatchSettings, learned: &Learned, dir_exes: &[(PathBuf, Roots)]) 
             extra.push(ExtraApp { path: p.clone(), source: Source::AppDir });
         }
     }
-    extra
+    let mut pending = Vec::new();
+    if s.mode == ChildMode::Tree {
+        let excluded: HashSet<String> = s.exclude.iter().map(|p| normalize_path(p)).collect();
+        for (k, p, roots) in learned.iter() {
+            if seen.contains(k) || excluded.contains(k) || !needs_confirm(k, roots, learned) {
+                continue;
+            }
+            let apps: Vec<PathBuf> = s.apps.iter().filter(|a| roots.contains(&normalize_path(a))).cloned().collect();
+            if !apps.is_empty() {
+                pending.push(PendingChild { path: p.clone(), apps });
+            }
+        }
+    }
+    Found { extra, pending }
 }
 
 /// 启动时同步计算一次（读取历史记录 + 目录扫描）。
-pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, system_dirs: &[String]) -> Vec<ExtraApp> {
+pub fn initial_extra(s: &WatchSettings, learned_file: Option<PathBuf>, system_dirs: &[String]) -> Found {
     let learned = Learned::load(learned_file);
     collect(s, &learned, &scan_app_dirs(app_dir_roots(s, system_dirs, false)))
 }
@@ -547,6 +700,8 @@ fn learn_children(
             if learned.add(Path::new(&p.path), root) {
                 if known {
                     log::info!("{} 也由 {root} 启动，记下这个来源 (PID {})", p.path, p.pid);
+                } else if learned.map.get(&norm).is_some_and(|(_, r)| needs_confirm(&norm, r, learned)) {
+                    log::warn!("受控应用 {root} 启动了浏览器，等待确认是否阻断: {} (PID {})", p.path, p.pid);
                 } else {
                     log::warn!("识别到受控应用的子进程，加入阻断: {} (PID {})", p.path, p.pid);
                 }
@@ -569,7 +724,7 @@ fn run(
     let mut scanned_version: Option<u64> = None;
     let mut last_round = Instant::now();
     let mut round: Option<AppDirScan> = None;
-    let mut last_sent: Option<Vec<ExtraApp>> = None;
+    let mut last_sent: Option<Found> = None;
 
     loop {
         // 引擎退出后只剩本线程持有设置，随之结束
@@ -581,6 +736,11 @@ fn run(
             if std::mem::take(&mut g.clear_learned) {
                 learned.clear();
                 log::info!("已清空子进程识别记录");
+            }
+            for p in std::mem::take(&mut g.confirm) {
+                if learned.confirm(&p) {
+                    log::info!("用户确认阻断浏览器: {}", p.display());
+                }
             }
             g.clone()
         };
@@ -607,12 +767,12 @@ fn run(
             learn_children(&s, &mut learned, &dir_exes, &snapshot(), &system_dirs);
         }
 
-        let extra = collect(&s, &learned, &dir_exes);
-        if last_sent.as_ref() != Some(&extra) {
-            if tx.send(Event::ExtraApps(extra.clone())).is_err() {
+        let found = collect(&s, &learned, &dir_exes);
+        if last_sent.as_ref() != Some(&found) {
+            if tx.send(Event::ExtraApps(found.clone())).is_err() {
                 return; // 引擎已退出
             }
-            last_sent = Some(extra);
+            last_sent = Some(found);
         }
 
         std::thread::sleep(POLL);
@@ -734,6 +894,116 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn browsers() {
+        for b in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Users\me\AppData\Local\360Chrome\Chrome\Application\360chrome.exe",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper",
+            "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox",
+            "/Applications/Arc.app/Contents/MacOS/Arc",
+        ] {
+            assert!(is_browser(&normalize(b)), "{b}");
+        }
+        for b in [
+            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\130.0\msedgewebview2.exe",
+            r"C:\Apps\Foo\chrome_helper.exe",
+            "/Applications/Archive Tool.app/Contents/MacOS/x",
+            "/Applications/Zenith.app/Contents/MacOS/Zenith",
+            "/Applications/Foo.app/Contents/MacOS/Foo",
+        ] {
+            assert!(!is_browser(&normalize(b)), "{b}");
+        }
+    }
+
+    /// 受控应用启动的浏览器先待确认：不阻断，它的子进程也不识别；确认后照常阻断和识别。
+    #[test]
+    fn browser_child_waits_for_confirmation() {
+        let dir = std::env::temp_dir().join(format!("eg-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("learned-apps.txt");
+        let sys = vec![normalize(r"C:\Windows")];
+        let chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        let procs = vec![
+            p(100, 1, 10, r"C:\Apps\Foo\foo.exe"),
+            p(200, 100, 20, chrome),
+            p(210, 200, 21, chrome),
+            p(220, 210, 22, r"D:\Downloads\setup.exe"),
+            p(300, 100, 30, r"C:\Apps\Foo\helper.exe"),
+        ];
+        let s = WatchSettings { apps: vec![PathBuf::from(r"C:\Apps\Foo\foo.exe")], mode: ChildMode::Tree, ..Default::default() };
+        let mut l = Learned::load(Some(f.clone()));
+        learn_children(&s, &mut l, &[], &procs, &sys);
+        let found = collect(&s, &l, &[]);
+        let names: Vec<_> = found.extra.iter().map(|x| x.path.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![r"C:\Apps\Foo\helper.exe"]);
+        assert_eq!(found.pending, vec![PendingChild { path: chrome.into(), apps: s.apps.clone() }]);
+        // 浏览器的子进程、从浏览器打开的程序都没有记下
+        assert!(!l.iter().any(|(k, _, _)| k.contains("setup.exe")));
+        // 重新载入后仍是待确认，不会当成已确认
+        let l2 = Learned::load(Some(f.clone()));
+        assert_eq!(collect(&s, &l2, &[]).pending.len(), 1);
+
+        // 忽略：不再待确认，也不阻断
+        let ignored = WatchSettings { exclude: vec![PathBuf::from(chrome)], ..s.clone() };
+        let found = collect(&ignored, &l, &[]);
+        assert!(found.pending.is_empty() && found.extra.len() == 1);
+
+        // 确认：阻断，之后从它启动的程序照常识别；确认记录会保存
+        assert!(l.confirm(Path::new(&chrome.to_uppercase())));
+        learn_children(&s, &mut l, &[], &procs, &sys);
+        let found = collect(&s, &l, &[]);
+        assert!(found.pending.is_empty());
+        assert_eq!(found.extra.len(), 3, "{:?}", found.extra);
+        let l3 = Learned::load(Some(f.clone()));
+        assert!(collect(&s, &l3, &[]).pending.is_empty());
+        // 旧版本把确认记录当注释，浏览器那一行照常读到
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.lines().any(|x| x.starts_with("#confirmed\t")));
+
+        // 清空记录后重新待确认
+        l.clear();
+        learn_children(&s, &mut l, &[], &procs, &sys);
+        assert_eq!(collect(&s, &l, &[]).pending.len(), 1);
+
+        // 受控应用本身就是浏览器：它启动的浏览器程序不需要确认
+        let other = r"C:\Program Files\Mozilla Firefox\firefox.exe";
+        let procs = vec![p(100, 1, 10, chrome), p(200, 100, 20, other)];
+        let s = WatchSettings { apps: vec![PathBuf::from(chrome)], mode: ChildMode::Tree, ..Default::default() };
+        let mut l = Learned::load(None);
+        learn_children(&s, &mut l, &[], &procs, &sys);
+        let found = collect(&s, &l, &[]);
+        assert!(found.pending.is_empty());
+        assert_eq!(found.extra.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// macOS：受控应用是整个 .app 包时不扫描（网络扩展已按前缀覆盖整个包），是包里的单个程序时扫描整个包。
+    #[test]
+    fn whole_bundle_is_not_scanned() {
+        let sys: Vec<String> = ["/System"].iter().map(|d| normalize(d)).collect();
+        let roots = |apps: &[&str]| {
+            let s = WatchSettings {
+                apps: apps.iter().map(PathBuf::from).collect(),
+                include_app_dir: true,
+                ..Default::default()
+            };
+            app_dir_roots(&s, &sys, false).into_iter().map(|(p, _)| p).collect::<Vec<_>>()
+        };
+        assert!(roots(&["/Applications/Foo.app"]).is_empty());
+        assert!(roots(&["/Applications/Foo.APP"]).is_empty());
+        assert_eq!(roots(&["/Applications/Foo.app/Contents/MacOS/foo"]), vec![PathBuf::from("/Applications/Foo.app")]);
+        // Windows 路径照常扫描所在目录（只有 Windows 上 Path 认反斜杠）
+        if cfg!(windows) {
+            assert_eq!(roots(&[r"C:\Apps\Vendor\Foo.app"]), vec![PathBuf::from(r"C:\Apps\Vendor")]);
+        } else {
+            assert_eq!(roots(&[r"C:\Apps\Vendor\Foo.app"]).len(), 1);
+        }
+    }
+
     /// 没有目标进程在运行时直接返回（不找后代）；受控应用或已识别程序在运行时照常识别。
     #[test]
     fn reports_whether_any_target_is_running() {
@@ -775,7 +1045,7 @@ mod tests {
         // 重启后仍在
         let learned = Learned::load(Some(f.clone()));
         let paths = |s: &WatchSettings| -> Vec<String> {
-            collect(s, &learned, &[]).iter().map(|e| e.path.to_string_lossy().into_owned()).collect()
+            collect(s, &learned, &[]).extra.iter().map(|e| e.path.to_string_lossy().into_owned()).collect()
         };
         assert_eq!(paths(&both), vec![h.to_string()]);
         assert_eq!(paths(&settings(&[b])), vec![h.to_string()], "移除 A 后 B 仍在使用");
@@ -851,7 +1121,7 @@ mod tests {
     fn recv_extra(rx: &std::sync::mpsc::Receiver<Event>) -> Vec<ExtraApp> {
         loop {
             match rx.recv_timeout(Duration::from_secs(5)).expect("没有收到识别结果") {
-                Event::ExtraApps(x) => return x,
+                Event::ExtraApps(x) => return x.extra,
                 _ => continue,
             }
         }

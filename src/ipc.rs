@@ -32,6 +32,8 @@ pub enum Request {
     SaveConfig(Box<RawConfig>),
     CheckNow,
     ClearLearned,
+    /// 确认一并阻断识别到的浏览器（状态里的 pending_children）。
+    ConfirmChild(PathBuf),
     Logs,
     ClearLogs,
     /// 连接记录（阻断、恢复、泄露）。
@@ -106,6 +108,7 @@ pub trait Handler: Send + Sync + 'static {
     fn set_config(&self, raw: RawConfig) -> Result<u64>;
     fn check_now(&self);
     fn clear_learned(&self);
+    fn confirm_child(&self, path: PathBuf);
     fn set_autostart(&self, on: bool) -> Result<()>;
     fn stop(&self);
 }
@@ -264,6 +267,10 @@ fn handle_conn(stream: UnixStream, handler: &dyn Handler, hub: &StatusHub) -> st
             }
             Request::ClearLearned => {
                 handler.clear_learned();
+                Reply::Ok
+            }
+            Request::ConfirmChild(path) => {
+                handler.confirm_child(path);
                 Reply::Ok
             }
             Request::Logs => Reply::Logs(crate::logbuf::recent_lines()),
@@ -571,6 +578,7 @@ mod tests {
         }
         fn check_now(&self) {}
         fn clear_learned(&self) {}
+        fn confirm_child(&self, _path: PathBuf) {}
         fn set_autostart(&self, _on: bool) -> Result<()> {
             bail!("不支持")
         }

@@ -26,7 +26,7 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 // ---------------- 界面自己的小状态文件 ----------------
 
-/// 界面记住的东西（不属于配置）：已经提醒过、已经忽略的版本。
+/// 界面记住的东西（不属于配置）：已经提醒过、已经忽略的版本，已经提醒过的待确认浏览器。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiState {
@@ -34,6 +34,8 @@ pub struct GuiState {
     pub notified_version: String,
     /// 用户点了「忽略这个版本」。
     pub dismissed_version: String,
+    /// 已经发过通知的待确认浏览器（规范路径）。
+    pub notified_children: Vec<String>,
 }
 
 fn state_path() -> PathBuf {

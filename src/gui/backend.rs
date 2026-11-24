@@ -27,6 +27,8 @@ pub enum ServiceState {
 pub trait Backend: Send + Sync {
     fn check_now(&self);
     fn clear_learned(&self);
+    /// 确认一并阻断识别到的浏览器。
+    fn confirm_child(&self, path: &std::path::Path);
     /// 校验、保存并应用配置。
     /// 保存并应用配置，返回配置版本（0 表示不知道，例如旧版本的后台服务）。
     /// 引擎应用后 [`crate::engine::Status::config_version`] 会追上这个版本。
@@ -80,6 +82,10 @@ impl Backend for Local {
 
     fn clear_learned(&self) {
         self.engine.send(Event::ClearLearned);
+    }
+
+    fn confirm_child(&self, path: &std::path::Path) {
+        self.engine.send(Event::ConfirmChild(path.to_path_buf()));
     }
 
     fn apply(&self, cfg: &Config) -> Result<u64> {
@@ -236,6 +242,12 @@ mod remote {
 
         fn clear_learned(&self) {
             if let Err(e) = self.client.command(&Request::ClearLearned, T) {
+                log::warn!("{e:#}");
+            }
+        }
+
+        fn confirm_child(&self, path: &std::path::Path) {
+            if let Err(e) = self.client.command(&Request::ConfirmChild(path.to_path_buf()), T) {
                 log::warn!("{e:#}");
             }
         }
