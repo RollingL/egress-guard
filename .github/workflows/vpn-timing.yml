@@ -1,0 +1,88 @@
+name: VPN 断开保护时序测量（临时）
+
+# 只在审查用的临时分支上运行，不会合并
+on:
+  push:
+    branches: [claude/project-thread-63vrrn]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows（真实 WFP + WireGuard 网卡）
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --example vpntiming
+      - name: 安装 WireGuard，准备隧道配置
+        shell: pwsh
+        run: |
+          choco install wireguard -y --no-progress | Out-Null
+          $wg = 'C:\Program Files\WireGuard'
+          $key = (& "$wg\wg.exe" genkey).Trim()
+          $peer = ((& "$wg\wg.exe" genkey) | & "$wg\wg.exe" pubkey).Trim()
+          # 对端不存在，只有 10.99.0.0/24 走隧道：默认路由不变，网卡照样建立、带地址
+          $conf = "[Interface]`r`nPrivateKey = $key`r`nAddress = 10.99.0.2/24`r`n`r`n[Peer]`r`nPublicKey = $peer`r`nAllowedIPs = 10.99.0.0/24`r`nEndpoint = 192.0.2.1:51820`r`n"
+          $dir = "$env:RUNNER_TEMP\wgconf"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          [IO.File]::WriteAllText("$dir\wg9.conf", $conf)
+          Set-Content -Encoding ascii "$dir\up.cmd" "@`"$wg\wireguard.exe`" /installtunnelservice `"$dir\wg9.conf`""
+          Set-Content -Encoding ascii "$dir\down.cmd" "@`"$wg\wireguard.exe`" /uninstalltunnelservice wg9"
+          # 先试一次：网卡能建立、能删除
+          & "$dir\up.cmd"; Start-Sleep 3
+          Get-NetAdapter | Format-Table Name, InterfaceDescription, Status
+          Get-NetIPAddress -InterfaceAlias wg9 -ErrorAction SilentlyContinue | Format-Table IPAddress
+          & "$dir\down.cmd"; Start-Sleep 3
+          Get-NetAdapter | Format-Table Name, InterfaceDescription, Status
+      - name: 1. 默认设置（网络变化时先阻断：开），按应用，含新子程序
+        shell: pwsh
+        run: |
+          $d = "$env:RUNNER_TEMP\wgconf"
+          ./target/release/examples/vpntiming.exe real --n 20 --kids 8 --up "$d\up.cmd" --down "$d\down.cmd"
+      - name: 2. 只靠 VPN 守护（网络变化时先阻断：关），按应用
+        shell: pwsh
+        run: |
+          $d = "$env:RUNNER_TEMP\wgconf"
+          ./target/release/examples/vpntiming.exe real --n 20 --guard-only --up "$d\up.cmd" --down "$d\down.cmd"
+      - name: 3. 全局断网（会短暂切断虚拟机自己的网络，放在最后）
+        continue-on-error: true
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $d = "$env:RUNNER_TEMP\wgconf"
+          ./target/release/examples/vpntiming.exe real --n 6 --block-all --guard-only --up "$d\up.cmd" --down "$d\down.cmd"
+
+  macos:
+    name: macOS（模拟模式 + wireguard-go utun，测检测链路）
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --example vpntiming
+        env:
+          EGRESS_GUARD_NO_NETEXT: "1"
+      - name: 安装 wireguard-tools，准备隧道配置
+        run: |
+          brew install wireguard-tools
+          d="$RUNNER_TEMP/wgconf"; mkdir -p "$d"
+          key=$(wg genkey); peer=$(wg genkey | wg pubkey)
+          printf '[Interface]\nPrivateKey = %s\nAddress = 10.99.0.2/24\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.99.0.0/24\nEndpoint = 192.0.2.1:51820\n' "$key" "$peer" > "$d/wg9.conf"
+          chmod 600 "$d/wg9.conf"
+          echo "sudo wg-quick up '$d/wg9.conf' >/dev/null 2>&1" > "$d/up.sh"
+          echo "sudo wg-quick down '$d/wg9.conf' >/dev/null 2>&1" > "$d/down.sh"
+          sh "$d/up.sh"; sleep 2; ifconfig | grep -A3 utun; sh "$d/down.sh"
+      - name: 默认设置，模拟模式（测网卡消失 → 引擎决定阻断）
+        run: |
+          d="$RUNNER_TEMP/wgconf"
+          ./target/release/examples/vpntiming real --dry-run --n 20 --up "sh $d/up.sh" --down "sh $d/down.sh"
+      - name: 只靠 VPN 守护，模拟模式
+        run: |
+          d="$RUNNER_TEMP/wgconf"
+          ./target/release/examples/vpntiming real --dry-run --guard-only --n 20 --up "sh $d/up.sh" --down "sh $d/down.sh"
