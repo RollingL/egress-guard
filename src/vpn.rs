@@ -20,6 +20,7 @@ use crate::leaktest::ifaces::{self, Adapter};
 /// 这不是漏放窗口的上限：断线到规则生效还要加上网卡状态变化本身的延迟和防火墙提交的耗时。
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// 没有守护中的网卡（阻断中、没有 VPN、关闭了守护）时的轮询间隔：只用来刷新界面上的 VPN 状态。
+/// 没有要保护的对象（没有受控应用、也没开全局断网）时完全不轮询，见 [`Watch::set_paused`]。
 pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Windows 接口类型（IF_TYPE_*）。
@@ -149,6 +150,7 @@ fn fingerprint(adapters: &[Adapter]) -> Vec<(String, String, String, u32, Vec<Ip
 #[derive(Default)]
 struct WatchState {
     active: bool,
+    paused: bool,
     stop: bool,
 }
 
@@ -169,6 +171,17 @@ impl Watch {
             cv.notify_all();
         }
     }
+
+    /// 暂停时检查线程不再轮询，一直睡到恢复或退出（系统的网络变化通知照样让引擎检查网卡）。
+    /// 恢复时立即检查一次。
+    pub fn set_paused(&self, paused: bool) {
+        let (m, cv) = &*self.shared;
+        let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+        if st.paused != paused {
+            st.paused = paused;
+            cv.notify_all();
+        }
+    }
 }
 
 impl Drop for Watch {
@@ -181,12 +194,22 @@ impl Drop for Watch {
 
 /// 等到下一次检查的时间（从 `since` 起按当前间隔算）；要求停止时返回 false。
 /// 间隔在等待期间缩短（进入守护）时按新的间隔算，已经超过就立即返回。
+/// 暂停期间一直等待；恢复时立即返回。
 fn wait_next(shared: &Shared, since: Instant) -> bool {
     let (m, cv) = &**shared;
     let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+    let mut was_paused = false;
     loop {
         if st.stop {
             return false;
+        }
+        if st.paused {
+            was_paused = true;
+            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        if was_paused {
+            return true;
         }
         let iv = if st.active { POLL_INTERVAL } else { IDLE_POLL_INTERVAL };
         let elapsed = since.elapsed();
@@ -356,8 +379,19 @@ mod tests {
         let second = rx.recv_timeout(Duration::from_secs(1)).unwrap(); // 第 3 次：换了地址
         assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
         assert_eq!(second[0].addrs, vec!["10.8.0.3".parse::<IpAddr>().unwrap()], "失败的那次没有发出空列表");
-        // 退出时唤醒线程：不用等到下一次间隔
+        // 暂停：不再轮询（空闲间隔 2 秒，等 2.5 秒也没有检查）；恢复时立即检查
         w.set_active(false);
+        w.set_paused(true);
+        std::thread::sleep(Duration::from_millis(300));
+        while scan_rx.try_recv().is_ok() {}
+        assert!(scan_rx.recv_timeout(Duration::from_millis(2500)).is_err(), "暂停期间仍在检查网卡");
+        let t = Instant::now();
+        w.set_paused(false);
+        scan_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        // 暂停中也能及时退出
+        w.set_paused(true);
+        // 退出时唤醒线程：不用等到下一次间隔
         while scan_rx.try_recv().is_ok() {}
         let t = Instant::now();
         drop(w);

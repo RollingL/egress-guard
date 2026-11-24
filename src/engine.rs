@@ -205,8 +205,10 @@ fn run(
     let net = NetNotifier::new(tx.clone());
     let mut watcher = start_netwatch(net.clone());
     // VPN 守护：定时检查网卡（变化通知之外的兜底，也覆盖「网络变化时先阻断」关闭的情况）。
-    // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒；引擎退出时 vpn_watch 被丢弃，线程随之结束
+    // 通过 VPN 放行时每 0.25 秒一次，其余时候每 2 秒，没有要保护的对象时暂停；
+    // 引擎退出时 vpn_watch 被丢弃，线程随之结束
     let vpn_watch = vpn::spawn_engine_watch(tx.clone());
+    vpn_watch.set_paused(nothing_to_protect(&cfg));
     let mut adapters: Vec<Adapter> = vpn::scan().unwrap_or_default();
     // 守护中的 VPN 网卡（名称 + 稳定标识）与上一次看到的 VPN 网卡（含地址，用来发现同名换址）
     let mut guarded: Vec<vpn::Link> = Vec::new();
@@ -539,12 +541,15 @@ fn run(
             }
         }
 
-        if ctrl.wants_block() {
+        // 没有要保护的对象时不守护，也不定时检查网卡（网络变化通知照样更新界面上的 VPN 状态）
+        let idle = nothing_to_protect(ctrl.config());
+        if ctrl.wants_block() || idle {
             guarded.clear();
         }
         status.vpn_guarded = vpn::names(&guarded);
         status.generation = generation;
         vpn_watch.set_active(!guarded.is_empty());
+        vpn_watch.set_paused(idle);
         update_status(&mut status, &ctrl, checking);
         if status != reported {
             reporter(&status);
@@ -568,10 +573,15 @@ fn later(d: Duration) -> Instant {
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86400))).unwrap_or(now)
 }
 
-/// 放行时要守护的 VPN 网卡：已经放行、开了 VPN 守护时，现在连着的 VPN 网卡；否则为空。
+/// 既没有受控应用、也没开全局断网：阻断不拦任何连接，VPN 守护没有意义。
+fn nothing_to_protect(cfg: &Config) -> bool {
+    cfg.apps.is_empty() && !cfg.block_all.enabled
+}
+
+/// 放行时要守护的 VPN 网卡：已经放行、开了 VPN 守护、有要保护的对象时，现在连着的 VPN 网卡；否则为空。
 fn guard_links(ctrl: &Controller, adapters: &[Adapter]) -> Vec<vpn::Link> {
     let vcfg = &ctrl.config().vpn;
-    if !ctrl.is_blocked() && vcfg.guard {
+    if !ctrl.is_blocked() && vcfg.guard && !nothing_to_protect(ctrl.config()) {
         vpn::links(adapters, vcfg)
     } else {
         Vec::new()
@@ -712,6 +722,19 @@ mod tests {
         drop(rx);
         n.taken();
         assert!(!n.notify(), "引擎已退出");
+    }
+
+    #[test]
+    fn nothing_to_protect_only_without_apps_and_block_all() {
+        let cfg = |apps: &[&str], block_all: bool| {
+            let mut raw = crate::config::RawConfig { apps: apps.iter().map(PathBuf::from).collect(), ..Default::default() };
+            raw.block_all.enabled = block_all;
+            Config::from_raw(raw).unwrap()
+        };
+        assert!(nothing_to_protect(&cfg(&[], false)));
+        assert!(!nothing_to_protect(&cfg(&["/usr/bin/curl"], false)));
+        assert!(!nothing_to_protect(&cfg(&[], true)));
+        assert!(!nothing_to_protect(&cfg(&["/usr/bin/curl"], true)));
     }
 
     #[test]
